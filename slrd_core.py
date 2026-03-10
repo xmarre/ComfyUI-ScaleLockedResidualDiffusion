@@ -263,84 +263,131 @@ class ScaleLockedCFGGuider:
         schedule: str,
         spatial_mask: Optional[torch.Tensor],
     ) -> None:
-        self._slrd_model = model
-        self._slrd_anchors_x0_cpu = list(anchors_x0_cpu)
-        self._slrd_planner_sigmas = [float(x) for x in planner_sigmas] if planner_sigmas is not None else None
-        self._slrd_lock_strength = float(lock_strength)
-        self._slrd_lock_strength_start = float(lock_strength_start)
-        self._slrd_lock_strength_end = float(lock_strength_end)
-        self._slrd_cutoff = float(cutoff)
-        self._slrd_mid_cutoff = float(max(cutoff, mid_cutoff))
-        self._slrd_mid_strength = float(mid_strength)
-        self._slrd_schedule = schedule
-        self._slrd_seen_sigmas: list[float] = []
-        self._slrd_prev_match_idx: int = 0
-        self._slrd_spatial_mask = spatial_mask
-        self._slrd_last_sigma: Optional[float] = None
+        init_scale_lock_state(
+            self,
+            model=model,
+            anchors_x0_cpu=anchors_x0_cpu,
+            planner_sigmas=planner_sigmas,
+            lock_strength=lock_strength,
+            lock_strength_start=lock_strength_start,
+            lock_strength_end=lock_strength_end,
+            cutoff=cutoff,
+            mid_cutoff=mid_cutoff,
+            mid_strength=mid_strength,
+            schedule=schedule,
+            spatial_mask=spatial_mask,
+        )
 
     def _slrd_resolve_step_index(self, timestep: torch.Tensor | float | int) -> int:
-        sigma = _sigma_scalar(timestep)
-
-        if self._slrd_planner_sigmas:
-            best_idx = 0
-            best_dist = float("inf")
-            for i, planner_sigma in enumerate(self._slrd_planner_sigmas):
-                dist = abs(planner_sigma - sigma)
-                if dist < best_dist:
-                    best_idx = i
-                    best_dist = dist
-            best_idx = max(best_idx, self._slrd_prev_match_idx)
-            best_idx = min(best_idx, len(self._slrd_anchors_x0_cpu) - 1)
-            self._slrd_prev_match_idx = best_idx
-            return best_idx
-
-        if self._slrd_last_sigma is None:
-            self._slrd_last_sigma = sigma
-            step_index = 0
-            self._slrd_seen_sigmas = [sigma]
-        else:
-            tol = 1e-6 * max(1.0, abs(self._slrd_last_sigma), abs(sigma))
-            if abs(sigma - self._slrd_last_sigma) > tol:
-                self._slrd_last_sigma = sigma
-                self._slrd_seen_sigmas.append(sigma)
-            unique_sigmas = []
-            for seen_sigma in self._slrd_seen_sigmas:
-                if all(
-                    abs(seen_sigma - unique_sigma) > (1e-6 * max(1.0, abs(seen_sigma), abs(unique_sigma)))
-                    for unique_sigma in unique_sigmas
-                ):
-                    unique_sigmas.append(seen_sigma)
-            step_index = max(0, len(unique_sigmas) - 1)
-            step_index = max(step_index, self._slrd_prev_match_idx)
-            self._slrd_prev_match_idx = step_index
-        if not self._slrd_anchors_x0_cpu:
-            return 0
-        return min(step_index, len(self._slrd_anchors_x0_cpu) - 1)
+        return resolve_scale_lock_step_index(self, timestep)
 
     def _slrd_strength_for_step(self, idx: int) -> float:
-        total = max(1, len(self._slrd_anchors_x0_cpu) - 1)
-        progress = idx / total
-        scheduled = schedule_value(self._slrd_lock_strength_start, self._slrd_lock_strength_end, progress, self._slrd_schedule)
-        return float(max(0.0, min(1.0, self._slrd_lock_strength * scheduled)))
+        return scale_lock_strength_for_step(self, idx)
 
     def _slrd_anchor_for(self, idx: int, like: torch.Tensor) -> torch.Tensor:
-        anchor = self._slrd_anchors_x0_cpu[idx].to(device=like.device, dtype=like.dtype, non_blocking=True)
-        if tuple(anchor.shape[-2:]) != tuple(like.shape[-2:]):
-            anchor = resize_4d_tensor(anchor, tuple(like.shape[-2:]))
-        return anchor
+        return scale_lock_anchor_for(self, idx, like)
 
     def _slrd_mask_for(self, like: torch.Tensor) -> Optional[torch.Tensor]:
-        if self._slrd_spatial_mask is None:
-            return None
-        mask = self._slrd_spatial_mask.to(device=like.device, dtype=like.dtype, non_blocking=True)
-        if tuple(mask.shape[-2:]) != tuple(like.shape[-2:]):
-            mask = resize_4d_tensor(mask, tuple(like.shape[-2:]))
-        if mask.shape[0] < like.shape[0]:
-            repeat = math.ceil(like.shape[0] / max(1, mask.shape[0]))
-            mask = mask.repeat(repeat, 1, 1, 1)[: like.shape[0]]
-        elif mask.shape[0] > like.shape[0]:
-            mask = mask[: like.shape[0]]
-        return mask
+        return scale_lock_mask_for(self, like)
+
+
+def init_scale_lock_state(
+    guider,
+    *,
+    model,
+    anchors_x0_cpu: Iterable[torch.Tensor],
+    planner_sigmas: Optional[Iterable[float]],
+    lock_strength: float,
+    lock_strength_start: float,
+    lock_strength_end: float,
+    cutoff: float,
+    mid_cutoff: float,
+    mid_strength: float,
+    schedule: str,
+    spatial_mask: Optional[torch.Tensor],
+) -> None:
+    guider._slrd_model = model
+    guider._slrd_anchors_x0_cpu = list(anchors_x0_cpu)
+    guider._slrd_planner_sigmas = [float(x) for x in planner_sigmas] if planner_sigmas is not None else None
+    guider._slrd_lock_strength = float(lock_strength)
+    guider._slrd_lock_strength_start = float(lock_strength_start)
+    guider._slrd_lock_strength_end = float(lock_strength_end)
+    guider._slrd_cutoff = float(cutoff)
+    guider._slrd_mid_cutoff = float(max(cutoff, mid_cutoff))
+    guider._slrd_mid_strength = float(mid_strength)
+    guider._slrd_schedule = schedule
+    guider._slrd_seen_sigmas = []
+    guider._slrd_prev_match_idx = 0
+    guider._slrd_spatial_mask = spatial_mask
+    guider._slrd_last_sigma = None
+
+
+def resolve_scale_lock_step_index(guider, timestep: torch.Tensor | float | int) -> int:
+    sigma = _sigma_scalar(timestep)
+
+    if guider._slrd_planner_sigmas:
+        best_idx = 0
+        best_dist = float("inf")
+        for i, planner_sigma in enumerate(guider._slrd_planner_sigmas):
+            dist = abs(planner_sigma - sigma)
+            if dist < best_dist:
+                best_idx = i
+                best_dist = dist
+        best_idx = max(best_idx, guider._slrd_prev_match_idx)
+        best_idx = min(best_idx, len(guider._slrd_anchors_x0_cpu) - 1)
+        guider._slrd_prev_match_idx = best_idx
+        return best_idx
+
+    if guider._slrd_last_sigma is None:
+        guider._slrd_last_sigma = sigma
+        step_index = 0
+        guider._slrd_seen_sigmas = [sigma]
+    else:
+        tol = 1e-6 * max(1.0, abs(guider._slrd_last_sigma), abs(sigma))
+        if abs(sigma - guider._slrd_last_sigma) > tol:
+            guider._slrd_last_sigma = sigma
+            guider._slrd_seen_sigmas.append(sigma)
+        unique_sigmas = []
+        for seen_sigma in guider._slrd_seen_sigmas:
+            if all(
+                abs(seen_sigma - unique_sigma) > (1e-6 * max(1.0, abs(seen_sigma), abs(unique_sigma)))
+                for unique_sigma in unique_sigmas
+            ):
+                unique_sigmas.append(seen_sigma)
+        step_index = max(0, len(unique_sigmas) - 1)
+        step_index = max(step_index, guider._slrd_prev_match_idx)
+        guider._slrd_prev_match_idx = step_index
+    if not guider._slrd_anchors_x0_cpu:
+        return 0
+    return min(step_index, len(guider._slrd_anchors_x0_cpu) - 1)
+
+
+def scale_lock_strength_for_step(guider, idx: int) -> float:
+    total = max(1, len(guider._slrd_anchors_x0_cpu) - 1)
+    progress = idx / total
+    scheduled = schedule_value(guider._slrd_lock_strength_start, guider._slrd_lock_strength_end, progress, guider._slrd_schedule)
+    return float(max(0.0, min(1.0, guider._slrd_lock_strength * scheduled)))
+
+
+def scale_lock_anchor_for(guider, idx: int, like: torch.Tensor) -> torch.Tensor:
+    anchor = guider._slrd_anchors_x0_cpu[idx].to(device=like.device, dtype=like.dtype, non_blocking=True)
+    if tuple(anchor.shape[-2:]) != tuple(like.shape[-2:]):
+        anchor = resize_4d_tensor(anchor, tuple(like.shape[-2:]))
+    return anchor
+
+
+def scale_lock_mask_for(guider, like: torch.Tensor) -> Optional[torch.Tensor]:
+    if guider._slrd_spatial_mask is None:
+        return None
+    mask = guider._slrd_spatial_mask.to(device=like.device, dtype=like.dtype, non_blocking=True)
+    if tuple(mask.shape[-2:]) != tuple(like.shape[-2:]):
+        mask = resize_4d_tensor(mask, tuple(like.shape[-2:]))
+    if mask.shape[0] < like.shape[0]:
+        repeat = math.ceil(like.shape[0] / max(1, mask.shape[0]))
+        mask = mask.repeat(repeat, 1, 1, 1)[: like.shape[0]]
+    elif mask.shape[0] > like.shape[0]:
+        mask = mask[: like.shape[0]]
+    return mask
 
 
 

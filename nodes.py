@@ -17,10 +17,15 @@ from .slrd_core import (
     TrajectoryRecorder,
     build_nested_noise,
     clone_latent,
+    init_scale_lock_state,
     latent_target_hw_from_megapixels,
+    resolve_scale_lock_step_index,
     resize_latent_dict,
     resize_mask,
     residual_lock_multiband,
+    scale_lock_anchor_for,
+    scale_lock_mask_for,
+    scale_lock_strength_for_step,
 )
 
 
@@ -53,7 +58,8 @@ class _ScaleLockedCFGGuiderImpl(ScaleLockedCFGGuider, comfy.samplers.CFGGuider):
         schedule: str,
         spatial_mask: Optional[torch.Tensor],
     ):
-        self._init_scale_lock_state(
+        init_scale_lock_state(
+            self,
             model=model,
             anchors_x0_cpu=anchors_x0_cpu,
             planner_sigmas=planner_sigmas,
@@ -88,12 +94,12 @@ class _ScaleLockedCFGGuiderImpl(ScaleLockedCFGGuider, comfy.samplers.CFGGuider):
         if not getattr(self, "_slrd_anchors_x0_cpu", None):
             return base_cfg
 
-        idx = self._slrd_resolve_step_index(timestep)
-        strength = self._slrd_strength_for_step(idx)
+        idx = resolve_scale_lock_step_index(self, timestep)
+        strength = scale_lock_strength_for_step(self, idx)
         if strength <= 0.0:
             return base_cfg
 
-        anchor = self._slrd_anchor_for(idx, base_cfg)
+        anchor = scale_lock_anchor_for(self, idx, base_cfg)
         corrected = residual_lock_multiband(
             base_cfg,
             anchor,
@@ -103,11 +109,13 @@ class _ScaleLockedCFGGuiderImpl(ScaleLockedCFGGuider, comfy.samplers.CFGGuider):
             mid_cutoff=self._slrd_mid_cutoff,
         )
 
-        mask = self._slrd_mask_for(base_cfg)
+        mask = scale_lock_mask_for(self, base_cfg)
         if mask is not None:
             corrected = base_cfg + mask * (corrected - base_cfg)
 
         return corrected
+
+
 
 
 class _NullPreviewCallback:
@@ -245,17 +253,16 @@ def _generate_noise_for_latent(noise, latent: dict) -> torch.Tensor:
         raise TypeError("ScaleLockedResidualSamplerCustomAdvanced currently supports tensor noise only.")
     return generated
 
-
 def _scale_lock_predict_noise(guider, base_noise: torch.Tensor, x, timestep):
     if not getattr(guider, "_slrd_anchors_x0_cpu", None):
         return base_noise
 
-    idx = guider._slrd_resolve_step_index(timestep)
-    strength = guider._slrd_strength_for_step(idx)
+    idx = resolve_scale_lock_step_index(guider, timestep)
+    strength = scale_lock_strength_for_step(guider, idx)
     if strength <= 0.0:
         return base_noise
 
-    anchor = guider._slrd_anchor_for(idx, base_noise)
+    anchor = scale_lock_anchor_for(guider, idx, base_noise)
     corrected = residual_lock_multiband(
         base_noise,
         anchor,
@@ -265,7 +272,7 @@ def _scale_lock_predict_noise(guider, base_noise: torch.Tensor, x, timestep):
         mid_cutoff=guider._slrd_mid_cutoff,
     )
 
-    mask = guider._slrd_mask_for(base_noise)
+    mask = scale_lock_mask_for(guider, base_noise)
     if mask is not None:
         corrected = base_noise + mask * (corrected - base_noise)
 
@@ -287,7 +294,8 @@ def _patch_guider_with_scale_lock(
     schedule: str,
     spatial_mask: Optional[torch.Tensor],
 ):
-    guider._init_scale_lock_state(
+    init_scale_lock_state(
+        guider,
         model=model,
         anchors_x0_cpu=anchors_x0_cpu,
         planner_sigmas=planner_sigmas,
@@ -309,6 +317,7 @@ def _patch_guider_with_scale_lock(
 
     guider.predict_noise = types.MethodType(_wrapped_predict_noise, guider)
     return original_predict_noise
+
 
 
 def _run_lowres_planner_advanced(
