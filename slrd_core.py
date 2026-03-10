@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -210,14 +210,67 @@ def residual_lock_multiband(
     return base_high + torch.lerp(base_low, anchor_low, low_strength) + torch.lerp(base_mid, anchor_mid, mid_strength)
 
 
-def schedule_value(start: float, end: float, progress: float, mode: str) -> float:
-    progress = float(max(0.0, min(1.0, progress)))
+def clamp(value: float, lo: float, hi: float) -> float:
+    return float(max(lo, min(hi, value)))
+
+
+def sigma_progress(planner_sigmas: Optional[Sequence[float]], idx: int) -> Optional[float]:
+    if planner_sigmas is None:
+        return None
+
+    if len(planner_sigmas) == 0:
+        return None
+
+    idx = max(0, min(int(idx), len(planner_sigmas) - 1))
+    sigma_hi = max(float(planner_sigmas[0]), 1e-6)
+    sigma_lo = max(float(planner_sigmas[-1]), 1e-6)
+    sigma = max(float(planner_sigmas[idx]), 1e-6)
+
+    hi = math.log(sigma_hi)
+    lo = math.log(sigma_lo)
+    denom = hi - lo
+    if abs(denom) < 1e-6:
+        return None
+
+    cur = math.log(sigma)
+    return clamp((hi - cur) / denom, 0.0, 1.0)
+
+
+def schedule_curve(progress: float, mode: str, power: float = 2.0, hold: float = 0.0) -> float:
+    p = clamp(progress, 0.0, 1.0)
+    power = max(1e-6, float(power))
+    hold = clamp(hold, 0.0, 0.95)
+
+    if mode == "flat":
+        return 0.0
+    if mode == "linear":
+        return p
     if mode == "cosine":
-        t = 0.5 - 0.5 * math.cos(math.pi * progress)
-    elif mode == "flat":
-        t = 0.0
-    else:
-        t = progress
+        return 0.5 - 0.5 * math.cos(math.pi * p)
+    if mode == "smoothstep":
+        return p * p * (3.0 - 2.0 * p)
+    if mode == "smootherstep":
+        return p * p * p * (p * (p * 6.0 - 15.0) + 10.0)
+    if mode == "ease_in":
+        return p ** power
+    if mode == "ease_out":
+        return 1.0 - (1.0 - p) ** power
+    if mode == "ease_in_out":
+        if p < 0.5:
+            return 0.5 * ((2.0 * p) ** power)
+        return 1.0 - 0.5 * ((2.0 * (1.0 - p)) ** power)
+    if mode == "hold_then_drop":
+        if p <= hold:
+            return 0.0
+        u = (p - hold) / max(1e-6, 1.0 - hold)
+        return u ** power
+    if mode == "fast_drop":
+        return p ** (1.0 / power)
+    return p
+
+
+def schedule_value(start: float, end: float, progress: float, mode: str, power: float = 2.0, hold: float = 0.0) -> float:
+    t = schedule_curve(progress, mode, power=power, hold=hold)
     return float(start + (end - start) * t)
 
 
@@ -261,6 +314,13 @@ class ScaleLockedCFGGuider:
         mid_cutoff: float,
         mid_strength: float,
         schedule: str,
+        schedule_power: float,
+        schedule_hold: float,
+        mid_strength_start: float,
+        mid_strength_end: float,
+        mid_schedule: str,
+        mid_schedule_power: float,
+        mid_schedule_hold: float,
         spatial_mask: Optional[torch.Tensor],
     ) -> None:
         init_scale_lock_state(
@@ -275,6 +335,13 @@ class ScaleLockedCFGGuider:
             mid_cutoff=mid_cutoff,
             mid_strength=mid_strength,
             schedule=schedule,
+            schedule_power=schedule_power,
+            schedule_hold=schedule_hold,
+            mid_strength_start=mid_strength_start,
+            mid_strength_end=mid_strength_end,
+            mid_schedule=mid_schedule,
+            mid_schedule_power=mid_schedule_power,
+            mid_schedule_hold=mid_schedule_hold,
             spatial_mask=spatial_mask,
         )
 
@@ -304,6 +371,13 @@ def init_scale_lock_state(
     mid_cutoff: float,
     mid_strength: float,
     schedule: str,
+    schedule_power: float,
+    schedule_hold: float,
+    mid_strength_start: float,
+    mid_strength_end: float,
+    mid_schedule: str,
+    mid_schedule_power: float,
+    mid_schedule_hold: float,
     spatial_mask: Optional[torch.Tensor],
 ) -> None:
     guider._slrd_model = model
@@ -316,6 +390,13 @@ def init_scale_lock_state(
     guider._slrd_mid_cutoff = float(max(cutoff, mid_cutoff))
     guider._slrd_mid_strength = float(mid_strength)
     guider._slrd_schedule = schedule
+    guider._slrd_schedule_power = float(schedule_power)
+    guider._slrd_schedule_hold = float(schedule_hold)
+    guider._slrd_mid_strength_start = float(mid_strength_start)
+    guider._slrd_mid_strength_end = float(mid_strength_end)
+    guider._slrd_mid_schedule = mid_schedule
+    guider._slrd_mid_schedule_power = float(mid_schedule_power)
+    guider._slrd_mid_schedule_hold = float(mid_schedule_hold)
     guider._slrd_seen_sigmas = []
     guider._slrd_prev_match_idx = 0
     guider._slrd_spatial_mask = spatial_mask
@@ -363,10 +444,54 @@ def resolve_scale_lock_step_index(guider, timestep: torch.Tensor | float | int) 
 
 
 def scale_lock_strength_for_step(guider, idx: int) -> float:
+    return scale_lock_strengths_for_step(guider, idx)[0]
+
+
+def scale_lock_progress_for_step(guider, idx: int) -> float:
+    sigma_based = sigma_progress(getattr(guider, "_slrd_planner_sigmas", None), idx)
+    if sigma_based is not None:
+        return sigma_based
     total = max(1, len(guider._slrd_anchors_x0_cpu) - 1)
-    progress = idx / total
-    scheduled = schedule_value(guider._slrd_lock_strength_start, guider._slrd_lock_strength_end, progress, guider._slrd_schedule)
-    return float(max(0.0, min(1.0, guider._slrd_lock_strength * scheduled)))
+    return clamp(idx / total, 0.0, 1.0)
+
+
+def _scheduled_strength(
+    base_strength: float,
+    start: float,
+    end: float,
+    progress: float,
+    mode: str,
+    power: float,
+    hold: float,
+) -> float:
+    scheduled = schedule_value(start, end, progress, mode, power=power, hold=hold)
+    return clamp(base_strength * scheduled, 0.0, 1.0)
+
+
+def scale_lock_strengths_for_step(guider, idx: int) -> tuple[float, float]:
+    progress = scale_lock_progress_for_step(guider, idx)
+    low_strength = _scheduled_strength(
+        guider._slrd_lock_strength,
+        guider._slrd_lock_strength_start,
+        guider._slrd_lock_strength_end,
+        progress,
+        guider._slrd_schedule,
+        guider._slrd_schedule_power,
+        guider._slrd_schedule_hold,
+    )
+    if getattr(guider, "_slrd_mid_schedule", "linked") == "linked":
+        mid_strength = clamp(low_strength * guider._slrd_mid_strength, 0.0, 1.0)
+    else:
+        mid_strength = _scheduled_strength(
+            guider._slrd_mid_strength,
+            guider._slrd_mid_strength_start,
+            guider._slrd_mid_strength_end,
+            progress,
+            guider._slrd_mid_schedule,
+            guider._slrd_mid_schedule_power,
+            guider._slrd_mid_schedule_hold,
+        )
+    return low_strength, mid_strength
 
 
 def scale_lock_anchor_for(guider, idx: int, like: torch.Tensor) -> torch.Tensor:

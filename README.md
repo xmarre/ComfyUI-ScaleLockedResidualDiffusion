@@ -33,11 +33,15 @@ Main all-in-one node.
 **Important controls**
 - `target_megapixels`: planner resolution in pixel-space megapixels (usually `0.8` to `1.5` for Flux-like native planning)
 - `lock_strength`: global multiplier for the scale lock
-- `lock_strength_start` / `lock_strength_end`: how strongly the lock applies early vs late in denoising
-- `lock_schedule`: linear / cosine / flat interpolation for the lock schedule
+- `lock_strength_start` / `lock_strength_end`: how strongly the low-band lock applies early vs late in denoising
+- `lock_schedule`: low-band schedule shape; progress follows normalized log-sigma position when planner sigmas are available, with fallback to raw step-index progress otherwise; `flat` means constant start-value scheduling and ignores `lock_strength_end`
+- `lock_schedule_hold` / `lock_schedule_power`: knee and curvature controls for schedules such as `hold_then_drop`, `ease_in`, and `ease_out`
 - `coarse_cutoff`: retained spatial fraction for the strongest coarse lock band
 - `mid_band_cutoff`: retained spatial fraction for an additional mid-frequency lock band
-- `mid_band_strength`: how strongly the mid-band is pulled toward the planner relative to the low-band schedule
+- `mid_band_strength`: overall mid-band lock multiplier
+- `mid_band_strength_start` / `mid_band_strength_end`: independent mid-band envelope when `mid_band_schedule` is not `linked`; this envelope multiplies the base `mid_band_strength`
+- `mid_band_schedule`: `linked` preserves the old behavior; other modes decouple the mid band from the low band
+- `mid_band_schedule_hold` / `mid_band_schedule_power`: shape controls for independent mid-band schedules
 - `nested_noise_strength`: amount of zero-mean high-frequency detail noise added on top of the lifted low-res noise
 - `lock_mask` (optional): spatial mask to strengthen the lock only in selected regions (for example body / face / hands)
 - `pin_anchors`: store planner anchors in pinned CPU memory when possible for faster non-blocking transfer during the high-res pass
@@ -67,10 +71,13 @@ For a first test when your high-res target is around 4 MP:
 - `lock_strength = 0.85`
 - `lock_strength_start = 0.95`
 - `lock_strength_end = 0.25`
-- `lock_schedule = cosine`
+- `lock_schedule = hold_then_drop`
+- `lock_schedule_hold = 0.35`
+- `lock_schedule_power = 3.0`
 - `coarse_cutoff = 0.33`
 - `mid_band_cutoff = 0.60`
 - `mid_band_strength = 0.35`
+- `mid_band_schedule = linked`
 - `sampler_guard = warn`
 - `nested_noise_strength = 0.35`
 
@@ -117,6 +124,7 @@ What is not implemented yet:
 - automatic anatomy / pose / segmentation mask extraction,
 - explicit residual-only tiled model execution,
 - sigma-perfect trajectory matching for samplers that perform unusual extra model evaluations,
+- scheduled cutoff animation for coarse or mid bands,
 - multi-stage 1 MP -> 2 MP -> 4 MP progressive ladder inside one node,
 - exact support tuning for every possible exotic custom sampler.
 
