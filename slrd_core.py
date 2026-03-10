@@ -239,7 +239,7 @@ class TrajectoryRecorder:
             self.xt_steps.append(_stage_cpu_tensor(x, self.store_dtype, self.pin_memory))
 
 
-class ScaleLockedCFGGuider(torch.nn.Module):
+class ScaleLockedCFGGuider:
     """
     A custom ComfyUI guider that applies the scale lock in denoised-latent space.
 
