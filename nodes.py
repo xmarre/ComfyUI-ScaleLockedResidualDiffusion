@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import types
 from typing import Optional
 
 import torch
@@ -28,6 +29,9 @@ _LOGGER = logging.getLogger(__name__)
 
 # Attach our mixin-style state logic to the real CFG guider base.
 class _ScaleLockedCFGGuiderImpl(ScaleLockedCFGGuider, comfy.samplers.CFGGuider):
+    def __init__(self, model_patcher):
+        comfy.samplers.CFGGuider.__init__(self, model_patcher)
+
     def set_conds(self, positive, negative):
         self.inner_set_conds({"positive": positive, "negative": negative})
 
@@ -226,6 +230,127 @@ def _planner_sigmas_for_recorded_steps(sigmas: torch.Tensor, recorded_steps: int
     if recorded_steps <= len(visible_sigmas):
         return visible_sigmas[:recorded_steps]
     return visible_sigmas + [visible_sigmas[-1]] * (recorded_steps - len(visible_sigmas))
+
+
+def _noise_seed(noise) -> int:
+    try:
+        return int(getattr(noise, "seed", 0))
+    except Exception:
+        return 0
+
+
+def _generate_noise_for_latent(noise, latent: dict) -> torch.Tensor:
+    generated = noise.generate_noise(latent)
+    if not isinstance(generated, torch.Tensor):
+        raise TypeError("ScaleLockedResidualSamplerCustomAdvanced currently supports tensor noise only.")
+    return generated
+
+
+def _scale_lock_predict_noise(guider, base_noise: torch.Tensor, x, timestep):
+    if not getattr(guider, "_slrd_anchors_x0_cpu", None):
+        return base_noise
+
+    idx = guider._slrd_resolve_step_index(timestep)
+    strength = guider._slrd_strength_for_step(idx)
+    if strength <= 0.0:
+        return base_noise
+
+    anchor = guider._slrd_anchor_for(idx, base_noise)
+    corrected = residual_lock_multiband(
+        base_noise,
+        anchor,
+        low_strength=strength,
+        mid_strength=min(1.0, strength * guider._slrd_mid_strength),
+        low_cutoff=guider._slrd_cutoff,
+        mid_cutoff=guider._slrd_mid_cutoff,
+    )
+
+    mask = guider._slrd_mask_for(base_noise)
+    if mask is not None:
+        corrected = base_noise + mask * (corrected - base_noise)
+
+    return corrected
+
+
+def _patch_guider_with_scale_lock(
+    guider,
+    *,
+    model,
+    anchors_x0_cpu,
+    planner_sigmas,
+    lock_strength: float,
+    lock_strength_start: float,
+    lock_strength_end: float,
+    cutoff: float,
+    mid_cutoff: float,
+    mid_strength: float,
+    schedule: str,
+    spatial_mask: Optional[torch.Tensor],
+):
+    guider._init_scale_lock_state(
+        model=model,
+        anchors_x0_cpu=anchors_x0_cpu,
+        planner_sigmas=planner_sigmas,
+        lock_strength=lock_strength,
+        lock_strength_start=lock_strength_start,
+        lock_strength_end=lock_strength_end,
+        cutoff=cutoff,
+        mid_cutoff=mid_cutoff,
+        mid_strength=mid_strength,
+        schedule=schedule,
+        spatial_mask=spatial_mask,
+    )
+
+    original_predict_noise = guider.predict_noise
+
+    def _wrapped_predict_noise(self, x, timestep, model_options={}, seed=None):
+        base_noise = original_predict_noise(x, timestep, model_options=model_options, seed=seed)
+        return _scale_lock_predict_noise(self, base_noise, x, timestep)
+
+    guider.predict_noise = types.MethodType(_wrapped_predict_noise, guider)
+    return original_predict_noise
+
+
+def _run_lowres_planner_advanced(
+    *,
+    guider,
+    sampler,
+    sigmas: torch.Tensor,
+    lowres_latent: dict,
+    noise,
+    pin_anchors: bool,
+) -> tuple[dict, list[torch.Tensor], list[float], torch.Tensor]:
+    model = guider.model_patcher
+    lowres_latent = _fix_latent_channels(model, lowres_latent)
+    latent_samples = lowres_latent["samples"]
+    noise_tensor = _generate_noise_for_latent(noise, lowres_latent).to(device="cpu", dtype=latent_samples.dtype)
+
+    noise_mask = lowres_latent.get("noise_mask", None)
+    recorder = TrajectoryRecorder(
+        store_dtype=_store_dtype_for(latent_samples),
+        capture_noisy_xt=False,
+        pin_memory=pin_anchors,
+    )
+
+    samples = guider.sample(
+        noise_tensor,
+        latent_samples,
+        sampler,
+        sigmas,
+        denoise_mask=noise_mask,
+        callback=recorder.callback,
+        disable_pbar=True,
+        seed=_noise_seed(noise),
+    )
+    samples = samples.to(comfy.model_management.intermediate_device())
+
+    out = clone_latent(lowres_latent)
+    out.pop("downscale_ratio_spacial", None)
+    out["samples"] = samples
+
+    planner_sigmas = _planner_sigmas_for_recorded_steps(sigmas, len(recorder.x0_steps))
+    recorder.step_sigmas = planner_sigmas
+    return out, recorder.x0_steps, planner_sigmas, noise_tensor
 
 
 def _run_lowres_planner(
@@ -485,6 +610,156 @@ class ScaleLockedResidualKSampler:
         return (out, lowres_out_clean, denoised)
 
 
+class ScaleLockedResidualSamplerCustomAdvanced:
+    CATEGORY = "sampling/scale_locked"
+    RETURN_TYPES = ("LATENT", "LATENT", "LATENT")
+    RETURN_NAMES = ("output", "lowres_planner", "denoised_output")
+    FUNCTION = "sample"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "noise": ("NOISE",),
+                "guider": ("GUIDER",),
+                "sampler": ("SAMPLER",),
+                "sigmas": ("SIGMAS",),
+                "latent_image": ("LATENT",),
+                "target_megapixels": ("FLOAT", {"default": 1.0, "min": 0.10, "max": 16.0, "step": 0.05, "round": 0.01}),
+                "lock_strength": ("FLOAT", {"default": 0.85, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001}),
+                "lock_strength_start": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001}),
+                "lock_strength_end": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001}),
+                "lock_schedule": (["linear", "cosine", "flat"],),
+                "coarse_cutoff": ("FLOAT", {"default": 0.33, "min": 0.05, "max": 1.0, "step": 0.01, "round": 0.001}),
+                "mid_band_cutoff": ("FLOAT", {"default": 0.60, "min": 0.05, "max": 1.0, "step": 0.01, "round": 0.001}),
+                "mid_band_strength": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 2.0, "step": 0.01, "round": 0.001}),
+                "nested_noise_strength": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 4.0, "step": 0.01, "round": 0.001}),
+                "pin_anchors": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "lock_mask": ("MASK",),
+            },
+        }
+
+    @staticmethod
+    def _preview_callback(model, steps: int, x0_output: dict):
+        return _make_preview_callback(model, steps, x0_output)
+
+    def sample(
+        self,
+        noise,
+        guider,
+        sampler,
+        sigmas,
+        latent_image,
+        target_megapixels,
+        lock_strength,
+        lock_strength_start,
+        lock_strength_end,
+        lock_schedule,
+        coarse_cutoff,
+        mid_band_cutoff,
+        mid_band_strength,
+        nested_noise_strength,
+        pin_anchors,
+        lock_mask=None,
+    ):
+        model = guider.model_patcher
+        highres_latent = _fix_latent_channels(model, latent_image)
+        lowres_latent = _make_lowres_latent(highres_latent, target_megapixels)
+
+        if sigmas.numel() == 0:
+            out = clone_latent(highres_latent)
+            out.pop("downscale_ratio_spacial", None)
+            lowres_out = clone_latent(lowres_latent)
+            lowres_out.pop("downscale_ratio_spacial", None)
+            return (out, lowres_out, out)
+
+        lowres_out, anchors_x0, planner_sigmas, lowres_noise = _run_lowres_planner_advanced(
+            guider=guider,
+            sampler=sampler,
+            sigmas=sigmas,
+            lowres_latent=lowres_latent,
+            noise=noise,
+            pin_anchors=pin_anchors,
+        )
+
+        if len(anchors_x0) == 0:
+            raise RuntimeError("ScaleLockedResidualSamplerCustomAdvanced: planner pass did not record any x0 anchors.")
+
+        highres_samples = highres_latent["samples"]
+        if torch.count_nonzero(lowres_noise).item() == 0:
+            highres_noise = torch.zeros(
+                highres_samples.size(),
+                dtype=highres_samples.dtype,
+                layout=highres_samples.layout,
+                device="cpu",
+            )
+        else:
+            highres_noise = build_nested_noise(
+                lowres_noise=lowres_noise,
+                target_shape=tuple(highres_samples.shape),
+                seed=_noise_seed(noise) ^ 0x9E3779B97F4A7C15,
+                hf_strength=nested_noise_strength,
+            )
+        highres_noise = highres_noise.to(device="cpu", dtype=highres_samples.dtype)
+
+        original_predict_noise = _patch_guider_with_scale_lock(
+            guider,
+            model=model,
+            anchors_x0_cpu=anchors_x0,
+            planner_sigmas=planner_sigmas,
+            lock_strength=lock_strength,
+            lock_strength_start=lock_strength_start,
+            lock_strength_end=lock_strength_end,
+            cutoff=coarse_cutoff,
+            mid_cutoff=mid_band_cutoff,
+            mid_strength=mid_band_strength,
+            schedule=lock_schedule,
+            spatial_mask=_prepare_spatial_lock_mask(lock_mask, highres_samples),
+        )
+
+        x0_output = {}
+        callback = self._preview_callback(model, len(sigmas) - 1, x0_output)
+        noise_mask = highres_latent.get("noise_mask", None)
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+
+        try:
+            samples = guider.sample(
+                highres_noise,
+                highres_samples,
+                sampler,
+                sigmas,
+                denoise_mask=noise_mask,
+                callback=callback,
+                disable_pbar=disable_pbar,
+                seed=_noise_seed(noise),
+            )
+        finally:
+            guider.predict_noise = original_predict_noise
+        samples = samples.to(comfy.model_management.intermediate_device())
+
+        out = clone_latent(highres_latent)
+        out.pop("downscale_ratio_spacial", None)
+        out["samples"] = samples
+
+        if "x0" in x0_output:
+            try:
+                x0_out = model.model.process_latent_out(x0_output["x0"].cpu())
+            except Exception:
+                x0_out = x0_output["x0"].detach().cpu()
+            denoised = clone_latent(highres_latent)
+            denoised.pop("downscale_ratio_spacial", None)
+            denoised["samples"] = x0_out
+        else:
+            denoised = out
+
+        lowres_out_clean = clone_latent(lowres_out)
+        lowres_out_clean.pop("downscale_ratio_spacial", None)
+
+        return (out, lowres_out_clean, denoised)
+
+
 class ScaleLockedNestedNoisePreview:
     CATEGORY = "sampling/scale_locked"
     RETURN_TYPES = ("LATENT", "LATENT")
@@ -523,11 +798,13 @@ class ScaleLockedNestedNoisePreview:
 
 NODE_CLASS_MAPPINGS = {
     "ScaleLockedResidualKSampler": ScaleLockedResidualKSampler,
+    "ScaleLockedResidualSamplerCustomAdvanced": ScaleLockedResidualSamplerCustomAdvanced,
     "ScaleLockedNestedNoisePreview": ScaleLockedNestedNoisePreview,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ScaleLockedResidualKSampler": "Scale-Locked Residual KSampler",
+    "ScaleLockedResidualSamplerCustomAdvanced": "Scale-Locked Residual SamplerCustomAdvanced",
     "ScaleLockedNestedNoisePreview": "Scale-Locked Nested Noise Preview",
 }
 
