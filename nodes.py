@@ -25,7 +25,7 @@ from .slrd_core import (
     residual_lock_multiband,
     scale_lock_anchor_for,
     scale_lock_mask_for,
-    scale_lock_strength_for_step,
+    scale_lock_strengths_for_step,
 )
 
 
@@ -56,6 +56,13 @@ class _ScaleLockedCFGGuiderImpl(ScaleLockedCFGGuider, comfy.samplers.CFGGuider):
         mid_cutoff: float,
         mid_strength: float,
         schedule: str,
+        schedule_power: float,
+        schedule_hold: float,
+        mid_strength_start: float,
+        mid_strength_end: float,
+        mid_schedule: str,
+        mid_schedule_power: float,
+        mid_schedule_hold: float,
         spatial_mask: Optional[torch.Tensor],
     ):
         init_scale_lock_state(
@@ -70,6 +77,13 @@ class _ScaleLockedCFGGuiderImpl(ScaleLockedCFGGuider, comfy.samplers.CFGGuider):
             mid_cutoff=mid_cutoff,
             mid_strength=mid_strength,
             schedule=schedule,
+            schedule_power=schedule_power,
+            schedule_hold=schedule_hold,
+            mid_strength_start=mid_strength_start,
+            mid_strength_end=mid_strength_end,
+            mid_schedule=mid_schedule,
+            mid_schedule_power=mid_schedule_power,
+            mid_schedule_hold=mid_schedule_hold,
             spatial_mask=spatial_mask,
         )
 
@@ -95,16 +109,16 @@ class _ScaleLockedCFGGuiderImpl(ScaleLockedCFGGuider, comfy.samplers.CFGGuider):
             return base_cfg
 
         idx = resolve_scale_lock_step_index(self, timestep)
-        strength = scale_lock_strength_for_step(self, idx)
-        if strength <= 0.0:
+        low_strength, mid_strength = scale_lock_strengths_for_step(self, idx)
+        if low_strength <= 0.0 and mid_strength <= 0.0:
             return base_cfg
 
         anchor = scale_lock_anchor_for(self, idx, base_cfg)
         corrected = residual_lock_multiband(
             base_cfg,
             anchor,
-            low_strength=strength,
-            mid_strength=min(1.0, strength * self._slrd_mid_strength),
+            low_strength=low_strength,
+            mid_strength=mid_strength,
             low_cutoff=self._slrd_cutoff,
             mid_cutoff=self._slrd_mid_cutoff,
         )
@@ -132,6 +146,21 @@ _CONSERVATIVE_SAFE_SAMPLERS = {
     "dpmpp_2m",
     "dpmpp_2m_cfg_pp",
 }
+
+_LOCK_SCHEDULE_OPTIONS = [
+    "linear",
+    "cosine",
+    "flat",
+    "smoothstep",
+    "smootherstep",
+    "ease_in",
+    "ease_out",
+    "ease_in_out",
+    "hold_then_drop",
+    "fast_drop",
+]
+
+_MID_SCHEDULE_OPTIONS = ["linked", *_LOCK_SCHEDULE_OPTIONS]
 
 
 def _normalize_sampler_name(name: str) -> str:
@@ -258,16 +287,16 @@ def _scale_lock_predict_noise(guider, base_noise: torch.Tensor, x, timestep):
         return base_noise
 
     idx = resolve_scale_lock_step_index(guider, timestep)
-    strength = scale_lock_strength_for_step(guider, idx)
-    if strength <= 0.0:
+    low_strength, mid_strength = scale_lock_strengths_for_step(guider, idx)
+    if low_strength <= 0.0 and mid_strength <= 0.0:
         return base_noise
 
     anchor = scale_lock_anchor_for(guider, idx, base_noise)
     corrected = residual_lock_multiband(
         base_noise,
         anchor,
-        low_strength=strength,
-        mid_strength=min(1.0, strength * guider._slrd_mid_strength),
+        low_strength=low_strength,
+        mid_strength=mid_strength,
         low_cutoff=guider._slrd_cutoff,
         mid_cutoff=guider._slrd_mid_cutoff,
     )
@@ -292,6 +321,13 @@ def _patch_guider_with_scale_lock(
     mid_cutoff: float,
     mid_strength: float,
     schedule: str,
+    schedule_power: float,
+    schedule_hold: float,
+    mid_strength_start: float,
+    mid_strength_end: float,
+    mid_schedule: str,
+    mid_schedule_power: float,
+    mid_schedule_hold: float,
     spatial_mask: Optional[torch.Tensor],
 ):
     init_scale_lock_state(
@@ -306,6 +342,13 @@ def _patch_guider_with_scale_lock(
         mid_cutoff=mid_cutoff,
         mid_strength=mid_strength,
         schedule=schedule,
+        schedule_power=schedule_power,
+        schedule_hold=schedule_hold,
+        mid_strength_start=mid_strength_start,
+        mid_strength_end=mid_strength_end,
+        mid_schedule=mid_schedule,
+        mid_schedule_power=mid_schedule_power,
+        mid_schedule_hold=mid_schedule_hold,
         spatial_mask=spatial_mask,
     )
 
@@ -448,10 +491,17 @@ class ScaleLockedResidualKSampler:
                 "lock_strength": ("FLOAT", {"default": 0.85, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001}),
                 "lock_strength_start": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001}),
                 "lock_strength_end": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001}),
-                "lock_schedule": (["linear", "cosine", "flat"],),
+                "lock_schedule": (_LOCK_SCHEDULE_OPTIONS,),
+                "lock_schedule_hold": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.95, "step": 0.01, "round": 0.001}),
+                "lock_schedule_power": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 8.0, "step": 0.1, "round": 0.01}),
                 "coarse_cutoff": ("FLOAT", {"default": 0.33, "min": 0.05, "max": 1.0, "step": 0.01, "round": 0.001}),
                 "mid_band_cutoff": ("FLOAT", {"default": 0.60, "min": 0.05, "max": 1.0, "step": 0.01, "round": 0.001}),
                 "mid_band_strength": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 2.0, "step": 0.01, "round": 0.001}),
+                "mid_band_strength_start": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001}),
+                "mid_band_strength_end": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001}),
+                "mid_band_schedule": (_MID_SCHEDULE_OPTIONS,),
+                "mid_band_schedule_hold": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.95, "step": 0.01, "round": 0.001}),
+                "mid_band_schedule_power": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 8.0, "step": 0.1, "round": 0.01}),
                 "nested_noise_strength": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 4.0, "step": 0.01, "round": 0.001}),
                 "add_noise": ("BOOLEAN", {"default": True}),
                 "pin_anchors": ("BOOLEAN", {"default": True}),
@@ -483,9 +533,16 @@ class ScaleLockedResidualKSampler:
         lock_strength_start,
         lock_strength_end,
         lock_schedule,
+        lock_schedule_hold,
+        lock_schedule_power,
         coarse_cutoff,
         mid_band_cutoff,
         mid_band_strength,
+        mid_band_strength_start,
+        mid_band_strength_end,
+        mid_band_schedule,
+        mid_band_schedule_hold,
+        mid_band_schedule_power,
         nested_noise_strength,
         add_noise,
         pin_anchors,
@@ -578,6 +635,13 @@ class ScaleLockedResidualKSampler:
             mid_cutoff=mid_band_cutoff,
             mid_strength=mid_band_strength,
             schedule=lock_schedule,
+            schedule_power=lock_schedule_power,
+            schedule_hold=lock_schedule_hold,
+            mid_strength_start=mid_band_strength_start,
+            mid_strength_end=mid_band_strength_end,
+            mid_schedule=mid_band_schedule,
+            mid_schedule_power=mid_band_schedule_power,
+            mid_schedule_hold=mid_band_schedule_hold,
             spatial_mask=_prepare_spatial_lock_mask(lock_mask, highres_samples),
         )
 
@@ -638,10 +702,17 @@ class ScaleLockedResidualSamplerCustomAdvanced:
                 "lock_strength": ("FLOAT", {"default": 0.85, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001}),
                 "lock_strength_start": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001}),
                 "lock_strength_end": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001}),
-                "lock_schedule": (["linear", "cosine", "flat"],),
+                "lock_schedule": (_LOCK_SCHEDULE_OPTIONS,),
+                "lock_schedule_hold": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.95, "step": 0.01, "round": 0.001}),
+                "lock_schedule_power": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 8.0, "step": 0.1, "round": 0.01}),
                 "coarse_cutoff": ("FLOAT", {"default": 0.33, "min": 0.05, "max": 1.0, "step": 0.01, "round": 0.001}),
                 "mid_band_cutoff": ("FLOAT", {"default": 0.60, "min": 0.05, "max": 1.0, "step": 0.01, "round": 0.001}),
                 "mid_band_strength": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 2.0, "step": 0.01, "round": 0.001}),
+                "mid_band_strength_start": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001}),
+                "mid_band_strength_end": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001}),
+                "mid_band_schedule": (_MID_SCHEDULE_OPTIONS,),
+                "mid_band_schedule_hold": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.95, "step": 0.01, "round": 0.001}),
+                "mid_band_schedule_power": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 8.0, "step": 0.1, "round": 0.01}),
                 "nested_noise_strength": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 4.0, "step": 0.01, "round": 0.001}),
                 "pin_anchors": ("BOOLEAN", {"default": True}),
             },
@@ -666,9 +737,16 @@ class ScaleLockedResidualSamplerCustomAdvanced:
         lock_strength_start,
         lock_strength_end,
         lock_schedule,
+        lock_schedule_hold,
+        lock_schedule_power,
         coarse_cutoff,
         mid_band_cutoff,
         mid_band_strength,
+        mid_band_strength_start,
+        mid_band_strength_end,
+        mid_band_schedule,
+        mid_band_schedule_hold,
+        mid_band_schedule_power,
         nested_noise_strength,
         pin_anchors,
         lock_mask=None,
@@ -725,6 +803,13 @@ class ScaleLockedResidualSamplerCustomAdvanced:
             mid_cutoff=mid_band_cutoff,
             mid_strength=mid_band_strength,
             schedule=lock_schedule,
+            schedule_power=lock_schedule_power,
+            schedule_hold=lock_schedule_hold,
+            mid_strength_start=mid_band_strength_start,
+            mid_strength_end=mid_band_strength_end,
+            mid_schedule=mid_band_schedule,
+            mid_schedule_power=mid_band_schedule_power,
+            mid_schedule_hold=mid_band_schedule_hold,
             spatial_mask=_prepare_spatial_lock_mask(lock_mask, highres_samples),
         )
 
