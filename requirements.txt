@@ -1,0 +1,2 @@
+# No extra requirements.
+# Uses ComfyUI's bundled runtime + PyTorch.
