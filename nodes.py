@@ -449,6 +449,9 @@ class _ScaleLockedDetailerHook:
         del w, h, item_bbox
         return crop_region
 
+    def post_detection(self, segs):
+        return segs
+
     def get_custom_sampler(self, *args, **kwargs):
         self._remember_request(args, kwargs, strict=False)
         return self._adapter
