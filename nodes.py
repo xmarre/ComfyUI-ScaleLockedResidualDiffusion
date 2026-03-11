@@ -452,6 +452,9 @@ class _ScaleLockedDetailerHook:
         self._step_info: Any | None = None
         self._adapter = _ScaleLockedImpactSamplerAdapter(self)
 
+    def get_skip_sampling(self):
+        return False
+
     def set_steps(self, info):
         self._step_info = info
 
