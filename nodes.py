@@ -452,6 +452,9 @@ class _ScaleLockedDetailerHook:
     def post_detection(self, segs):
         return segs
 
+    def touch_scaled_size(self, w, h):
+        return w, h
+
     def get_custom_sampler(self, *args, **kwargs):
         self._remember_request(args, kwargs, strict=False)
         return self._adapter
