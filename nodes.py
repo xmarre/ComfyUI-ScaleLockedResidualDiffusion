@@ -443,7 +443,11 @@ class _ScaleLockedDetailerHook:
     def __init__(self, settings: _ImpactHookSettings):
         self._settings = settings
         self._pending_request: _ImpactSampleRequest | None = None
+        self._step_info: Any | None = None
         self._adapter = _ScaleLockedImpactSamplerAdapter(self)
+
+    def set_steps(self, info):
+        self._step_info = info
 
     def post_crop_region(self, w, h, item_bbox, crop_region):
         del w, h, item_bbox
@@ -454,6 +458,33 @@ class _ScaleLockedDetailerHook:
 
     def touch_scaled_size(self, w, h):
         return w, h
+
+    def post_upscale(self, pixels, mask=None):
+        del mask
+        return pixels
+
+    def post_encode(self, samples):
+        return samples
+
+    def pre_decode(self, samples):
+        return samples
+
+    def post_decode(self, pixels):
+        return pixels
+
+    def cycle_latent(self, latent):
+        return latent
+
+    def post_paste(self, image):
+        return image
+
+    def get_custom_noise(self, seed, noise, is_touched):
+        del seed
+        return noise, is_touched
+
+    def should_retry_patch(self, image):
+        del image
+        return False
 
     def get_custom_sampler(self, *args, **kwargs):
         self._remember_request(args, kwargs, strict=False)
