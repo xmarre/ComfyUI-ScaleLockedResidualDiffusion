@@ -445,6 +445,10 @@ class _ScaleLockedDetailerHook:
         self._pending_request: _ImpactSampleRequest | None = None
         self._adapter = _ScaleLockedImpactSamplerAdapter(self)
 
+    def post_crop_region(self, w, h, item_bbox, crop_region):
+        del w, h, item_bbox
+        return crop_region
+
     def get_custom_sampler(self, *args, **kwargs):
         self._remember_request(args, kwargs, strict=False)
         return self._adapter
