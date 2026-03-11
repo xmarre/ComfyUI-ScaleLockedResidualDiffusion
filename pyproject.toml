@@ -1,0 +1,16 @@
+[project]
+name = "scale-locked-residual-diffusion"
+description = "A ComfyUI custom node pack implementing Scale-Locked Residual Diffusion for high-resolution composition and anatomy stability."
+version = "1.0.0"
+license = { file = "LICENSE" }
+
+[project.urls]
+Repository = "https://github.com/ComfyUI-ScaleLockedResidualDiffusion/ComfyUI-ScaleLockedResidualDiffusion"
+Documentation = "https://github.com/ComfyUI-ScaleLockedResidualDiffusion/ComfyUI-ScaleLockedResidualDiffusion/blob/main/README.md"
+"Bug Tracker" = "https://github.com/ComfyUI-ScaleLockedResidualDiffusion/ComfyUI-ScaleLockedResidualDiffusion/issues"
+
+[tool.comfy]
+PublisherId = "scalelockedresidualdiffusion"
+DisplayName = "ComfyUI-ScaleLockedResidualDiffusion"
+Icon = ""
+includes = []
