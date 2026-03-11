@@ -427,16 +427,22 @@ class _ScaleLockedImpactSamplerAdapter:
         self._hook = hook
 
     def sample(self, *args, **kwargs):
-        return self._hook.sample_latent(*args, **kwargs)
+        result = self._hook.sample_full(*args, **kwargs)
+        return result.output["samples"]
 
     def ksample(self, *args, **kwargs):
-        return self._hook.sample_latent(*args, **kwargs)
+        result = self._hook.sample_full(*args, **kwargs)
+        return result.output["samples"]
+
+    def sample_latent(self, *args, **kwargs):
+        return self._hook.sample_full(*args, **kwargs).output
 
     def sample_full(self, *args, **kwargs):
         return self._hook.sample_full(*args, **kwargs)
 
     def __call__(self, *args, **kwargs):
-        return self._hook.sample_latent(*args, **kwargs)
+        result = self._hook.sample_full(*args, **kwargs)
+        return result.output["samples"]
 
 
 class _ScaleLockedDetailerHook:
