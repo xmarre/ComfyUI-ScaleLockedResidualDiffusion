@@ -10,7 +10,7 @@ Documentation = "https://github.com/xmarre/ComfyUI-ScaleLockedResidualDiffusion/
 "Bug Tracker" = "https://github.com/xmarre/ComfyUI-ScaleLockedResidualDiffusion/issues"
 
 [tool.comfy]
-PublisherId = "scalelockedresidualdiffusion"
+PublisherId = "xmarre"
 DisplayName = "ComfyUI-ScaleLockedResidualDiffusion"
 Icon = ""
 includes = []
