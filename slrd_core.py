@@ -345,6 +345,55 @@ def _weighted_channel_stats(x: torch.Tensor, mask_1ch: torch.Tensor) -> tuple[to
     return mean, std
 
 
+def _weighted_global_std(x: torch.Tensor, mask_1ch: torch.Tensor, mean: Optional[torch.Tensor] = None) -> torch.Tensor:
+    if mean is None:
+        mean, _ = _weighted_channel_stats(x, mask_1ch)
+    mass = mask_1ch.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+    denom = mass * float(max(1, x.shape[1]))
+    var = (((x - mean).square()) * mask_1ch).sum(dim=(1, 2, 3), keepdim=True) / denom
+    return torch.sqrt(var.clamp_min(1e-8))
+
+
+def _bounded_ratio(target: torch.Tensor, source: torch.Tensor, gain_cap: float) -> torch.Tensor:
+    gain_cap = float(max(1.0, gain_cap))
+    lo = 1.0 / gain_cap
+    hi = gain_cap
+    return (target / source.clamp_min(1e-5)).clamp(lo, hi)
+
+
+def tether_latent_low_frequency_energy(
+    base_low: torch.Tensor,
+    anchor_low: torch.Tensor,
+    mask_1ch: torch.Tensor,
+    energy_tether: float,
+    channel_tether: float,
+    gain_cap: float,
+) -> torch.Tensor:
+    energy_tether = float(max(0.0, min(1.0, energy_tether)))
+    channel_tether = float(max(0.0, min(1.0, channel_tether)))
+    if energy_tether <= 0.0 and channel_tether <= 0.0:
+        return base_low
+
+    base_mean, _ = _weighted_channel_stats(base_low, mask_1ch)
+    anchor_mean, anchor_std = _weighted_channel_stats(anchor_low, mask_1ch)
+
+    regulated = base_low
+    if energy_tether > 0.0:
+        base_global_std = _weighted_global_std(regulated, mask_1ch, mean=base_mean)
+        anchor_global_std = _weighted_global_std(anchor_low, mask_1ch, mean=anchor_mean)
+        global_gain = _bounded_ratio(anchor_global_std, base_global_std, gain_cap)
+        global_gain = torch.lerp(torch.ones_like(global_gain), global_gain, energy_tether)
+        regulated = base_mean + (regulated - base_mean) * global_gain
+
+    if channel_tether > 0.0:
+        regulated_mean, regulated_std = _weighted_channel_stats(regulated, mask_1ch)
+        channel_gain = _bounded_ratio(anchor_std, regulated_std, gain_cap)
+        channel_gain = torch.lerp(torch.ones_like(channel_gain), channel_gain, channel_tether)
+        regulated = regulated_mean + (regulated - regulated_mean) * channel_gain
+
+    return regulated
+
+
 def restore_latent_low_frequency_stats(
     warped_low: torch.Tensor,
     anchor_low: torch.Tensor,
@@ -378,6 +427,9 @@ def latent_manifold_compand(
     anchor_mix: float,
     mean_anchor_mix: float,
     contrast_restore: float,
+    energy_tether: float,
+    channel_tether: float,
+    energy_gain_cap: float,
     max_shift_px: float,
 ) -> torch.Tensor:
     strength = float(max(0.0, min(1.0, strength)))
@@ -406,9 +458,18 @@ def latent_manifold_compand(
     anchor_low = lowpass_latent(anchor, cutoff)
     base_high = base - base_low
 
+    regulated_low = tether_latent_low_frequency_energy(
+        base_low,
+        anchor_low,
+        mask_1ch,
+        energy_tether=float(max(0.0, min(1.0, energy_tether))) * strength,
+        channel_tether=float(max(0.0, min(1.0, channel_tether))) * strength,
+        gain_cap=float(max(1.0, energy_gain_cap)),
+    )
+
     flow = estimate_latent_compaction_flow(
         anchor_low=anchor_low,
-        base_low=base_low,
+        base_low=regulated_low,
         mask_1ch=mask_1ch,
         strength=strength,
         radial_strength=radial_strength,
@@ -416,7 +477,7 @@ def latent_manifold_compand(
         translation_strength=translation_strength,
         max_shift_px=max_shift_px,
     )
-    warped_low = warp_4d_tensor(base_low, flow, mode="bilinear")
+    warped_low = warp_4d_tensor(regulated_low, flow, mode="bilinear")
     restored_low = restore_latent_low_frequency_stats(
         warped_low,
         anchor_low,
@@ -555,6 +616,9 @@ class ScaleLockedCFGGuider:
         manifold_anchor_mix: float = 0.18,
         manifold_mean_anchor_mix: float = 0.12,
         manifold_contrast_restore: float = 0.10,
+        manifold_energy_tether: float = 0.0,
+        manifold_channel_tether: float = 0.0,
+        manifold_energy_gain_cap: float = 1.75,
         manifold_max_shift_px: float = 3.0,
         manifold_spatial_mask: Optional[torch.Tensor] = None,
     ) -> None:
@@ -592,6 +656,9 @@ class ScaleLockedCFGGuider:
             manifold_anchor_mix=manifold_anchor_mix,
             manifold_mean_anchor_mix=manifold_mean_anchor_mix,
             manifold_contrast_restore=manifold_contrast_restore,
+            manifold_energy_tether=manifold_energy_tether,
+            manifold_channel_tether=manifold_channel_tether,
+            manifold_energy_gain_cap=manifold_energy_gain_cap,
             manifold_max_shift_px=manifold_max_shift_px,
             manifold_spatial_mask=manifold_spatial_mask,
         )
@@ -650,6 +717,9 @@ def init_scale_lock_state(
     manifold_anchor_mix: float = 0.18,
     manifold_mean_anchor_mix: float = 0.12,
     manifold_contrast_restore: float = 0.10,
+    manifold_energy_tether: float = 0.0,
+    manifold_channel_tether: float = 0.0,
+    manifold_energy_gain_cap: float = 1.75,
     manifold_max_shift_px: float = 3.0,
     manifold_spatial_mask: Optional[torch.Tensor] = None,
 ) -> None:
@@ -688,6 +758,9 @@ def init_scale_lock_state(
     guider._slrd_manifold_anchor_mix = float(manifold_anchor_mix)
     guider._slrd_manifold_mean_anchor_mix = float(manifold_mean_anchor_mix)
     guider._slrd_manifold_contrast_restore = float(manifold_contrast_restore)
+    guider._slrd_manifold_energy_tether = float(max(0.0, min(1.0, manifold_energy_tether)))
+    guider._slrd_manifold_channel_tether = float(max(0.0, min(1.0, manifold_channel_tether)))
+    guider._slrd_manifold_energy_gain_cap = float(max(1.0, manifold_energy_gain_cap))
     guider._slrd_manifold_max_shift_px = float(manifold_max_shift_px)
     guider._slrd_manifold_spatial_mask = manifold_spatial_mask if manifold_spatial_mask is not None else spatial_mask
 

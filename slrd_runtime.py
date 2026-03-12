@@ -99,6 +99,9 @@ class ScaleLockConfig:
     manifold_anchor_mix: float = 0.18
     manifold_mean_anchor_mix: float = 0.12
     manifold_contrast_restore: float = 0.10
+    manifold_energy_tether: float = 0.0
+    manifold_channel_tether: float = 0.0
+    manifold_energy_gain_cap: float = 1.75
     manifold_max_shift_px: float = 3.0
     manifold_spatial_mask: Optional[torch.Tensor] = None
 
@@ -285,6 +288,9 @@ def _apply_manifold_compand_to_noise_prediction(guider, working_noise: torch.Ten
         anchor_mix=guider._slrd_manifold_anchor_mix,
         mean_anchor_mix=guider._slrd_manifold_mean_anchor_mix,
         contrast_restore=guider._slrd_manifold_contrast_restore,
+        energy_tether=guider._slrd_manifold_energy_tether,
+        channel_tether=guider._slrd_manifold_channel_tether,
+        energy_gain_cap=guider._slrd_manifold_energy_gain_cap,
         max_shift_px=guider._slrd_manifold_max_shift_px,
     )
     if mask is not None:
@@ -386,6 +392,9 @@ def apply_scale_lock_to_guider(guider, runtime: ScaleLockedRuntimeContext, confi
         manifold_anchor_mix=config.manifold_anchor_mix,
         manifold_mean_anchor_mix=config.manifold_mean_anchor_mix,
         manifold_contrast_restore=config.manifold_contrast_restore,
+        manifold_energy_tether=config.manifold_energy_tether,
+        manifold_channel_tether=config.manifold_channel_tether,
+        manifold_energy_gain_cap=config.manifold_energy_gain_cap,
         manifold_max_shift_px=config.manifold_max_shift_px,
         manifold_spatial_mask=manifold_spatial_mask,
     )
