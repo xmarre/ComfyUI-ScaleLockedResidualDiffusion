@@ -19,12 +19,15 @@ from .slrd_core import (
     build_nested_noise,
     clone_latent,
     init_scale_lock_state,
+    latent_manifold_compand,
     latent_target_hw_from_megapixels,
     resolve_scale_lock_step_index,
     resize_latent_dict,
     resize_mask,
     residual_lock_multiband,
     scale_lock_anchor_for,
+    scale_lock_manifold_mask_for,
+    scale_lock_manifold_strength_for_step,
     scale_lock_mask_for,
     scale_lock_strengths_for_step,
 )
@@ -82,6 +85,22 @@ class ScaleLockConfig:
     mid_schedule_power: float
     mid_schedule_hold: float
     spatial_mask: Optional[torch.Tensor] = None
+    manifold_enabled: bool = False
+    manifold_strength: float = 0.0
+    manifold_strength_start: float = 1.0
+    manifold_strength_end: float = 0.0
+    manifold_schedule: str = "ease_out"
+    manifold_schedule_power: float = 2.0
+    manifold_schedule_hold: float = 0.0
+    manifold_cutoff: float = 0.18
+    manifold_radial_strength: float = 1.0
+    manifold_anisotropy: float = 0.15
+    manifold_translation_strength: float = 1.0
+    manifold_anchor_mix: float = 0.18
+    manifold_mean_anchor_mix: float = 0.12
+    manifold_contrast_restore: float = 0.10
+    manifold_max_shift_px: float = 3.0
+    manifold_spatial_mask: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -248,29 +267,56 @@ def generate_noise_for_latent(noise, latent: dict) -> torch.Tensor:
     return generated
 
 
+def _apply_manifold_compand_to_noise_prediction(guider, working_noise: torch.Tensor, anchor: torch.Tensor, idx: int) -> torch.Tensor:
+    manifold_strength = scale_lock_manifold_strength_for_step(guider, idx)
+    if manifold_strength <= 0.0:
+        return working_noise
+
+    mask = scale_lock_manifold_mask_for(guider, working_noise)
+    corrected = latent_manifold_compand(
+        working_noise,
+        anchor,
+        mask=mask,
+        strength=manifold_strength,
+        cutoff=guider._slrd_manifold_cutoff,
+        radial_strength=guider._slrd_manifold_radial_strength,
+        anisotropy=guider._slrd_manifold_anisotropy,
+        translation_strength=guider._slrd_manifold_translation_strength,
+        anchor_mix=guider._slrd_manifold_anchor_mix,
+        mean_anchor_mix=guider._slrd_manifold_mean_anchor_mix,
+        contrast_restore=guider._slrd_manifold_contrast_restore,
+        max_shift_px=guider._slrd_manifold_max_shift_px,
+    )
+    if mask is not None:
+        corrected = working_noise + mask * (corrected - working_noise)
+    return corrected
+
+
 def apply_scale_lock_to_noise_prediction(guider, base_noise: torch.Tensor, x, timestep):
+    del x
     if not getattr(guider, "_slrd_anchors_x0_cpu", None):
         return base_noise
 
     idx = resolve_scale_lock_step_index(guider, timestep)
-    low_strength, mid_strength = scale_lock_strengths_for_step(guider, idx)
-    if low_strength <= 0.0 and mid_strength <= 0.0:
-        return base_noise
-
     anchor = scale_lock_anchor_for(guider, idx, base_noise)
-    corrected = residual_lock_multiband(
-        base_noise,
-        anchor,
-        low_strength=low_strength,
-        mid_strength=mid_strength,
-        low_cutoff=guider._slrd_cutoff,
-        mid_cutoff=guider._slrd_mid_cutoff,
-    )
 
-    mask = scale_lock_mask_for(guider, base_noise)
-    if mask is not None:
-        corrected = base_noise + mask * (corrected - base_noise)
+    corrected = base_noise
+    low_strength, mid_strength = scale_lock_strengths_for_step(guider, idx)
+    if low_strength > 0.0 or mid_strength > 0.0:
+        corrected = residual_lock_multiband(
+            corrected,
+            anchor,
+            low_strength=low_strength,
+            mid_strength=mid_strength,
+            low_cutoff=guider._slrd_cutoff,
+            mid_cutoff=guider._slrd_mid_cutoff,
+        )
 
+        mask = scale_lock_mask_for(guider, corrected)
+        if mask is not None:
+            corrected = base_noise + mask * (corrected - base_noise)
+
+    corrected = _apply_manifold_compand_to_noise_prediction(guider, corrected, anchor, idx)
     return corrected
 
 
@@ -302,6 +348,10 @@ def clone_guider_for_scale_lock(guider):
 
 def apply_scale_lock_to_guider(guider, runtime: ScaleLockedRuntimeContext, config: ScaleLockConfig):
     spatial_mask = prepare_spatial_lock_mask(config.spatial_mask, runtime.highres_latent["samples"])
+    manifold_spatial_mask = prepare_spatial_lock_mask(
+        config.manifold_spatial_mask if config.manifold_spatial_mask is not None else config.spatial_mask,
+        runtime.highres_latent["samples"],
+    )
     init_scale_lock_state(
         guider,
         model=runtime.model,
@@ -322,6 +372,22 @@ def apply_scale_lock_to_guider(guider, runtime: ScaleLockedRuntimeContext, confi
         mid_schedule_power=config.mid_schedule_power,
         mid_schedule_hold=config.mid_schedule_hold,
         spatial_mask=spatial_mask,
+        manifold_enabled=config.manifold_enabled,
+        manifold_strength=config.manifold_strength,
+        manifold_strength_start=config.manifold_strength_start,
+        manifold_strength_end=config.manifold_strength_end,
+        manifold_schedule=config.manifold_schedule,
+        manifold_schedule_power=config.manifold_schedule_power,
+        manifold_schedule_hold=config.manifold_schedule_hold,
+        manifold_cutoff=config.manifold_cutoff,
+        manifold_radial_strength=config.manifold_radial_strength,
+        manifold_anisotropy=config.manifold_anisotropy,
+        manifold_translation_strength=config.manifold_translation_strength,
+        manifold_anchor_mix=config.manifold_anchor_mix,
+        manifold_mean_anchor_mix=config.manifold_mean_anchor_mix,
+        manifold_contrast_restore=config.manifold_contrast_restore,
+        manifold_max_shift_px=config.manifold_max_shift_px,
+        manifold_spatial_mask=manifold_spatial_mask,
     )
 
     original_predict_noise = getattr(guider, "_slrd_original_predict_noise", guider.predict_noise)

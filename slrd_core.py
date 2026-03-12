@@ -210,6 +210,225 @@ def residual_lock_multiband(
     return base_high + torch.lerp(base_low, anchor_low, low_strength) + torch.lerp(base_mid, anchor_mid, mid_strength)
 
 
+def _base_grid(batch: int, height: int, width: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype),
+        torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype),
+        indexing="ij",
+    )
+    return torch.stack([xx, yy], dim=-1).unsqueeze(0).expand(batch, -1, -1, -1).contiguous()
+
+
+def warp_4d_tensor(x: torch.Tensor, flow_xy_norm: torch.Tensor, mode: str = "bilinear") -> torch.Tensor:
+    if x.ndim != 4:
+        raise ValueError(f"Expected BCHW tensor, got shape {tuple(x.shape)}")
+    batch, _, height, width = x.shape
+    expected = (batch, height, width, 2)
+    if tuple(flow_xy_norm.shape) != expected:
+        raise ValueError(f"Expected flow shape {expected}, got {tuple(flow_xy_norm.shape)}")
+    base_grid = _base_grid(batch, height, width, x.device, x.dtype)
+    sample_grid = (base_grid + flow_xy_norm).clamp(-1.25, 1.25)
+    return F.grid_sample(
+        x,
+        sample_grid,
+        mode=mode,
+        padding_mode="border",
+        align_corners=True,
+    )
+
+
+def _expand_mask_channels(mask: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    if mask.ndim != 4:
+        raise ValueError(f"Expected mask tensor BCHW, got shape {tuple(mask.shape)}")
+    if mask.shape[0] < like.shape[0]:
+        repeat = math.ceil(like.shape[0] / max(1, mask.shape[0]))
+        mask = mask.repeat(repeat, 1, 1, 1)[: like.shape[0]]
+    elif mask.shape[0] > like.shape[0]:
+        mask = mask[: like.shape[0]]
+    if mask.shape[1] == like.shape[1]:
+        return mask
+    if mask.shape[1] == 1:
+        return mask.expand(like.shape[0], like.shape[1], like.shape[-2], like.shape[-1]).contiguous()
+    return mask.mean(dim=1, keepdim=True).expand(like.shape[0], like.shape[1], like.shape[-2], like.shape[-1]).contiguous()
+
+
+def _latent_activity_map(x: torch.Tensor, mask_1ch: torch.Tensor) -> torch.Tensor:
+    mass = mask_1ch.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+    mean = (x * mask_1ch).sum(dim=(-2, -1), keepdim=True) / mass
+    centered = x - mean
+    activity = centered.square().mean(dim=1, keepdim=True)
+    activity = activity * mask_1ch
+    activity = activity + mask_1ch * 1e-8
+    return activity
+
+
+def _masked_spatial_stats(x: torch.Tensor, mask_1ch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch, _, height, width = x.shape
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1.0, 1.0, height, device=x.device, dtype=x.dtype),
+        torch.linspace(-1.0, 1.0, width, device=x.device, dtype=x.dtype),
+        indexing="ij",
+    )
+    xx = xx.view(1, 1, height, width).expand(batch, -1, -1, -1)
+    yy = yy.view(1, 1, height, width).expand(batch, -1, -1, -1)
+
+    activity = _latent_activity_map(x, mask_1ch)
+    mass = activity.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+    cx = (activity * xx).sum(dim=(-2, -1), keepdim=True) / mass
+    cy = (activity * yy).sum(dim=(-2, -1), keepdim=True) / mass
+
+    dx = xx - cx
+    dy = yy - cy
+    rx = torch.sqrt((activity * dx.square()).sum(dim=(-2, -1), keepdim=True) / mass).clamp_min(1e-4)
+    ry = torch.sqrt((activity * dy.square()).sum(dim=(-2, -1), keepdim=True) / mass).clamp_min(1e-4)
+    return cx, cy, rx, ry
+
+
+def estimate_latent_compaction_flow(
+    anchor_low: torch.Tensor,
+    base_low: torch.Tensor,
+    mask_1ch: torch.Tensor,
+    strength: float,
+    radial_strength: float,
+    anisotropy: float,
+    translation_strength: float,
+    max_shift_px: float,
+) -> torch.Tensor:
+    batch, _, height, width = base_low.shape
+    anchor_cx, anchor_cy, anchor_rx, anchor_ry = _masked_spatial_stats(anchor_low, mask_1ch)
+    base_cx, base_cy, base_rx, base_ry = _masked_spatial_stats(base_low, mask_1ch)
+
+    ratio_x = (base_rx / anchor_rx.clamp_min(1e-5)).clamp(0.85, 1.25)
+    ratio_y = (base_ry / anchor_ry.clamp_min(1e-5)).clamp(0.85, 1.25)
+    outward_x = (ratio_x - 1.0).clamp(min=0.0)
+    outward_y = (ratio_y - 1.0).clamp(min=0.0)
+
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1.0, 1.0, height, device=base_low.device, dtype=base_low.dtype),
+        torch.linspace(-1.0, 1.0, width, device=base_low.device, dtype=base_low.dtype),
+        indexing="ij",
+    )
+    xx = xx.view(1, 1, height, width).expand(batch, -1, -1, -1)
+    yy = yy.view(1, 1, height, width).expand(batch, -1, -1, -1)
+
+    dx = xx - base_cx
+    dy = yy - base_cy
+    ex = dx / base_rx.clamp_min(1e-5)
+    ey = dy / base_ry.clamp_min(1e-5)
+    radius = torch.sqrt(ex.square() + ey.square() + 1e-8)
+    edge_envelope = torch.clamp(radius / 1.25, 0.0, 1.0)
+
+    smooth_mask = lowpass_latent(mask_1ch, 0.35).clamp(0.0, 1.0)
+    mean_outward = 0.5 * (outward_x + outward_y)
+    axis_x = mean_outward * float(radial_strength) + (outward_x - mean_outward) * float(anisotropy)
+    axis_y = mean_outward * float(radial_strength) + (outward_y - mean_outward) * float(anisotropy)
+
+    shift_x = ex * edge_envelope * smooth_mask * float(strength) * axis_x
+    shift_y = ey * edge_envelope * smooth_mask * float(strength) * axis_y
+
+    trans_x = (base_cx - anchor_cx) * smooth_mask * float(strength) * float(translation_strength)
+    trans_y = (base_cy - anchor_cy) * smooth_mask * float(strength) * float(translation_strength)
+
+    max_shift_norm_x = 2.0 * float(max_shift_px) / max(width - 1, 1)
+    max_shift_norm_y = 2.0 * float(max_shift_px) / max(height - 1, 1)
+
+    shift_x = (shift_x + trans_x).clamp(-max_shift_norm_x, max_shift_norm_x)
+    shift_y = (shift_y + trans_y).clamp(-max_shift_norm_y, max_shift_norm_y)
+    return torch.stack([shift_x[:, 0], shift_y[:, 0]], dim=-1)
+
+
+def _weighted_channel_stats(x: torch.Tensor, mask_1ch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    mass = mask_1ch.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+    mean = (x * mask_1ch).sum(dim=(-2, -1), keepdim=True) / mass
+    var = (((x - mean).square()) * mask_1ch).sum(dim=(-2, -1), keepdim=True) / mass
+    std = torch.sqrt(var.clamp_min(1e-8))
+    return mean, std
+
+
+def restore_latent_low_frequency_stats(
+    warped_low: torch.Tensor,
+    anchor_low: torch.Tensor,
+    mask_1ch: torch.Tensor,
+    anchor_mix: float,
+    mean_anchor_mix: float,
+    contrast_restore: float,
+) -> torch.Tensor:
+    warped_mean, warped_std = _weighted_channel_stats(warped_low, mask_1ch)
+    anchor_mean, anchor_std = _weighted_channel_stats(anchor_low, mask_1ch)
+
+    mean_target = torch.lerp(warped_mean, anchor_mean, float(mean_anchor_mix))
+    contrast_gain = torch.lerp(
+        torch.ones_like(anchor_std),
+        anchor_std / warped_std.clamp_min(1e-5),
+        float(contrast_restore),
+    )
+    restored = mean_target + (warped_low - warped_mean) * contrast_gain
+    return torch.lerp(restored, anchor_low, float(anchor_mix))
+
+
+def latent_manifold_compand(
+    base_denoised: torch.Tensor,
+    anchor_denoised: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    strength: float,
+    cutoff: float,
+    radial_strength: float,
+    anisotropy: float,
+    translation_strength: float,
+    anchor_mix: float,
+    mean_anchor_mix: float,
+    contrast_restore: float,
+    max_shift_px: float,
+) -> torch.Tensor:
+    strength = float(max(0.0, min(1.0, strength)))
+    if strength <= 0.0:
+        return base_denoised
+
+    cutoff = float(max(0.05, min(1.0, cutoff)))
+    work_dtype = base_denoised.dtype
+    compute_dtype = torch.float32
+
+    base = base_denoised.to(dtype=compute_dtype)
+    anchor = anchor_denoised.to(device=base.device, dtype=compute_dtype)
+    if tuple(anchor.shape[-2:]) != tuple(base.shape[-2:]):
+        anchor = resize_4d_tensor(anchor, tuple(base.shape[-2:]))
+
+    if mask is None:
+        mask_1ch = torch.ones((base.shape[0], 1, base.shape[-2], base.shape[-1]), device=base.device, dtype=compute_dtype)
+    else:
+        if mask.ndim == 3:
+            mask = mask.unsqueeze(1)
+        elif mask.ndim == 4 and mask.shape[1] != 1:
+            mask = mask.mean(dim=1, keepdim=True)
+        mask_1ch = _expand_mask_channels(mask.to(device=base.device, dtype=compute_dtype), base)[:, :1].clamp(0.0, 1.0)
+
+    base_low = lowpass_latent(base, cutoff)
+    anchor_low = lowpass_latent(anchor, cutoff)
+    base_high = base - base_low
+
+    flow = estimate_latent_compaction_flow(
+        anchor_low=anchor_low,
+        base_low=base_low,
+        mask_1ch=mask_1ch,
+        strength=strength,
+        radial_strength=radial_strength,
+        anisotropy=anisotropy,
+        translation_strength=translation_strength,
+        max_shift_px=max_shift_px,
+    )
+    warped_low = warp_4d_tensor(base_low, flow, mode="bilinear")
+    restored_low = restore_latent_low_frequency_stats(
+        warped_low,
+        anchor_low,
+        mask_1ch,
+        anchor_mix=float(max(0.0, min(1.0, anchor_mix))),
+        mean_anchor_mix=float(max(0.0, min(1.0, mean_anchor_mix))),
+        contrast_restore=float(max(0.0, min(1.0, contrast_restore))),
+    )
+    corrected = base_high + restored_low
+    return corrected.to(dtype=work_dtype)
+
+
 def clamp(value: float, lo: float, hi: float) -> float:
     return float(max(lo, min(hi, value)))
 
@@ -322,6 +541,22 @@ class ScaleLockedCFGGuider:
         mid_schedule_power: float,
         mid_schedule_hold: float,
         spatial_mask: Optional[torch.Tensor],
+        manifold_enabled: bool = False,
+        manifold_strength: float = 0.0,
+        manifold_strength_start: float = 1.0,
+        manifold_strength_end: float = 0.0,
+        manifold_schedule: str = "ease_out",
+        manifold_schedule_power: float = 2.0,
+        manifold_schedule_hold: float = 0.0,
+        manifold_cutoff: float = 0.18,
+        manifold_radial_strength: float = 1.0,
+        manifold_anisotropy: float = 0.15,
+        manifold_translation_strength: float = 1.0,
+        manifold_anchor_mix: float = 0.18,
+        manifold_mean_anchor_mix: float = 0.12,
+        manifold_contrast_restore: float = 0.10,
+        manifold_max_shift_px: float = 3.0,
+        manifold_spatial_mask: Optional[torch.Tensor] = None,
     ) -> None:
         init_scale_lock_state(
             self,
@@ -343,6 +578,22 @@ class ScaleLockedCFGGuider:
             mid_schedule_power=mid_schedule_power,
             mid_schedule_hold=mid_schedule_hold,
             spatial_mask=spatial_mask,
+            manifold_enabled=manifold_enabled,
+            manifold_strength=manifold_strength,
+            manifold_strength_start=manifold_strength_start,
+            manifold_strength_end=manifold_strength_end,
+            manifold_schedule=manifold_schedule,
+            manifold_schedule_power=manifold_schedule_power,
+            manifold_schedule_hold=manifold_schedule_hold,
+            manifold_cutoff=manifold_cutoff,
+            manifold_radial_strength=manifold_radial_strength,
+            manifold_anisotropy=manifold_anisotropy,
+            manifold_translation_strength=manifold_translation_strength,
+            manifold_anchor_mix=manifold_anchor_mix,
+            manifold_mean_anchor_mix=manifold_mean_anchor_mix,
+            manifold_contrast_restore=manifold_contrast_restore,
+            manifold_max_shift_px=manifold_max_shift_px,
+            manifold_spatial_mask=manifold_spatial_mask,
         )
 
     def _slrd_resolve_step_index(self, timestep: torch.Tensor | float | int) -> int:
@@ -356,6 +607,12 @@ class ScaleLockedCFGGuider:
 
     def _slrd_mask_for(self, like: torch.Tensor) -> Optional[torch.Tensor]:
         return scale_lock_mask_for(self, like)
+
+    def _slrd_manifold_strength_for_step(self, idx: int) -> float:
+        return scale_lock_manifold_strength_for_step(self, idx)
+
+    def _slrd_manifold_mask_for(self, like: torch.Tensor) -> Optional[torch.Tensor]:
+        return scale_lock_manifold_mask_for(self, like)
 
 
 def init_scale_lock_state(
@@ -379,6 +636,22 @@ def init_scale_lock_state(
     mid_schedule_power: float,
     mid_schedule_hold: float,
     spatial_mask: Optional[torch.Tensor],
+    manifold_enabled: bool = False,
+    manifold_strength: float = 0.0,
+    manifold_strength_start: float = 1.0,
+    manifold_strength_end: float = 0.0,
+    manifold_schedule: str = "ease_out",
+    manifold_schedule_power: float = 2.0,
+    manifold_schedule_hold: float = 0.0,
+    manifold_cutoff: float = 0.18,
+    manifold_radial_strength: float = 1.0,
+    manifold_anisotropy: float = 0.15,
+    manifold_translation_strength: float = 1.0,
+    manifold_anchor_mix: float = 0.18,
+    manifold_mean_anchor_mix: float = 0.12,
+    manifold_contrast_restore: float = 0.10,
+    manifold_max_shift_px: float = 3.0,
+    manifold_spatial_mask: Optional[torch.Tensor] = None,
 ) -> None:
     guider._slrd_model = model
     guider._slrd_anchors_x0_cpu = list(anchors_x0_cpu)
@@ -401,6 +674,22 @@ def init_scale_lock_state(
     guider._slrd_prev_match_idx = 0
     guider._slrd_spatial_mask = spatial_mask
     guider._slrd_last_sigma = None
+    guider._slrd_manifold_enabled = bool(manifold_enabled)
+    guider._slrd_manifold_strength = float(manifold_strength)
+    guider._slrd_manifold_strength_start = float(manifold_strength_start)
+    guider._slrd_manifold_strength_end = float(manifold_strength_end)
+    guider._slrd_manifold_schedule = manifold_schedule
+    guider._slrd_manifold_schedule_power = float(manifold_schedule_power)
+    guider._slrd_manifold_schedule_hold = float(manifold_schedule_hold)
+    guider._slrd_manifold_cutoff = float(max(0.05, min(1.0, manifold_cutoff)))
+    guider._slrd_manifold_radial_strength = float(manifold_radial_strength)
+    guider._slrd_manifold_anisotropy = float(manifold_anisotropy)
+    guider._slrd_manifold_translation_strength = float(manifold_translation_strength)
+    guider._slrd_manifold_anchor_mix = float(manifold_anchor_mix)
+    guider._slrd_manifold_mean_anchor_mix = float(manifold_mean_anchor_mix)
+    guider._slrd_manifold_contrast_restore = float(manifold_contrast_restore)
+    guider._slrd_manifold_max_shift_px = float(manifold_max_shift_px)
+    guider._slrd_manifold_spatial_mask = manifold_spatial_mask if manifold_spatial_mask is not None else spatial_mask
 
 
 def resolve_scale_lock_step_index(guider, timestep: torch.Tensor | float | int) -> int:
@@ -494,6 +783,21 @@ def scale_lock_strengths_for_step(guider, idx: int) -> tuple[float, float]:
     return low_strength, mid_strength
 
 
+def scale_lock_manifold_strength_for_step(guider, idx: int) -> float:
+    if not getattr(guider, "_slrd_manifold_enabled", False):
+        return 0.0
+    progress = scale_lock_progress_for_step(guider, idx)
+    return _scheduled_strength(
+        guider._slrd_manifold_strength,
+        guider._slrd_manifold_strength_start,
+        guider._slrd_manifold_strength_end,
+        progress,
+        guider._slrd_manifold_schedule,
+        guider._slrd_manifold_schedule_power,
+        guider._slrd_manifold_schedule_hold,
+    )
+
+
 def scale_lock_anchor_for(guider, idx: int, like: torch.Tensor) -> torch.Tensor:
     anchor = guider._slrd_anchors_x0_cpu[idx].to(device=like.device, dtype=like.dtype, non_blocking=True)
     if tuple(anchor.shape[-2:]) != tuple(like.shape[-2:]):
@@ -505,6 +809,21 @@ def scale_lock_mask_for(guider, like: torch.Tensor) -> Optional[torch.Tensor]:
     if guider._slrd_spatial_mask is None:
         return None
     mask = guider._slrd_spatial_mask.to(device=like.device, dtype=like.dtype, non_blocking=True)
+    if tuple(mask.shape[-2:]) != tuple(like.shape[-2:]):
+        mask = resize_4d_tensor(mask, tuple(like.shape[-2:]))
+    if mask.shape[0] < like.shape[0]:
+        repeat = math.ceil(like.shape[0] / max(1, mask.shape[0]))
+        mask = mask.repeat(repeat, 1, 1, 1)[: like.shape[0]]
+    elif mask.shape[0] > like.shape[0]:
+        mask = mask[: like.shape[0]]
+    return mask
+
+
+def scale_lock_manifold_mask_for(guider, like: torch.Tensor) -> Optional[torch.Tensor]:
+    manifold_mask = getattr(guider, "_slrd_manifold_spatial_mask", None)
+    if manifold_mask is None:
+        return None
+    mask = manifold_mask.to(device=like.device, dtype=like.dtype, non_blocking=True)
     if tuple(mask.shape[-2:]) != tuple(like.shape[-2:]):
         mask = resize_4d_tensor(mask, tuple(like.shape[-2:]))
     if mask.shape[0] < like.shape[0]:
