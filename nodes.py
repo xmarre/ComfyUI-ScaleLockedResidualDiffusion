@@ -1,21 +1,26 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import math
 import torch
+import comfy.samplers
 
-from .slrd_core import build_nested_noise, clone_latent, latent_manifold_compand, residual_lock_multiband, resize_4d_tensor
+from .slrd_core import build_nested_noise, clone_latent, init_scale_lock_state, resize_4d_tensor
 from .slrd_runtime import (
     LOCK_SCHEDULE_OPTIONS,
     MID_SCHEDULE_OPTIONS,
     ScaleLockConfig,
+    apply_scale_lock_to_noise_prediction,
     build_runtime_context_from_advanced,
+    calculate_sigmas,
     clean_latent,
     compat_sampler_names,
     compat_scheduler_names,
+    create_cfg_guider,
     fix_latent_channels,
+    guard_sampler_alignment,
     make_lowres_latent,
     prepare_noise,
     run_scale_locked_ksampler,
@@ -588,13 +593,19 @@ _IMPACT_FIELD_ALIASES = {
 
 @dataclass
 class _ImpactHookSettings:
+    target_megapixels: float
+    nested_noise_strength: float
+    add_noise: bool
+    pin_anchors: bool
+    sampler_guard: str
     config: ScaleLockConfig
 
 
-def _clone_latent_with_samples(latent: dict, samples: torch.Tensor) -> dict:
-    out = clone_latent(latent)
-    out["samples"] = samples
-    return out
+@dataclass
+class _ScaleLockedImpactRuntimeState:
+    request: _ImpactSampleRequest
+    runtime: Any
+    config: ScaleLockConfig
 
 
 def _expand_mask_for_like(mask: torch.Tensor | None, like: torch.Tensor) -> torch.Tensor | None:
@@ -622,6 +633,10 @@ def _expand_mask_for_like(mask: torch.Tensor | None, like: torch.Tensor) -> torc
         m = m.repeat(repeat, 1, 1, 1)[: like.shape[0]]
     elif m.shape[0] > like.shape[0]:
         m = m[: like.shape[0]]
+    if m.shape[1] == 1:
+        m = m.expand(like.shape[0], like.shape[1], like.shape[-2], like.shape[-1]).contiguous()
+    elif m.shape[1] != like.shape[1]:
+        m = m.mean(dim=1, keepdim=True).expand(like.shape[0], like.shape[1], like.shape[-2], like.shape[-1]).contiguous()
     return m.clamp(0.0, 1.0)
 
 
@@ -651,19 +666,142 @@ def _impact_request_tuple_from_kwargs(kwargs: dict[str, Any]) -> tuple[Any, ...]
     return tuple(data.get(name) for name in names)
 
 
+class _ScaleLockedPlannerNoise:
+    def __init__(self, seed: int, disable_noise: bool):
+        self.seed = int(seed)
+        self.disable_noise = bool(disable_noise)
+
+    def generate_noise(self, latent: dict) -> torch.Tensor:
+        return prepare_noise(
+            latent["samples"],
+            seed=self.seed,
+            batch_inds=latent.get("batch_index", None),
+            disable_noise=self.disable_noise,
+        )
+
+
+class _ScaleLockedGuiderProxy:
+    def __init__(self, base_guider, runtime, config: ScaleLockConfig):
+        self._base_guider = base_guider
+        init_scale_lock_state(
+            self,
+            model=runtime.model,
+            anchors_x0_cpu=runtime.anchors_x0,
+            planner_sigmas=runtime.planner_sigmas,
+            lock_strength=config.lock_strength,
+            lock_strength_start=config.lock_strength_start,
+            lock_strength_end=config.lock_strength_end,
+            cutoff=config.cutoff,
+            mid_cutoff=config.mid_cutoff,
+            mid_strength=config.mid_strength,
+            schedule=config.schedule,
+            schedule_power=config.schedule_power,
+            schedule_hold=config.schedule_hold,
+            mid_strength_start=config.mid_strength_start,
+            mid_strength_end=config.mid_strength_end,
+            mid_schedule=config.mid_schedule,
+            mid_schedule_power=config.mid_schedule_power,
+            mid_schedule_hold=config.mid_schedule_hold,
+            spatial_mask=config.spatial_mask,
+            manifold_enabled=config.manifold_enabled,
+            manifold_strength=config.manifold_strength,
+            manifold_strength_start=config.manifold_strength_start,
+            manifold_strength_end=config.manifold_strength_end,
+            manifold_schedule=config.manifold_schedule,
+            manifold_schedule_power=config.manifold_schedule_power,
+            manifold_schedule_hold=config.manifold_schedule_hold,
+            manifold_cutoff=config.manifold_cutoff,
+            manifold_radial_strength=config.manifold_radial_strength,
+            manifold_anisotropy=config.manifold_anisotropy,
+            manifold_translation_strength=config.manifold_translation_strength,
+            manifold_anchor_mix=config.manifold_anchor_mix,
+            manifold_mean_anchor_mix=config.manifold_mean_anchor_mix,
+            manifold_contrast_restore=config.manifold_contrast_restore,
+            manifold_energy_tether=config.manifold_energy_tether,
+            manifold_channel_tether=config.manifold_channel_tether,
+            manifold_energy_gain_cap=config.manifold_energy_gain_cap,
+            manifold_max_shift_px=config.manifold_max_shift_px,
+            manifold_spatial_mask=config.manifold_spatial_mask,
+        )
+
+    def __getattr__(self, name: str):
+        return getattr(self._base_guider, name)
+
+    def __call__(self, x, timestep, model_options=None, seed=None):
+        if model_options is None:
+            model_options = {}
+        base_noise = self._base_guider(x, timestep, model_options=model_options, seed=seed)
+        return apply_scale_lock_to_noise_prediction(self, base_noise, x, timestep)
+
+
+class _ScaleLockedImpactSampler:
+    def __init__(self, hook: "_ScaleLockedDetailerHook"):
+        self._hook = hook
+
+    def sample(self, model_wrap, sigmas, extra_args, callback, noise, latent_image=None, denoise_mask=None, disable_pbar=False):
+        state = self._hook._active_runtime
+        if state is None:
+            raise RuntimeError("ScaleLockedDetailerHook: runtime state was not prepared before the custom sampler was used.")
+
+        base_sampler = comfy.samplers.sampler_object(state.request.sampler_name)
+        proxy = _ScaleLockedGuiderProxy(model_wrap, state.runtime, state.config)
+        return base_sampler.sample(
+            proxy,
+            sigmas,
+            extra_args,
+            callback,
+            noise,
+            latent_image=latent_image,
+            denoise_mask=denoise_mask,
+            disable_pbar=disable_pbar,
+        )
+
+
 class _ScaleLockedDetailerHook:
     def __init__(self, settings: _ImpactHookSettings):
         self._settings = settings
         self._pending_request: _ImpactSampleRequest | None = None
         self._step_info: Any | None = None
         self._upscale_mask: torch.Tensor | None = None
-        self._anchor_latent: torch.Tensor | None = None
-        self._latent_mask: torch.Tensor | None = None
+        self._active_runtime: _ScaleLockedImpactRuntimeState | None = None
+        self._custom_sampler = _ScaleLockedImpactSampler(self)
 
-    def _clear_detailer_state(self):
-        self._upscale_mask = None
-        self._anchor_latent = None
-        self._latent_mask = None
+    def _clear_cycle_state(self):
+        self._pending_request = None
+        self._active_runtime = None
+
+    def _effective_config_for_samples(self, samples: torch.Tensor) -> ScaleLockConfig:
+        cfg = self._settings.config
+
+        face_mask = _expand_mask_for_like(self._upscale_mask, samples)
+        lock_mask = _combine_masks(face_mask, _expand_mask_for_like(cfg.spatial_mask, samples))
+        manifold_source = cfg.manifold_spatial_mask if cfg.manifold_spatial_mask is not None else cfg.spatial_mask
+        manifold_mask = _combine_masks(face_mask, _expand_mask_for_like(manifold_source, samples))
+        return replace(cfg, spatial_mask=lock_mask, manifold_spatial_mask=manifold_mask)
+
+    def _prepare_runtime_state(self, request: _ImpactSampleRequest) -> _ScaleLockedImpactRuntimeState:
+        guard_sampler_alignment(request.sampler_name, self._settings.sampler_guard)
+        planner_noise = _ScaleLockedPlannerNoise(request.seed, disable_noise=not self._settings.add_noise)
+        sigmas = calculate_sigmas(request.model, scheduler=request.scheduler, steps=request.steps, denoise=request.denoise)
+        guider = create_cfg_guider(request.model, request.positive, request.negative, request.cfg)
+        sampler = comfy.samplers.sampler_object(request.sampler_name)
+        runtime = build_runtime_context_from_advanced(
+            noise=planner_noise,
+            guider=guider,
+            sampler=sampler,
+            sigmas=sigmas,
+            latent_image=request.latent,
+            target_megapixels=self._settings.target_megapixels,
+            nested_noise_strength=self._settings.nested_noise_strength,
+            pin_anchors=self._settings.pin_anchors,
+        )
+        state = _ScaleLockedImpactRuntimeState(
+            request=request,
+            runtime=runtime,
+            config=self._effective_config_for_samples(runtime.highres_latent["samples"]),
+        )
+        self._active_runtime = state
+        return state
 
     def get_skip_sampling(self):
         return False
@@ -682,68 +820,15 @@ class _ScaleLockedDetailerHook:
         return w, h
 
     def post_upscale(self, pixels, mask=None):
-        self._clear_detailer_state()
+        self._clear_cycle_state()
         self._upscale_mask = None if mask is None else mask.detach().clone()
         return pixels
 
     def post_encode(self, samples):
-        if isinstance(samples, dict) and isinstance(samples.get("samples", None), torch.Tensor):
-            self._anchor_latent = samples["samples"].detach().clone()
-            self._latent_mask = _expand_mask_for_like(self._upscale_mask, samples["samples"])
-        else:
-            self._anchor_latent = None
-            self._latent_mask = None
         return samples
 
     def pre_decode(self, samples):
-        if self._anchor_latent is None:
-            return samples
-        if not isinstance(samples, dict) or "samples" not in samples or not isinstance(samples["samples"], torch.Tensor):
-            return samples
-
-        cfg = self._settings.config
-        base = samples["samples"]
-        anchor = self._anchor_latent.to(device=base.device, dtype=base.dtype, non_blocking=True)
-        if tuple(anchor.shape[-2:]) != tuple(base.shape[-2:]):
-            anchor = resize_4d_tensor(anchor, tuple(base.shape[-2:]))
-        face_mask = _expand_mask_for_like(self._latent_mask, base)
-        lock_mask = _combine_masks(face_mask, _expand_mask_for_like(cfg.spatial_mask, base))
-        manifold_source_mask = cfg.manifold_spatial_mask if cfg.manifold_spatial_mask is not None else cfg.spatial_mask
-        manifold_mask = _combine_masks(face_mask, _expand_mask_for_like(manifold_source_mask, base))
-
-        corrected = base
-        if cfg.lock_strength > 0.0 or cfg.mid_strength > 0.0:
-            locked = residual_lock_multiband(
-                corrected,
-                anchor,
-                low_strength=float(max(0.0, min(1.0, cfg.lock_strength))),
-                mid_strength=float(max(0.0, min(1.0, cfg.mid_strength))),
-                low_cutoff=cfg.cutoff,
-                mid_cutoff=cfg.mid_cutoff,
-            )
-            corrected = corrected + lock_mask * (locked - corrected) if lock_mask is not None else locked
-
-        if cfg.manifold_enabled and cfg.manifold_strength > 0.0:
-            manifold = latent_manifold_compand(
-                corrected,
-                anchor,
-                mask=manifold_mask,
-                strength=float(max(0.0, min(1.0, cfg.manifold_strength))),
-                cutoff=cfg.manifold_cutoff,
-                radial_strength=cfg.manifold_radial_strength,
-                anisotropy=cfg.manifold_anisotropy,
-                translation_strength=cfg.manifold_translation_strength,
-                anchor_mix=cfg.manifold_anchor_mix,
-                mean_anchor_mix=cfg.manifold_mean_anchor_mix,
-                contrast_restore=cfg.manifold_contrast_restore,
-                energy_tether=cfg.manifold_energy_tether,
-                channel_tether=cfg.manifold_channel_tether,
-                energy_gain_cap=cfg.manifold_energy_gain_cap,
-                max_shift_px=cfg.manifold_max_shift_px,
-            )
-            corrected = corrected + manifold_mask * (manifold - corrected) if manifold_mask is not None else manifold
-
-        return _clone_latent_with_samples(samples, corrected)
+        return samples
 
     def post_decode(self, pixels):
         return pixels
@@ -756,15 +841,22 @@ class _ScaleLockedDetailerHook:
 
     def get_custom_noise(self, seed, noise, is_touched):
         del seed
-        return noise, is_touched
+        state = self._active_runtime
+        if state is None:
+            return noise, is_touched
+
+        prepared = state.runtime.highres_noise
+        if tuple(prepared.shape) != tuple(noise.shape):
+            return noise, is_touched
+        return prepared.to(device=noise.device, dtype=noise.dtype).clone(), True
 
     def should_retry_patch(self, image):
         del image
         return False
 
     def get_custom_sampler(self, *args, **kwargs):
-        self._remember_request(args, kwargs, strict=False)
-        return None
+        del args, kwargs
+        return self._custom_sampler
 
     def get_custom_sampler_provider(self, *args, **kwargs):
         return self.get_custom_sampler(*args, **kwargs)
@@ -776,6 +868,8 @@ class _ScaleLockedDetailerHook:
         request = self._remember_request(args, kwargs, strict=False)
         if request is None:
             return _impact_request_tuple_from_kwargs(kwargs) if kwargs else args
+
+        state = self._prepare_runtime_state(request)
         return (
             request.model,
             request.seed,
@@ -785,13 +879,13 @@ class _ScaleLockedDetailerHook:
             request.scheduler,
             request.positive,
             request.negative,
-            request.latent,
+            state.runtime.highres_latent,
             request.denoise,
         )
 
     def post_ksample(self, *args, **kwargs):
-        self._pending_request = None
-        self._clear_detailer_state()
+        self._clear_cycle_state()
+        self._upscale_mask = None
         if kwargs:
             return kwargs
         if len(args) == 1:
@@ -820,12 +914,28 @@ class ScaleLockedDetailerHookProvider:
     def INPUT_TYPES(cls):
         return {
             "required": {
+                "target_megapixels": ("FLOAT", {"default": 1.0, "min": 0.10, "max": 16.0, "step": 0.05, "round": 0.01}),
                 "lock_strength": ("FLOAT", {"default": 0.85, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001}),
+                "lock_strength_start": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001}),
+                "lock_strength_end": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001}),
+                "lock_schedule": (LOCK_SCHEDULE_OPTIONS,),
+                "lock_schedule_hold": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.95, "step": 0.01, "round": 0.001}),
+                "lock_schedule_power": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 8.0, "step": 0.1, "round": 0.01}),
                 "coarse_cutoff": ("FLOAT", {"default": 0.33, "min": 0.05, "max": 1.0, "step": 0.01, "round": 0.001}),
                 "mid_band_cutoff": ("FLOAT", {"default": 0.60, "min": 0.05, "max": 1.0, "step": 0.01, "round": 0.001}),
                 "mid_band_strength": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 2.0, "step": 0.01, "round": 0.001}),
+                "mid_band_strength_start": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001}),
+                "mid_band_strength_end": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001}),
+                "mid_band_schedule": (MID_SCHEDULE_OPTIONS,),
+                "mid_band_schedule_hold": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.95, "step": 0.01, "round": 0.001}),
+                "mid_band_schedule_power": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 8.0, "step": 0.1, "round": 0.01}),
                 "manifold_enabled": ("BOOLEAN", {"default": False}),
                 "manifold_strength": ("FLOAT", {"default": 0.45, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001}),
+                "manifold_strength_start": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001}),
+                "manifold_strength_end": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001}),
+                "manifold_schedule": (LOCK_SCHEDULE_OPTIONS,),
+                "manifold_schedule_hold": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.95, "step": 0.01, "round": 0.001}),
+                "manifold_schedule_power": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 8.0, "step": 0.1, "round": 0.01}),
                 "manifold_cutoff": ("FLOAT", {"default": 0.18, "min": 0.05, "max": 1.0, "step": 0.01, "round": 0.001}),
                 "manifold_radial_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.01, "round": 0.001}),
                 "manifold_anisotropy": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 2.0, "step": 0.01, "round": 0.001}),
@@ -837,6 +947,10 @@ class ScaleLockedDetailerHookProvider:
                 "manifold_channel_tether": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001}),
                 "manifold_energy_gain_cap": ("FLOAT", {"default": 1.75, "min": 1.0, "max": 4.0, "step": 0.05, "round": 0.01}),
                 "manifold_max_shift_px": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 64.0, "step": 0.1, "round": 0.01}),
+                "nested_noise_strength": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 4.0, "step": 0.01, "round": 0.001}),
+                "add_noise": ("BOOLEAN", {"default": True}),
+                "pin_anchors": ("BOOLEAN", {"default": True}),
+                "sampler_guard": (["warn", "error", "off"],),
             },
             "optional": {
                 "lock_mask": ("MASK",),
@@ -846,12 +960,28 @@ class ScaleLockedDetailerHookProvider:
 
     def build(
         self,
+        target_megapixels,
         lock_strength,
+        lock_strength_start,
+        lock_strength_end,
+        lock_schedule,
+        lock_schedule_hold,
+        lock_schedule_power,
         coarse_cutoff,
         mid_band_cutoff,
         mid_band_strength,
+        mid_band_strength_start,
+        mid_band_strength_end,
+        mid_band_schedule,
+        mid_band_schedule_hold,
+        mid_band_schedule_power,
         manifold_enabled,
         manifold_strength,
+        manifold_strength_start,
+        manifold_strength_end,
+        manifold_schedule,
+        manifold_schedule_hold,
+        manifold_schedule_power,
         manifold_cutoff,
         manifold_radial_strength,
         manifold_anisotropy,
@@ -863,32 +993,41 @@ class ScaleLockedDetailerHookProvider:
         manifold_channel_tether,
         manifold_energy_gain_cap,
         manifold_max_shift_px,
+        nested_noise_strength,
+        add_noise,
+        pin_anchors,
+        sampler_guard,
         lock_mask=None,
         manifold_mask=None,
     ):
         settings = _ImpactHookSettings(
+            target_megapixels=target_megapixels,
+            nested_noise_strength=nested_noise_strength,
+            add_noise=add_noise,
+            pin_anchors=pin_anchors,
+            sampler_guard=sampler_guard,
             config=_scale_lock_config(
                 lock_strength=lock_strength,
-                lock_strength_start=lock_strength,
-                lock_strength_end=lock_strength,
+                lock_strength_start=lock_strength_start,
+                lock_strength_end=lock_strength_end,
                 coarse_cutoff=coarse_cutoff,
                 mid_band_cutoff=mid_band_cutoff,
                 mid_band_strength=mid_band_strength,
-                lock_schedule="flat",
-                lock_schedule_hold=0.0,
-                lock_schedule_power=1.0,
-                mid_band_strength_start=mid_band_strength,
-                mid_band_strength_end=mid_band_strength,
-                mid_band_schedule="flat",
-                mid_band_schedule_hold=0.0,
-                mid_band_schedule_power=1.0,
+                lock_schedule=lock_schedule,
+                lock_schedule_hold=lock_schedule_hold,
+                lock_schedule_power=lock_schedule_power,
+                mid_band_strength_start=mid_band_strength_start,
+                mid_band_strength_end=mid_band_strength_end,
+                mid_band_schedule=mid_band_schedule,
+                mid_band_schedule_hold=mid_band_schedule_hold,
+                mid_band_schedule_power=mid_band_schedule_power,
                 manifold_enabled=manifold_enabled,
                 manifold_strength=manifold_strength,
-                manifold_strength_start=manifold_strength,
-                manifold_strength_end=manifold_strength,
-                manifold_schedule="flat",
-                manifold_schedule_hold=0.0,
-                manifold_schedule_power=1.0,
+                manifold_strength_start=manifold_strength_start,
+                manifold_strength_end=manifold_strength_end,
+                manifold_schedule=manifold_schedule,
+                manifold_schedule_hold=manifold_schedule_hold,
+                manifold_schedule_power=manifold_schedule_power,
                 manifold_cutoff=manifold_cutoff,
                 manifold_radial_strength=manifold_radial_strength,
                 manifold_anisotropy=manifold_anisotropy,
