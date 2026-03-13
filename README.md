@@ -55,7 +55,17 @@ One-node version of the modular custom-sampling workflow. Internally it now call
 
 Experimental Impact Pack / FaceDetailer integration path.
 
-This node returns a `DETAILER_HOOK` object with a provider-first adapter surface (`get_custom_sampler()` and related aliases) plus a `pre_ksample(...)` fallback path. The goal is to run the full SLRD bundle per crop: planner pass, anchor recording, nested-noise construction, and scale-locked final sample. This has been validated for import/compile in this repo, but not against a live current Impact Pack checkout in this environment.
+This node returns a `DETAILER_HOOK` object that preserves the FaceDetailer crop mask, records the encoded crop latent as the anchor in `post_encode(...)`, and applies one-shot residual/manifold correction in `pre_decode(...)`.
+
+This provider no longer advertises sampler-runtime controls that do not participate in its one-shot hook path. The exposed knobs are the ones that still affect the masked latent correction directly:
+
+- residual lock strength and cutoffs,
+- optional manifold companding controls,
+- optional `lock_mask` / `manifold_mask`, which are intersected with the FaceDetailer mask.
+
+Compatibility note: this provider's input signature changed when the inert detailer-only sampler/runtime controls were removed. Older saved workflows that used the previous `Scale-Locked Detailer Hook Provider` input surface will need to be re-wired to the current node inputs.
+
+This has been validated for import/compile in this repo, but not against a live current Impact Pack checkout in this environment.
 
 ### 6. Scale-Locked Nested Noise Preview
 
@@ -75,13 +85,14 @@ That path uses the same SLRD runtime pieces as the all-in-one sampler instead of
 
 ## FaceDetailer / Impact Pack note
 
-A public guider node alone does not make FaceDetailer use SLRD. Detailer crop sampling needs the full planner-plus-noise bundle, not only the denoiser correction. `Scale-Locked Detailer Hook Provider` is the experimental integration point for that path.
+A public guider node alone does not make FaceDetailer use SLRD. `Scale-Locked Detailer Hook Provider` is the experimental integration point for applying the masked residual/manifold correction inside the FaceDetailer crop lifecycle.
 
 The current hook implementation is duck-typed rather than source-verified against a live Impact Pack checkout:
 
-- provider-first via `get_custom_sampler()` / provider aliases,
-- fallback interception via `pre_ksample(...)`,
-- crop execution delegated to the same shared SLRD runtime as the regular sampler nodes.
+- FaceDetailer mask capture via `post_upscale(...)`,
+- self-anchoring via `post_encode(...)`,
+- alias-tolerant request capture via `pre_ksample(...)`,
+- masked latent correction via `pre_decode(...)`.
 
 Because Impact Pack's internal contracts can move, this integration should be treated as unverified runtime glue until it is exercised against the current Impact Pack source.
 

@@ -482,9 +482,9 @@ def latent_manifold_compand(
         warped_low,
         anchor_low,
         mask_1ch,
-        anchor_mix=float(max(0.0, min(1.0, anchor_mix))),
-        mean_anchor_mix=float(max(0.0, min(1.0, mean_anchor_mix))),
-        contrast_restore=float(max(0.0, min(1.0, contrast_restore))),
+        anchor_mix=float(max(0.0, min(1.0, anchor_mix))) * strength,
+        mean_anchor_mix=float(max(0.0, min(1.0, mean_anchor_mix))) * strength,
+        contrast_restore=float(max(0.0, min(1.0, contrast_restore))) * strength,
     )
     corrected = base_high + restored_low
     return corrected.to(dtype=work_dtype)
