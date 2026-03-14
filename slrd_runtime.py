@@ -430,9 +430,18 @@ def _run_lowres_planner_advanced(
     model = guider.model_patcher
     lowres_latent = fix_latent_channels(model, lowres_latent)
     latent_samples = lowres_latent["samples"]
-    noise_tensor = generate_noise_for_latent(noise, lowres_latent).to(device="cpu", dtype=latent_samples.dtype)
+    target_device = latent_samples.device
+    target_dtype = latent_samples.dtype
+    noise_tensor = generate_noise_for_latent(noise, lowres_latent).to(
+        device=target_device,
+        dtype=target_dtype,
+        non_blocking=True,
+    )
 
     noise_mask = lowres_latent.get("noise_mask", None)
+    if isinstance(noise_mask, torch.Tensor):
+        noise_mask = noise_mask.to(device=target_device, non_blocking=True)
+    sigmas = sigmas.to(device=target_device, non_blocking=True)
     recorder = TrajectoryRecorder(
         store_dtype=_store_dtype_for(latent_samples),
         capture_noisy_xt=False,
@@ -480,10 +489,24 @@ def _run_lowres_planner(
 
     lowres_latent = fix_latent_channels(model, lowres_latent)
     latent_samples = lowres_latent["samples"]
+    target_device = latent_samples.device
+    target_dtype = latent_samples.dtype
     batch_inds = lowres_latent.get("batch_index", None)
-    planner_noise = prepare_noise(latent_samples, seed=seed, batch_inds=batch_inds, disable_noise=disable_noise)
+    planner_noise = prepare_noise(
+        latent_samples,
+        seed=seed,
+        batch_inds=batch_inds,
+        disable_noise=disable_noise,
+    ).to(
+        device=target_device,
+        dtype=target_dtype,
+        non_blocking=True,
+    )
 
     noise_mask = lowres_latent.get("noise_mask", None)
+    if isinstance(noise_mask, torch.Tensor):
+        noise_mask = noise_mask.to(device=target_device, non_blocking=True)
+    sigmas = sigmas.to(device=target_device, non_blocking=True)
     recorder = TrajectoryRecorder(
         store_dtype=_store_dtype_for(latent_samples),
         capture_noisy_xt=False,
