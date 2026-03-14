@@ -802,6 +802,12 @@ class _ScaleLockedImpactSampler:
         if request is None:
             raise RuntimeError("ScaleLockedDetailerHook: sampler request was not captured before the custom sampler was used.")
 
+        planner_latent = clone_latent(request.latent)
+        if latent_image is not None:
+            planner_latent["samples"] = latent_image
+        if isinstance(denoise_mask, torch.Tensor):
+            planner_latent["noise_mask"] = denoise_mask
+
         base_sampler = comfy.samplers.sampler_object(request.sampler_name)
         state = self._hook._prepare_runtime_state_for_sampler(
             request=request,
@@ -809,6 +815,7 @@ class _ScaleLockedImpactSampler:
             sampler=base_sampler,
             sigmas=sigmas,
             extra_args=extra_args,
+            live_latent=planner_latent,
         )
         proxy = _ScaleLockedGuiderProxy(model_wrap, state.runtime, state.config)
 
@@ -831,10 +838,7 @@ class _ScaleLockedImpactSampler:
                 non_blocking=True,
             )
 
-        sampling_latent = latent_image
-        prepared_latent = state.runtime.highres_latent["samples"]
-        if sampling_latent is None or tuple(prepared_latent.shape) != tuple(sampling_latent.shape):
-            sampling_latent = prepared_latent
+        sampling_latent = latent_image if latent_image is not None else state.runtime.highres_latent["samples"]
         sampling_latent = sampling_latent.to(device=target_device, dtype=target_dtype, non_blocking=True)
         sigmas = sigmas.to(device=target_device, non_blocking=True)
         if isinstance(denoise_mask, torch.Tensor):
@@ -882,17 +886,19 @@ class _ScaleLockedDetailerHook:
         sampler,
         sigmas,
         extra_args,
+        live_latent: dict[str, Any] | None = None,
     ) -> _ScaleLockedImpactRuntimeState:
         guard_sampler_alignment(request.sampler_name, self._settings.sampler_guard)
         planner_noise = _ScaleLockedPlannerNoise(request.seed, disable_noise=not self._settings.add_noise)
         planner_model = getattr(model_wrap, "model_patcher", request.model)
         planner_guider = _ScaleLockedPlannerGuiderProxy(planner_model, model_wrap, extra_args)
+        planner_latent = request.latent if live_latent is None else live_latent
         runtime = build_runtime_context_from_advanced(
             noise=planner_noise,
             guider=planner_guider,
             sampler=sampler,
             sigmas=sigmas,
-            latent_image=request.latent,
+            latent_image=planner_latent,
             target_megapixels=self._settings.target_megapixels,
             nested_noise_strength=self._settings.nested_noise_strength,
             pin_anchors=self._settings.pin_anchors,
