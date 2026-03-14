@@ -678,6 +678,21 @@ class _ScaleLockedPlannerNoise:
         )
 
 
+def _resolve_sampler_device(model_or_wrap, fallback: torch.device) -> torch.device:
+    for obj in (
+        model_or_wrap,
+        getattr(model_or_wrap, "inner_model", None),
+        getattr(model_or_wrap, "model", None),
+        getattr(model_or_wrap, "model_patcher", None),
+    ):
+        if obj is None:
+            continue
+        device = getattr(obj, "load_device", None)
+        if device is not None:
+            return device
+    return fallback
+
+
 def _normalize_sampler_extra_args(
     extra_args: dict[str, Any] | None, sigmas: torch.Tensor, target_device: torch.device
 ) -> dict[str, Any]:
@@ -700,8 +715,13 @@ class _ScaleLockedPlannerGuiderProxy:
         del seed
         if callback is None:
             callback = lambda *args, **kwargs: None
-        target_device = latent_samples.device
+        target_device = _resolve_sampler_device(self._model_wrap, latent_samples.device)
         target_dtype = latent_samples.dtype
+        latent_samples = latent_samples.to(
+            device=target_device,
+            dtype=target_dtype,
+            non_blocking=True,
+        )
         noise = noise.to(device=target_device, dtype=target_dtype, non_blocking=True)
         sigmas = sigmas.to(device=target_device, non_blocking=True)
         if isinstance(denoise_mask, torch.Tensor):
@@ -793,20 +813,29 @@ class _ScaleLockedImpactSampler:
         proxy = _ScaleLockedGuiderProxy(model_wrap, state.runtime, state.config)
 
         sampling_noise = noise
+        fallback_device = latent_image.device if latent_image is not None else noise.device
+        target_device = _resolve_sampler_device(model_wrap, fallback_device)
+        target_dtype = latent_image.dtype if latent_image is not None else noise.dtype
+
         prepared_noise = state.runtime.highres_noise
         if tuple(prepared_noise.shape) == tuple(noise.shape):
-            sampling_noise = prepared_noise.to(device=noise.device, dtype=noise.dtype).clone()
+            sampling_noise = prepared_noise.to(
+                device=target_device,
+                dtype=target_dtype,
+                non_blocking=True,
+            ).clone()
+        else:
+            sampling_noise = sampling_noise.to(
+                device=target_device,
+                dtype=target_dtype,
+                non_blocking=True,
+            )
 
         sampling_latent = latent_image
         prepared_latent = state.runtime.highres_latent["samples"]
         if sampling_latent is None or tuple(prepared_latent.shape) != tuple(sampling_latent.shape):
-            target_device = sampling_latent.device if sampling_latent is not None else sampling_noise.device
-            target_dtype = sampling_latent.dtype if sampling_latent is not None else sampling_noise.dtype
-            sampling_latent = prepared_latent.to(device=target_device, dtype=target_dtype, non_blocking=True)
-
-        target_device = sampling_latent.device if sampling_latent is not None else sampling_noise.device
-        target_dtype = sampling_latent.dtype if sampling_latent is not None else sampling_noise.dtype
-        sampling_noise = sampling_noise.to(device=target_device, dtype=target_dtype, non_blocking=True)
+            sampling_latent = prepared_latent
+        sampling_latent = sampling_latent.to(device=target_device, dtype=target_dtype, non_blocking=True)
         sigmas = sigmas.to(device=target_device, non_blocking=True)
         if isinstance(denoise_mask, torch.Tensor):
             denoise_mask = denoise_mask.to(device=target_device, non_blocking=True)

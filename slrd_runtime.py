@@ -208,6 +208,21 @@ def prepare_noise(latent_samples: torch.Tensor, seed: int, batch_inds=None, disa
     return comfy.sample.prepare_noise(latent_samples, seed, batch_inds)
 
 
+def _resolve_sampler_device(model_or_wrap, fallback: torch.device) -> torch.device:
+    for obj in (
+        model_or_wrap,
+        getattr(model_or_wrap, "inner_model", None),
+        getattr(model_or_wrap, "model", None),
+        getattr(model_or_wrap, "model_patcher", None),
+    ):
+        if obj is None:
+            continue
+        device = getattr(obj, "load_device", None)
+        if device is not None:
+            return device
+    return fallback
+
+
 def fix_latent_channels(model, latent_dict: dict) -> dict:
     out = clone_latent(latent_dict)
     ratio = out.get("downscale_ratio_spacial", None)
@@ -430,8 +445,14 @@ def _run_lowres_planner_advanced(
     model = guider.model_patcher
     lowres_latent = fix_latent_channels(model, lowres_latent)
     latent_samples = lowres_latent["samples"]
-    target_device = latent_samples.device
+    target_device = _resolve_sampler_device(model, latent_samples.device)
     target_dtype = latent_samples.dtype
+    latent_samples = latent_samples.to(
+        device=target_device,
+        dtype=target_dtype,
+        non_blocking=True,
+    )
+    lowres_latent["samples"] = latent_samples
     noise_tensor = generate_noise_for_latent(noise, lowres_latent).to(
         device=target_device,
         dtype=target_dtype,
@@ -489,8 +510,14 @@ def _run_lowres_planner(
 
     lowres_latent = fix_latent_channels(model, lowres_latent)
     latent_samples = lowres_latent["samples"]
-    target_device = latent_samples.device
+    target_device = _resolve_sampler_device(model, latent_samples.device)
     target_dtype = latent_samples.dtype
+    latent_samples = latent_samples.to(
+        device=target_device,
+        dtype=target_dtype,
+        non_blocking=True,
+    )
+    lowres_latent["samples"] = latent_samples
     batch_inds = lowres_latent.get("batch_index", None)
     planner_noise = prepare_noise(
         latent_samples,
