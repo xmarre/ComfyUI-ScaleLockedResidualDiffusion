@@ -14,11 +14,9 @@ from .slrd_runtime import (
     ScaleLockConfig,
     apply_scale_lock_to_noise_prediction,
     build_runtime_context_from_advanced,
-    calculate_sigmas,
     clean_latent,
     compat_sampler_names,
     compat_scheduler_names,
-    create_cfg_guider,
     fix_latent_channels,
     guard_sampler_alignment,
     make_lowres_latent,
@@ -680,6 +678,28 @@ class _ScaleLockedPlannerNoise:
         )
 
 
+class _ScaleLockedPlannerGuiderProxy:
+    def __init__(self, model, model_wrap, extra_args):
+        self.model_patcher = model
+        self._model_wrap = model_wrap
+        self._extra_args = {} if extra_args is None else dict(extra_args)
+
+    def sample(self, noise, latent_samples, sampler, sigmas, denoise_mask=None, callback=None, disable_pbar=False, seed=None):
+        del seed
+        if callback is None:
+            callback = lambda *args, **kwargs: None
+        return sampler.sample(
+            self._model_wrap,
+            sigmas,
+            dict(self._extra_args),
+            callback,
+            noise,
+            latent_image=latent_samples,
+            denoise_mask=denoise_mask,
+            disable_pbar=disable_pbar,
+        )
+
+
 class _ScaleLockedGuiderProxy:
     def __init__(self, base_guider, runtime, config: ScaleLockConfig):
         self._base_guider = base_guider
@@ -739,19 +759,39 @@ class _ScaleLockedImpactSampler:
         self._hook = hook
 
     def sample(self, model_wrap, sigmas, extra_args, callback, noise, latent_image=None, denoise_mask=None, disable_pbar=False):
-        state = self._hook._active_runtime
-        if state is None:
-            raise RuntimeError("ScaleLockedDetailerHook: runtime state was not prepared before the custom sampler was used.")
+        request = self._hook._pending_request
+        if request is None:
+            raise RuntimeError("ScaleLockedDetailerHook: sampler request was not captured before the custom sampler was used.")
 
-        base_sampler = comfy.samplers.sampler_object(state.request.sampler_name)
+        base_sampler = comfy.samplers.sampler_object(request.sampler_name)
+        state = self._hook._prepare_runtime_state_for_sampler(
+            request=request,
+            model_wrap=model_wrap,
+            sampler=base_sampler,
+            sigmas=sigmas,
+            extra_args=extra_args,
+        )
         proxy = _ScaleLockedGuiderProxy(model_wrap, state.runtime, state.config)
+
+        sampling_noise = noise
+        prepared_noise = state.runtime.highres_noise
+        if tuple(prepared_noise.shape) == tuple(noise.shape):
+            sampling_noise = prepared_noise.to(device=noise.device, dtype=noise.dtype).clone()
+
+        sampling_latent = latent_image
+        prepared_latent = state.runtime.highres_latent["samples"]
+        if sampling_latent is None or tuple(prepared_latent.shape) != tuple(sampling_latent.shape):
+            target_device = sampling_latent.device if sampling_latent is not None else sampling_noise.device
+            target_dtype = sampling_latent.dtype if sampling_latent is not None else sampling_noise.dtype
+            sampling_latent = prepared_latent.to(device=target_device, dtype=target_dtype)
+
         return base_sampler.sample(
             proxy,
             sigmas,
             extra_args,
             callback,
-            noise,
-            latent_image=latent_image,
+            sampling_noise,
+            latent_image=sampling_latent,
             denoise_mask=denoise_mask,
             disable_pbar=disable_pbar,
         )
@@ -779,15 +819,21 @@ class _ScaleLockedDetailerHook:
         manifold_mask = _combine_masks(face_mask, _expand_mask_for_like(manifold_source, samples))
         return replace(cfg, spatial_mask=lock_mask, manifold_spatial_mask=manifold_mask)
 
-    def _prepare_runtime_state(self, request: _ImpactSampleRequest) -> _ScaleLockedImpactRuntimeState:
+    def _prepare_runtime_state_for_sampler(
+        self,
+        request: _ImpactSampleRequest,
+        model_wrap,
+        sampler,
+        sigmas,
+        extra_args,
+    ) -> _ScaleLockedImpactRuntimeState:
         guard_sampler_alignment(request.sampler_name, self._settings.sampler_guard)
         planner_noise = _ScaleLockedPlannerNoise(request.seed, disable_noise=not self._settings.add_noise)
-        sigmas = calculate_sigmas(request.model, scheduler=request.scheduler, steps=request.steps, denoise=request.denoise)
-        guider = create_cfg_guider(request.model, request.positive, request.negative, request.cfg)
-        sampler = comfy.samplers.sampler_object(request.sampler_name)
+        planner_model = getattr(model_wrap, "model_patcher", request.model)
+        planner_guider = _ScaleLockedPlannerGuiderProxy(planner_model, model_wrap, extra_args)
         runtime = build_runtime_context_from_advanced(
             noise=planner_noise,
-            guider=guider,
+            guider=planner_guider,
             sampler=sampler,
             sigmas=sigmas,
             latent_image=request.latent,
@@ -841,14 +887,7 @@ class _ScaleLockedDetailerHook:
 
     def get_custom_noise(self, seed, noise, is_touched):
         del seed
-        state = self._active_runtime
-        if state is None:
-            return noise, is_touched
-
-        prepared = state.runtime.highres_noise
-        if tuple(prepared.shape) != tuple(noise.shape):
-            return noise, is_touched
-        return prepared.to(device=noise.device, dtype=noise.dtype).clone(), True
+        return noise, is_touched
 
     def should_retry_patch(self, image):
         del image
@@ -869,19 +908,8 @@ class _ScaleLockedDetailerHook:
         if request is None:
             return _impact_request_tuple_from_kwargs(kwargs) if kwargs else args
 
-        state = self._prepare_runtime_state(request)
-        return (
-            request.model,
-            request.seed,
-            request.steps,
-            request.cfg,
-            request.sampler_name,
-            request.scheduler,
-            request.positive,
-            request.negative,
-            state.runtime.highres_latent,
-            request.denoise,
-        )
+        self._active_runtime = None
+        return _impact_request_tuple_from_kwargs(kwargs) if kwargs else args
 
     def post_ksample(self, *args, **kwargs):
         self._clear_cycle_state()
