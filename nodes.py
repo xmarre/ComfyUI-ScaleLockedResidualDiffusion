@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import logging
+import time
 from typing import Any
 
 import math
@@ -26,6 +28,9 @@ from .slrd_runtime import (
     apply_scale_lock_to_guider,
     clone_guider_for_scale_lock,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class ScaleLockedResidualKSampler:
@@ -596,6 +601,7 @@ class _ImpactHookSettings:
     add_noise: bool
     pin_anchors: bool
     sampler_guard: str
+    warn_if_inactive_sampler: bool
     config: ScaleLockConfig
 
 
@@ -801,60 +807,64 @@ class _ScaleLockedImpactSampler:
         request = self._hook._pending_request
         if request is None:
             raise RuntimeError("ScaleLockedDetailerHook: sampler request was not captured before the custom sampler was used.")
+        try:
+            self._hook._sampler_ran = True
 
-        planner_latent = clone_latent(request.latent)
-        if latent_image is not None:
-            planner_latent["samples"] = latent_image
-        if isinstance(denoise_mask, torch.Tensor):
-            planner_latent["noise_mask"] = denoise_mask
+            planner_latent = clone_latent(request.latent)
+            if latent_image is not None:
+                planner_latent["samples"] = latent_image
+            if isinstance(denoise_mask, torch.Tensor):
+                planner_latent["noise_mask"] = denoise_mask
 
-        base_sampler = comfy.samplers.sampler_object(request.sampler_name)
-        state = self._hook._prepare_runtime_state_for_sampler(
-            request=request,
-            model_wrap=model_wrap,
-            sampler=base_sampler,
-            sigmas=sigmas,
-            extra_args=extra_args,
-            live_latent=planner_latent,
-        )
-        proxy = _ScaleLockedGuiderProxy(model_wrap, state.runtime, state.config)
-
-        sampling_noise = noise
-        fallback_device = latent_image.device if latent_image is not None else noise.device
-        target_device = _resolve_sampler_device(model_wrap, fallback_device)
-        target_dtype = latent_image.dtype if latent_image is not None else noise.dtype
-
-        prepared_noise = state.runtime.highres_noise
-        if tuple(prepared_noise.shape) == tuple(noise.shape):
-            sampling_noise = prepared_noise.to(
-                device=target_device,
-                dtype=target_dtype,
-                non_blocking=True,
-            ).clone()
-        else:
-            sampling_noise = sampling_noise.to(
-                device=target_device,
-                dtype=target_dtype,
-                non_blocking=True,
+            base_sampler = comfy.samplers.sampler_object(request.sampler_name)
+            state = self._hook._prepare_runtime_state_for_sampler(
+                request=request,
+                model_wrap=model_wrap,
+                sampler=base_sampler,
+                sigmas=sigmas,
+                extra_args=extra_args,
+                live_latent=planner_latent,
             )
+            proxy = _ScaleLockedGuiderProxy(model_wrap, state.runtime, state.config)
 
-        sampling_latent = latent_image if latent_image is not None else state.runtime.highres_latent["samples"]
-        sampling_latent = sampling_latent.to(device=target_device, dtype=target_dtype, non_blocking=True)
-        sigmas = sigmas.to(device=target_device, non_blocking=True)
-        if isinstance(denoise_mask, torch.Tensor):
-            denoise_mask = denoise_mask.to(device=target_device, non_blocking=True)
-        sample_extra_args = _normalize_sampler_extra_args(extra_args, sigmas, target_device)
+            sampling_noise = noise
+            fallback_device = latent_image.device if latent_image is not None else noise.device
+            target_device = _resolve_sampler_device(model_wrap, fallback_device)
+            target_dtype = latent_image.dtype if latent_image is not None else noise.dtype
 
-        return base_sampler.sample(
-            proxy,
-            sigmas,
-            sample_extra_args,
-            callback,
-            sampling_noise,
-            latent_image=sampling_latent,
-            denoise_mask=denoise_mask,
-            disable_pbar=disable_pbar,
-        )
+            prepared_noise = state.runtime.highres_noise
+            if tuple(prepared_noise.shape) == tuple(noise.shape):
+                sampling_noise = prepared_noise.to(
+                    device=target_device,
+                    dtype=target_dtype,
+                    non_blocking=True,
+                ).clone()
+            else:
+                sampling_noise = sampling_noise.to(
+                    device=target_device,
+                    dtype=target_dtype,
+                    non_blocking=True,
+                )
+
+            sampling_latent = latent_image if latent_image is not None else state.runtime.highres_latent["samples"]
+            sampling_latent = sampling_latent.to(device=target_device, dtype=target_dtype, non_blocking=True)
+            sigmas = sigmas.to(device=target_device, non_blocking=True)
+            if isinstance(denoise_mask, torch.Tensor):
+                denoise_mask = denoise_mask.to(device=target_device, non_blocking=True)
+            sample_extra_args = _normalize_sampler_extra_args(extra_args, sigmas, target_device)
+
+            return base_sampler.sample(
+                proxy,
+                sigmas,
+                sample_extra_args,
+                callback,
+                sampling_noise,
+                latent_image=sampling_latent,
+                denoise_mask=denoise_mask,
+                disable_pbar=disable_pbar,
+            )
+        finally:
+            self._hook._clear_sampler_state()
 
 
 class _ScaleLockedDetailerHook:
@@ -864,11 +874,31 @@ class _ScaleLockedDetailerHook:
         self._step_info: Any | None = None
         self._upscale_mask: torch.Tensor | None = None
         self._active_runtime: _ScaleLockedImpactRuntimeState | None = None
+        self._sampler_ran = False
+        self._inactive_sampler_warned = False
         self._custom_sampler = _ScaleLockedImpactSampler(self)
 
-    def _clear_cycle_state(self):
+    def _clear_sampler_state(self):
         self._pending_request = None
         self._active_runtime = None
+        self._sampler_ran = False
+        self._inactive_sampler_warned = False
+
+    def _clear_cycle_state(self):
+        self._clear_sampler_state()
+        self._upscale_mask = None
+
+    def _warn_if_sampler_inactive(self, stage: str):
+        if self._pending_request is None or self._sampler_ran or self._inactive_sampler_warned:
+            return
+        if not self._settings.warn_if_inactive_sampler:
+            return
+        self._inactive_sampler_warned = True
+        logger.warning(
+            "ScaleLockedDetailerHook: custom sampler was not selected for this cycle before %s. "
+            "An earlier hook in the Impact chain provided the active sampler, so Scale-Locked sampler logic stayed inert.",
+            stage,
+        )
 
     def _effective_config_for_samples(self, samples: torch.Tensor) -> ScaleLockConfig:
         cfg = self._settings.config
@@ -928,7 +958,7 @@ class _ScaleLockedDetailerHook:
         return w, h
 
     def post_upscale(self, pixels, mask=None):
-        self._clear_cycle_state()
+        self._clear_sampler_state()
         self._upscale_mask = None if mask is None else mask.detach().clone()
         return pixels
 
@@ -936,15 +966,21 @@ class _ScaleLockedDetailerHook:
         return samples
 
     def pre_decode(self, samples):
+        self._warn_if_sampler_inactive("pre_decode")
+        self._clear_sampler_state()
         return samples
 
     def post_decode(self, pixels):
+        self._warn_if_sampler_inactive("post_decode")
+        self._clear_sampler_state()
         return pixels
 
     def cycle_latent(self, latent):
         return latent
 
     def post_paste(self, image):
+        self._warn_if_sampler_inactive("post_paste")
+        self._clear_cycle_state()
         return image
 
     def get_custom_noise(self, seed, noise, is_touched):
@@ -966,16 +1002,15 @@ class _ScaleLockedDetailerHook:
         return self.get_custom_sampler(*args, **kwargs)
 
     def pre_ksample(self, *args, **kwargs):
+        self._clear_sampler_state()
         request = self._remember_request(args, kwargs, strict=False)
         if request is None:
             return _impact_request_tuple_from_kwargs(kwargs) if kwargs else args
 
-        self._active_runtime = None
         return _impact_request_tuple_from_kwargs(kwargs) if kwargs else args
 
     def post_ksample(self, *args, **kwargs):
         self._clear_cycle_state()
-        self._upscale_mask = None
         if kwargs:
             return kwargs
         if len(args) == 1:
@@ -999,6 +1034,12 @@ class ScaleLockedDetailerHookProvider:
     RETURN_TYPES = ("DETAILER_HOOK",)
     RETURN_NAMES = ("detailer_hook",)
     FUNCTION = "build"
+
+    @classmethod
+    def IS_CHANGED(cls, *args, **kwargs):
+        del cls, args, kwargs
+        # Force a fresh hook object for each prompt execution.
+        return time.monotonic_ns()
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1041,6 +1082,7 @@ class ScaleLockedDetailerHookProvider:
                 "add_noise": ("BOOLEAN", {"default": True}),
                 "pin_anchors": ("BOOLEAN", {"default": True}),
                 "sampler_guard": (["warn", "error", "off"],),
+                "warn_if_inactive_sampler": ("BOOLEAN", {"default": True}),
             },
             "optional": {
                 "lock_mask": ("MASK",),
@@ -1087,6 +1129,7 @@ class ScaleLockedDetailerHookProvider:
         add_noise,
         pin_anchors,
         sampler_guard,
+        warn_if_inactive_sampler,
         lock_mask=None,
         manifold_mask=None,
     ):
@@ -1096,6 +1139,7 @@ class ScaleLockedDetailerHookProvider:
             add_noise=add_noise,
             pin_anchors=pin_anchors,
             sampler_guard=sampler_guard,
+            warn_if_inactive_sampler=warn_if_inactive_sampler,
             config=_scale_lock_config(
                 lock_strength=lock_strength,
                 lock_strength_start=lock_strength_start,
@@ -1245,9 +1289,21 @@ def _coerce_impact_request(args, kwargs, fallback=None) -> _ImpactSampleRequest:
         scheduler=str(data["scheduler"]),
         positive=data["positive"],
         negative=data["negative"],
-        latent=data["latent"],
+        latent=_snapshot_impact_latent(latent),
         denoise=float(data["denoise"]),
     )
+
+
+def _snapshot_impact_latent(latent: dict[str, Any]) -> dict[str, Any]:
+    snapshot = clone_latent(latent)
+    for key, value in snapshot.items():
+        if isinstance(value, torch.Tensor):
+            snapshot[key] = value.detach().clone()
+        elif isinstance(value, list):
+            snapshot[key] = list(value)
+        elif isinstance(value, dict):
+            snapshot[key] = dict(value)
+    return snapshot
 
 
 NODE_CLASS_MAPPINGS = {
