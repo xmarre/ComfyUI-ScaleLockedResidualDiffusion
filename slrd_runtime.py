@@ -563,12 +563,14 @@ def _run_lowres_planner(
 
 def _build_highres_noise(highres_latent: dict, lowres_noise: torch.Tensor, seed: int, hf_strength: float):
     highres_samples = highres_latent["samples"]
+    target_device = highres_samples.device
+    target_dtype = highres_samples.dtype
     if torch.count_nonzero(lowres_noise).item() == 0:
         return torch.zeros(
             highres_samples.size(),
-            dtype=highres_samples.dtype,
+            dtype=target_dtype,
             layout=highres_samples.layout,
-            device="cpu",
+            device=target_device,
         )
 
     return build_nested_noise(
@@ -576,7 +578,7 @@ def _build_highres_noise(highres_latent: dict, lowres_noise: torch.Tensor, seed:
         target_shape=tuple(highres_samples.shape),
         seed=seed,
         hf_strength=hf_strength,
-    ).to(device="cpu", dtype=highres_samples.dtype)
+    ).to(device=target_device, dtype=target_dtype, non_blocking=True)
 
 
 def build_runtime_context_from_advanced(
@@ -592,6 +594,18 @@ def build_runtime_context_from_advanced(
 ) -> ScaleLockedRuntimeContext:
     model = guider.model_patcher
     highres_latent = fix_latent_channels(model, latent_image)
+    target_device = _resolve_sampler_device(model, highres_latent["samples"].device)
+    target_dtype = highres_latent["samples"].dtype
+    highres_latent["samples"] = highres_latent["samples"].to(
+        device=target_device,
+        dtype=target_dtype,
+        non_blocking=True,
+    )
+    if isinstance(highres_latent.get("noise_mask"), torch.Tensor):
+        highres_latent["noise_mask"] = highres_latent["noise_mask"].to(
+            device=target_device,
+            non_blocking=True,
+        )
     lowres_latent = make_lowres_latent(highres_latent, target_megapixels)
 
     if sigmas.numel() == 0:
@@ -600,10 +614,13 @@ def build_runtime_context_from_advanced(
             highres_latent=highres_latent,
             lowres_latent=lowres_latent,
             lowres_out=clean_latent(lowres_latent),
-            sigmas=sigmas,
+            sigmas=sigmas.to(device=target_device, non_blocking=True),
             anchors_x0=[],
             planner_sigmas=[],
-            highres_noise=torch.zeros_like(highres_latent["samples"], device="cpu"),
+            highres_noise=torch.zeros_like(
+                highres_latent["samples"],
+                device=target_device,
+            ),
             noise_seed=noise_seed(noise),
         )
 
@@ -629,7 +646,7 @@ def build_runtime_context_from_advanced(
         highres_latent=highres_latent,
         lowres_latent=lowres_latent,
         lowres_out=lowres_out,
-        sigmas=sigmas,
+        sigmas=sigmas.to(device=target_device, non_blocking=True),
         anchors_x0=anchors_x0,
         planner_sigmas=planner_sigmas,
         highres_noise=highres_noise,

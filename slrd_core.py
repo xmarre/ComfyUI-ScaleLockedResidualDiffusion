@@ -155,7 +155,7 @@ def build_nested_noise(
     hf = hf - hf_low_up
 
     std = hf.std(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
-    hf = hf / std
+    hf = (hf / std).to(device=device, non_blocking=True)
 
     out = base + float(hf_strength) * hf
     out_std = out.std(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
