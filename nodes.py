@@ -678,6 +678,18 @@ class _ScaleLockedPlannerNoise:
         )
 
 
+def _normalize_sampler_extra_args(
+    extra_args: dict[str, Any] | None, sigmas: torch.Tensor, target_device: torch.device
+) -> dict[str, Any]:
+    normalized = {} if extra_args is None else dict(extra_args)
+    model_options = normalized.get("model_options", None)
+    if isinstance(model_options, dict):
+        model_options = dict(model_options)
+        model_options["sigmas"] = sigmas.to(device=target_device, non_blocking=True)
+        normalized["model_options"] = model_options
+    return normalized
+
+
 class _ScaleLockedPlannerGuiderProxy:
     def __init__(self, model, model_wrap, extra_args):
         self.model_patcher = model
@@ -688,10 +700,17 @@ class _ScaleLockedPlannerGuiderProxy:
         del seed
         if callback is None:
             callback = lambda *args, **kwargs: None
+        target_device = latent_samples.device
+        target_dtype = latent_samples.dtype
+        noise = noise.to(device=target_device, dtype=target_dtype, non_blocking=True)
+        sigmas = sigmas.to(device=target_device, non_blocking=True)
+        if isinstance(denoise_mask, torch.Tensor):
+            denoise_mask = denoise_mask.to(device=target_device, non_blocking=True)
+        sample_extra_args = _normalize_sampler_extra_args(self._extra_args, sigmas, target_device)
         return sampler.sample(
             self._model_wrap,
             sigmas,
-            dict(self._extra_args),
+            sample_extra_args,
             callback,
             noise,
             latent_image=latent_samples,
@@ -783,12 +802,20 @@ class _ScaleLockedImpactSampler:
         if sampling_latent is None or tuple(prepared_latent.shape) != tuple(sampling_latent.shape):
             target_device = sampling_latent.device if sampling_latent is not None else sampling_noise.device
             target_dtype = sampling_latent.dtype if sampling_latent is not None else sampling_noise.dtype
-            sampling_latent = prepared_latent.to(device=target_device, dtype=target_dtype)
+            sampling_latent = prepared_latent.to(device=target_device, dtype=target_dtype, non_blocking=True)
+
+        target_device = sampling_latent.device if sampling_latent is not None else sampling_noise.device
+        target_dtype = sampling_latent.dtype if sampling_latent is not None else sampling_noise.dtype
+        sampling_noise = sampling_noise.to(device=target_device, dtype=target_dtype, non_blocking=True)
+        sigmas = sigmas.to(device=target_device, non_blocking=True)
+        if isinstance(denoise_mask, torch.Tensor):
+            denoise_mask = denoise_mask.to(device=target_device, non_blocking=True)
+        sample_extra_args = _normalize_sampler_extra_args(extra_args, sigmas, target_device)
 
         return base_sampler.sample(
             proxy,
             sigmas,
-            extra_args,
+            sample_extra_args,
             callback,
             sampling_noise,
             latent_image=sampling_latent,
