@@ -14,6 +14,7 @@ from .slrd_runtime import (
     LOCK_SCHEDULE_OPTIONS,
     MID_SCHEDULE_OPTIONS,
     ScaleLockConfig,
+    _resolve_sampler_device,
     apply_scale_lock_to_noise_prediction,
     build_runtime_context_from_advanced,
     clean_latent,
@@ -765,32 +766,6 @@ def _resolve_impact_ag_guider_template(request: "_ImpactSampleRequest", model_wr
         return candidate
     return None
 
-
-def _resolve_sampler_device(model_or_wrap, fallback: torch.device) -> torch.device:
-    """
-    Determine the device to use for sampling by inspecting the provided model or wrapper.
-    
-    Parameters:
-        model_or_wrap: An object (model or wrapper) to inspect for a `load_device` attribute; common wrapper fields (`inner_model`, `model`, `model_patcher`) are checked as well.
-        fallback (torch.device): Device to return if no `load_device` attribute is found on the inspected objects.
-    
-    Returns:
-        torch.device: The first `load_device` found on `model_or_wrap` or its common attributes, otherwise `fallback`.
-    """
-    for obj in (
-        model_or_wrap,
-        getattr(model_or_wrap, "inner_model", None),
-        getattr(model_or_wrap, "model", None),
-        getattr(model_or_wrap, "model_patcher", None),
-    ):
-        if obj is None:
-            continue
-        device = getattr(obj, "load_device", None)
-        if device is not None:
-            return device
-    return fallback
-
-
 def _normalize_sampler_extra_args(
     extra_args: dict[str, Any] | None,
     sigmas: torch.Tensor,
@@ -855,7 +830,8 @@ class _ScaleLockedPlannerGuiderProxy:
         """
         del seed
         if callback is None:
-            callback = lambda *args, **kwargs: None
+            def callback(*args, **kwargs):
+                return None
 
         target_device = _resolve_sampler_device(self._model_wrap, latent_samples.device)
         target_dtype = latent_samples.dtype
