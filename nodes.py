@@ -654,6 +654,25 @@ def _combine_masks(*masks: torch.Tensor | None) -> torch.Tensor | None:
     return None if combined is None else combined.clamp(0.0, 1.0)
 
 
+def _canonicalize_impact_noise_mask(mask: Any) -> torch.Tensor | None:
+    if not isinstance(mask, torch.Tensor):
+        return None
+    if mask.ndim == 4:
+        if mask.shape[1] == 0:
+            return None
+        return mask[:, :1, :, :].squeeze(1).contiguous()
+    if mask.ndim == 3:
+        return mask.contiguous()
+    if mask.ndim == 2:
+        return mask.unsqueeze(0).contiguous()
+    logger.warning(
+        "ScaleLockedDetailerHook: ignoring unsupported denoise_mask rank %s with shape %s.",
+        mask.ndim,
+        tuple(mask.shape),
+    )
+    return None
+
+
 def _impact_request_tuple_from_kwargs(kwargs: dict[str, Any]) -> tuple[Any, ...]:
     if not kwargs:
         return ()
@@ -827,8 +846,12 @@ class _ScaleLockedImpactSampler:
             planner_latent = clone_latent(request.latent)
             if latent_image is not None:
                 planner_latent["samples"] = latent_image
-            if isinstance(denoise_mask, torch.Tensor):
-                planner_latent["noise_mask"] = denoise_mask
+
+            planner_mask = _canonicalize_impact_noise_mask(planner_latent.get("noise_mask", None))
+            if planner_mask is None:
+                planner_mask = _canonicalize_impact_noise_mask(denoise_mask)
+            if planner_mask is not None:
+                planner_latent["noise_mask"] = planner_mask
 
             base_sampler = comfy.samplers.sampler_object(request.sampler_name)
             guider_template = (
@@ -862,7 +885,9 @@ class _ScaleLockedImpactSampler:
             target_dtype = state.runtime.highres_latent["samples"].dtype
             sampling_noise = state.runtime.highres_noise
             sampling_latent = state.runtime.highres_latent["samples"]
-            sampling_mask = state.runtime.highres_latent.get("noise_mask", denoise_mask)
+            sampling_mask = state.runtime.highres_latent.get("noise_mask", None)
+            if sampling_mask is None:
+                sampling_mask = _canonicalize_impact_noise_mask(denoise_mask)
 
             if tuple(sampling_noise.shape) != tuple(noise.shape):
                 sampling_noise = noise
@@ -870,7 +895,7 @@ class _ScaleLockedImpactSampler:
                     sampling_latent = latent_image
                 else:
                     sampling_latent = planner_latent["samples"]
-                sampling_mask = denoise_mask
+                sampling_mask = _canonicalize_impact_noise_mask(denoise_mask)
 
             sampling_noise = sampling_noise.to(device=target_device, dtype=target_dtype, non_blocking=True)
             sampling_latent = sampling_latent.to(device=target_device, dtype=target_dtype, non_blocking=True)
