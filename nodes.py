@@ -854,17 +854,18 @@ class _ScaleLockedImpactSampler:
                 planner_latent["noise_mask"] = planner_mask
 
             base_sampler = comfy.samplers.sampler_object(request.sampler_name)
-            guider_template = (
-                model_wrap
-                if _is_impact_guider_like(model_wrap)
-                else _resolve_impact_ag_guider_template(request, model_wrap)
+
+            # Keep the internal low-res planner on a stable base CFG guider.
+            # The AutoGuidance detailer guider is a one-shot final-pass helper;
+            # feeding it into the planner can poison the recorded anchors for
+            # tiny masked FaceDetailer crops.
+            planner_guider = create_cfg_guider(
+                request.model,
+                request.positive,
+                request.negative,
+                float(request.cfg),
             )
-            planner_guider = _build_impact_effective_guider(
-                request,
-                model_wrap,
-                extra_args,
-                guider_template=guider_template,
-            )
+            _apply_impact_model_options(planner_guider, extra_args)
             state = self._hook._prepare_runtime_state_for_sampler(
                 request=request,
                 guider=planner_guider,
@@ -873,6 +874,11 @@ class _ScaleLockedImpactSampler:
                 live_latent=planner_latent,
             )
 
+            guider_template = (
+                model_wrap
+                if _is_impact_guider_like(model_wrap)
+                else _resolve_impact_ag_guider_template(request, model_wrap)
+            )
             sample_guider = _build_impact_effective_guider(
                 request,
                 model_wrap,
