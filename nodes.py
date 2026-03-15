@@ -738,6 +738,18 @@ def _clear_impact_ag_guider(owner) -> None:
 
 
 def _resolve_impact_ag_guider_template(request: "_ImpactSampleRequest", model_wrap):
+    """
+    Locate an existing impact guider template from the provided request or model wrapper and return it.
+    
+    If a candidate guider is found on either model_wrap.model_patcher or request.model, the guider is returned and the internal `_ag_detailer_guider` attribute is cleared from both potential owners as a side effect.
+    
+    Parameters:
+        request (_ImpactSampleRequest): Impact request that may contain a `model` owning a guider.
+        model_wrap: Model wrapper that may contain a `model_patcher` owning a guider.
+    
+    Returns:
+        The found guider instance, or `None` if no guider template is present.
+    """
     owners = (
         getattr(model_wrap, "model_patcher", None),
         getattr(request, "model", None),
@@ -755,6 +767,16 @@ def _resolve_impact_ag_guider_template(request: "_ImpactSampleRequest", model_wr
 
 
 def _resolve_sampler_device(model_or_wrap, fallback: torch.device) -> torch.device:
+    """
+    Determine the device to use for sampling by inspecting the provided model or wrapper.
+    
+    Parameters:
+        model_or_wrap: An object (model or wrapper) to inspect for a `load_device` attribute; common wrapper fields (`inner_model`, `model`, `model_patcher`) are checked as well.
+        fallback (torch.device): Device to return if no `load_device` attribute is found on the inspected objects.
+    
+    Returns:
+        torch.device: The first `load_device` found on `model_or_wrap` or its common attributes, otherwise `fallback`.
+    """
     for obj in (
         model_or_wrap,
         getattr(model_or_wrap, "inner_model", None),
@@ -774,6 +796,19 @@ def _normalize_sampler_extra_args(
     sigmas: torch.Tensor,
     target_device: torch.device,
 ) -> dict[str, Any]:
+    """
+    Ensure the provided extra_args include a `model_options.sigmas` tensor moved to the target device.
+    
+    If `extra_args` contains a `model_options` mapping, this function copies it, sets its `sigmas` entry to `sigmas` converted to `target_device` (non-blocking), and returns a shallow-copied dict with the updated `model_options`. If `extra_args` is None or `model_options` is not a dict, returns a shallow copy of `extra_args` (or an empty dict when None).
+    
+    Parameters:
+        extra_args (dict[str, Any] | None): Extra sampler arguments that may include a `model_options` dict.
+        sigmas (torch.Tensor): Sigmas tensor to insert into `model_options`.
+        target_device (torch.device): Device to which `sigmas` will be moved.
+    
+    Returns:
+        dict[str, Any]: A normalized copy of `extra_args` with `model_options.sigmas` set to `sigmas` on `target_device` when applicable.
+    """
     normalized = {} if extra_args is None else dict(extra_args)
     model_options = normalized.get("model_options", None)
     if isinstance(model_options, dict):
@@ -785,6 +820,13 @@ def _normalize_sampler_extra_args(
 
 class _ScaleLockedPlannerGuiderProxy:
     def __init__(self, model_wrap, extra_args: dict[str, Any] | None):
+        """
+        Initialize the planner guider proxy which forwards sampling calls to the underlying model wrapper.
+        
+        Parameters:
+            model_wrap: An object that exposes a sampler-compatible interface and may provide a `model_patcher` attribute.
+            extra_args (dict[str, Any] | None): Optional model/sampler options to be merged and stored for use when sampling; a shallow copy is made if provided.
+        """
         self.model_patcher = getattr(model_wrap, "model_patcher", None)
         self._model_wrap = model_wrap
         self._extra_args = {} if extra_args is None else dict(extra_args)
@@ -800,6 +842,17 @@ class _ScaleLockedPlannerGuiderProxy:
         disable_pbar=False,
         seed=None,
     ):
+        """
+        Prepare inputs on the sampler's device/dtype, normalize extra args, and forward the call to the underlying sampler.
+        
+        Parameters:
+            denoise_mask (torch.Tensor | None): Optional mask moved to the sampler device when provided.
+            callback (callable | None): Optional progress callback; if None a no-op callback is used.
+            seed: Ignored by this proxy.
+        
+        Returns:
+            The value returned by the underlying sampler.sample(...) call.
+        """
         del seed
         if callback is None:
             callback = lambda *args, **kwargs: None
@@ -831,6 +884,14 @@ class _ScaleLockedPlannerGuiderProxy:
 
 class _ScaleLockedGuiderProxy:
     def __init__(self, base_guider, runtime, config: ScaleLockConfig):
+        """
+        Wraps a base guider and initializes its scale-lock state using the provided runtime context and configuration.
+        
+        Parameters:
+            base_guider: The underlying guider object to delegate to; must implement the guider interface used during sampling.
+            runtime: Runtime context providing model, anchors_x0, and planner_sigmas required to initialize scale-lock state.
+            config (ScaleLockConfig): Configuration object containing all scale-lock parameters (strengths, cutoffs, schedules, manifold controls, spatial masks, etc.) used to initialize the guider's scale-lock behavior.
+        """
         self._base_guider = base_guider
         init_scale_lock_state(
             self,
@@ -874,9 +935,30 @@ class _ScaleLockedGuiderProxy:
         )
 
     def __getattr__(self, name: str):
+        """
+        Delegate attribute lookup to the wrapped base guider.
+        
+        Parameters:
+            name (str): The attribute name to retrieve from the wrapped guider.
+        
+        Returns:
+            Any: The value of the requested attribute from the wrapped base guider.
+        """
         return getattr(self._base_guider, name)
 
     def __call__(self, x, timestep, model_options=None, seed=None):
+        """
+        Run the wrapped guider to produce a noise prediction then apply scale-lock adjustments.
+        
+        Parameters:
+            x (torch.Tensor): Input latent tensor for guidance.
+            timestep: Timestep value passed to the guider (e.g., scheduler timestep).
+            model_options (dict, optional): Additional model options forwarded to the base guider.
+            seed (int | None, optional): RNG seed forwarded to the base guider.
+        
+        Returns:
+            torch.Tensor: Noise prediction after applying scale-lock modifications.
+        """
         if model_options is None:
             model_options = {}
         base_noise = self._base_guider(x, timestep, model_options=model_options, seed=seed)
@@ -884,6 +966,19 @@ class _ScaleLockedGuiderProxy:
 
 
 def _sync_impact_guider_conditions(guider, positive, negative) -> None:
+    """
+    Synchronizes positive and negative conditioning on a guider object.
+    
+    Attempts to apply the provided positive and negative conditioning to the guider.
+    If the guider exposes set_conds, that method is called with (positive, negative).
+    If it exposes inner_set_conds, that method is called with {"positive": positive, "negative": negative}.
+    If neither method is present, a warning is logged. Failures during the call are caught and logged as warnings.
+    
+    Parameters:
+        guider (object): The guider instance to update; may implement `set_conds` or `inner_set_conds`.
+        positive: The positive conditioning to apply (type depends on guider implementation).
+        negative: The negative conditioning to apply (type depends on guider implementation).
+    """
     try:
         if hasattr(guider, "set_conds"):
             guider.set_conds(positive, negative)
@@ -966,6 +1061,25 @@ class _ScaleLockedImpactSampler:
         self._hook = hook
 
     def sample(self, model_wrap, sigmas, extra_args, callback, noise, latent_image=None, denoise_mask=None, disable_pbar=False):
+        """
+        Dispatches a scale-locked sampling run through the underlying sampler using a guider proxy and device-aware tensors.
+        
+        Parameters:
+            model_wrap: Model wrapper or model object used to resolve device information and guider behavior.
+            sigmas (torch.Tensor): Noise schedule tensor for the sampler; will be moved to the target device.
+            extra_args (dict | None): Additional sampler/model options; may be normalized to include device-sharded sigmas.
+            callback: Progress/callback object passed through to the underlying sampler.
+            noise (torch.Tensor): Initial noise tensor for sampling; may be replaced with prepared high-resolution noise if shapes match.
+            latent_image (dict | torch.Tensor | None): Optional high-resolution latent to sample from; if a dict is provided its "samples" entry is used.
+            denoise_mask (torch.Tensor | None): Optional denoising mask to pass to the sampler.
+            disable_pbar (bool): If true, disables progress bar propagation to the underlying sampler.
+        
+        Raises:
+            RuntimeError: If no pending impact sampling request was captured before this sampler was invoked.
+        
+        Returns:
+            The value returned by the underlying sampler's sample(...) call.
+        """
         request = self._hook._pending_request
         if request is None:
             raise RuntimeError("ScaleLockedDetailerHook: sampler request was not captured before the custom sampler was used.")
@@ -1091,6 +1205,20 @@ class _ScaleLockedDetailerHook:
         extra_args: dict[str, Any] | None,
         live_latent: dict[str, Any] | None = None,
     ) -> _ScaleLockedImpactRuntimeState:
+        """
+        Builds and registers a scale-locked impact runtime state for the given impact sampling request.
+        
+        Parameters:
+            request (_ImpactSampleRequest): Canonicalized impact sampling request containing model, seed, sampler name, and latent.
+            model_wrap: Model or model wrapper used to construct the planner guider proxy and to resolve runtime device/dtype.
+            sampler: Sampler instance to be used for planning and runtime creation.
+            sigmas (torch.Tensor): Noise schedule tensor to use for runtime construction.
+            extra_args (dict | None): Optional extra model arguments forwarded into the planner guider proxy (e.g., model_options).
+            live_latent (dict | None): Optional override latent to use for planning instead of request.latent.
+        
+        Returns:
+            _ScaleLockedImpactRuntimeState: The created runtime state containing the original request, the prepared runtime context, and the effective ScaleLockConfig computed for the planner latent.
+        """
         guard_sampler_alignment(request.sampler_name, self._settings.sampler_guard)
         planner_noise = _ScaleLockedPlannerNoise(request.seed, disable_noise=not self._settings.add_noise)
         planner_latent = request.latent if live_latent is None else live_latent
