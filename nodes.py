@@ -694,6 +694,30 @@ def _is_impact_guider_like(obj) -> bool:
     )
 
 
+def _clear_impact_ag_guider(owner) -> None:
+    if owner is None or not hasattr(owner, "_ag_detailer_guider"):
+        return
+    try:
+        delattr(owner, "_ag_detailer_guider")
+        return
+    except Exception as exc:
+        try:
+            setattr(owner, "_ag_detailer_guider", None)
+        except Exception as fallback_exc:
+            logger.warning(
+                "ScaleLockedDetailerHook: failed to clear _ag_detailer_guider on %s (delete=%r, fallback=%r).",
+                type(owner).__name__,
+                exc,
+                fallback_exc,
+            )
+        else:
+            logger.warning(
+                "ScaleLockedDetailerHook: delattr(_ag_detailer_guider) failed on %s; replaced with None instead (%r).",
+                type(owner).__name__,
+                exc,
+            )
+
+
 def _resolve_impact_ag_guider_template(request: "_ImpactSampleRequest", model_wrap):
     owners = (
         getattr(model_wrap, "model_patcher", None),
@@ -706,14 +730,63 @@ def _resolve_impact_ag_guider_template(request: "_ImpactSampleRequest", model_wr
         if candidate is None:
             continue
         for clear_owner in owners:
-            if clear_owner is None:
-                continue
-            try:
-                delattr(clear_owner, "_ag_detailer_guider")
-            except Exception:
-                pass
+            _clear_impact_ag_guider(clear_owner)
         return candidate
     return None
+
+
+def _sync_impact_guider_conditions(guider, positive, negative) -> None:
+    try:
+        if hasattr(guider, "set_conds"):
+            guider.set_conds(positive, negative)
+        elif hasattr(guider, "inner_set_conds"):
+            guider.inner_set_conds({"positive": positive, "negative": negative})
+        else:
+            logger.warning(
+                "ScaleLockedDetailerHook: guider %s does not expose set_conds/inner_set_conds.",
+                type(guider).__name__,
+            )
+    except Exception as exc:
+        logger.warning(
+            "ScaleLockedDetailerHook: failed to sync guider conditions on %s: %r",
+            type(guider).__name__,
+            exc,
+        )
+
+
+def _sync_impact_guider_cfg(guider, cfg: float) -> None:
+    try:
+        if hasattr(guider, "set_scales"):
+            w_ag = getattr(guider, "w_ag", None)
+            if w_ag is None:
+                w_ag = getattr(guider, "w_autoguide", 2.0)
+            guider.set_scales(cfg=float(cfg), w_ag=float(w_ag))
+        elif hasattr(guider, "set_cfg"):
+            guider.set_cfg(float(cfg))
+        else:
+            guider.cfg = float(cfg)
+    except Exception as exc:
+        logger.warning(
+            "ScaleLockedDetailerHook: failed to sync guider cfg/scales on %s: %r",
+            type(guider).__name__,
+            exc,
+        )
+
+
+def _apply_impact_model_options(guider, extra_args: dict[str, Any] | None) -> None:
+    if not isinstance(extra_args, dict):
+        return
+    model_options = extra_args.get("model_options", None)
+    if not isinstance(model_options, dict):
+        return
+    try:
+        guider.model_options = dict(model_options)
+    except Exception as exc:
+        logger.warning(
+            "ScaleLockedDetailerHook: failed to copy model_options onto guider %s: %r",
+            type(guider).__name__,
+            exc,
+        )
 
 
 def _build_impact_effective_guider(
@@ -732,32 +805,10 @@ def _build_impact_effective_guider(
         guider = create_cfg_guider(request.model, request.positive, request.negative, float(request.cfg))
     else:
         guider = clone_guider_for_scale_lock(guider_template)
+        _sync_impact_guider_conditions(guider, request.positive, request.negative)
+        _sync_impact_guider_cfg(guider, float(request.cfg))
 
-        try:
-            guider.set_conds(request.positive, request.negative)
-        except Exception:
-            pass
-
-        try:
-            if hasattr(guider, "set_scales"):
-                w_ag = getattr(guider, "w_ag", None)
-                if w_ag is None:
-                    w_ag = getattr(guider, "w_autoguide", 2.0)
-                guider.set_scales(cfg=float(request.cfg), w_ag=float(w_ag))
-            elif hasattr(guider, "set_cfg"):
-                guider.set_cfg(float(request.cfg))
-            else:
-                guider.cfg = float(request.cfg)
-        except Exception:
-            pass
-
-    if isinstance(extra_args, dict):
-        model_options = extra_args.get("model_options", None)
-        if isinstance(model_options, dict):
-            try:
-                guider.model_options = dict(model_options)
-            except Exception:
-                pass
+    _apply_impact_model_options(guider, extra_args)
 
     return guider
 
@@ -807,11 +858,24 @@ class _ScaleLockedImpactSampler:
             )
             apply_scale_lock_to_guider(sample_guider, state.runtime, state.config)
 
+            target_device = state.runtime.highres_latent["samples"].device
+            target_dtype = state.runtime.highres_latent["samples"].dtype
             sampling_noise = state.runtime.highres_noise
-            if tuple(sampling_noise.shape) != tuple(noise.shape):
-                sampling_noise = noise
             sampling_latent = state.runtime.highres_latent["samples"]
             sampling_mask = state.runtime.highres_latent.get("noise_mask", denoise_mask)
+
+            if tuple(sampling_noise.shape) != tuple(noise.shape):
+                sampling_noise = noise
+                if latent_image is not None:
+                    sampling_latent = latent_image
+                else:
+                    sampling_latent = planner_latent["samples"]
+                sampling_mask = denoise_mask
+
+            sampling_noise = sampling_noise.to(device=target_device, dtype=target_dtype, non_blocking=True)
+            sampling_latent = sampling_latent.to(device=target_device, dtype=target_dtype, non_blocking=True)
+            if isinstance(sampling_mask, torch.Tensor):
+                sampling_mask = sampling_mask.to(device=target_device, non_blocking=True)
 
             return sample_guider.sample(
                 sampling_noise,
