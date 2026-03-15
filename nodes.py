@@ -19,6 +19,7 @@ from .slrd_runtime import (
     clean_latent,
     compat_sampler_names,
     compat_scheduler_names,
+    create_cfg_guider,
     fix_latent_channels,
     guard_sampler_alignment,
     make_lowres_latent,
@@ -684,119 +685,132 @@ class _ScaleLockedPlannerNoise:
         )
 
 
-def _resolve_sampler_device(model_or_wrap, fallback: torch.device) -> torch.device:
-    for obj in (
-        model_or_wrap,
-        getattr(model_or_wrap, "inner_model", None),
-        getattr(model_or_wrap, "model", None),
-        getattr(model_or_wrap, "model_patcher", None),
-    ):
-        if obj is None:
+def _is_impact_guider_like(obj) -> bool:
+    return (
+        obj is not None
+        and hasattr(obj, "sample")
+        and hasattr(obj, "model_patcher")
+        and (hasattr(obj, "set_conds") or hasattr(obj, "inner_set_conds"))
+    )
+
+
+def _clear_impact_ag_guider(owner) -> None:
+    if owner is None or not hasattr(owner, "_ag_detailer_guider"):
+        return
+    try:
+        delattr(owner, "_ag_detailer_guider")
+        return
+    except Exception as exc:
+        try:
+            setattr(owner, "_ag_detailer_guider", None)
+        except Exception as fallback_exc:
+            logger.warning(
+                "ScaleLockedDetailerHook: failed to clear _ag_detailer_guider on %s (delete=%r, fallback=%r).",
+                type(owner).__name__,
+                exc,
+                fallback_exc,
+            )
+        else:
+            logger.warning(
+                "ScaleLockedDetailerHook: delattr(_ag_detailer_guider) failed on %s; replaced with None instead (%r).",
+                type(owner).__name__,
+                exc,
+            )
+
+
+def _resolve_impact_ag_guider_template(request: "_ImpactSampleRequest", model_wrap):
+    owners = (
+        getattr(model_wrap, "model_patcher", None),
+        getattr(request, "model", None),
+    )
+    for owner in owners:
+        if owner is None:
             continue
-        device = getattr(obj, "load_device", None)
-        if device is not None:
-            return device
-    return fallback
+        candidate = getattr(owner, "_ag_detailer_guider", None)
+        if candidate is None:
+            continue
+        for clear_owner in owners:
+            _clear_impact_ag_guider(clear_owner)
+        return candidate
+    return None
 
 
-def _normalize_sampler_extra_args(
-    extra_args: dict[str, Any] | None, sigmas: torch.Tensor, target_device: torch.device
-) -> dict[str, Any]:
-    normalized = {} if extra_args is None else dict(extra_args)
-    model_options = normalized.get("model_options", None)
-    if isinstance(model_options, dict):
-        model_options = dict(model_options)
-        model_options["sigmas"] = sigmas.to(device=target_device, non_blocking=True)
-        normalized["model_options"] = model_options
-    return normalized
-
-
-class _ScaleLockedPlannerGuiderProxy:
-    def __init__(self, model, model_wrap, extra_args):
-        self.model_patcher = model
-        self._model_wrap = model_wrap
-        self._extra_args = {} if extra_args is None else dict(extra_args)
-
-    def sample(self, noise, latent_samples, sampler, sigmas, denoise_mask=None, callback=None, disable_pbar=False, seed=None):
-        del seed
-        if callback is None:
-            callback = lambda *args, **kwargs: None
-        target_device = _resolve_sampler_device(self._model_wrap, latent_samples.device)
-        target_dtype = latent_samples.dtype
-        latent_samples = latent_samples.to(
-            device=target_device,
-            dtype=target_dtype,
-            non_blocking=True,
-        )
-        noise = noise.to(device=target_device, dtype=target_dtype, non_blocking=True)
-        sigmas = sigmas.to(device=target_device, non_blocking=True)
-        if isinstance(denoise_mask, torch.Tensor):
-            denoise_mask = denoise_mask.to(device=target_device, non_blocking=True)
-        sample_extra_args = _normalize_sampler_extra_args(self._extra_args, sigmas, target_device)
-        return sampler.sample(
-            self._model_wrap,
-            sigmas,
-            sample_extra_args,
-            callback,
-            noise,
-            latent_image=latent_samples,
-            denoise_mask=denoise_mask,
-            disable_pbar=disable_pbar,
+def _sync_impact_guider_conditions(guider, positive, negative) -> None:
+    try:
+        if hasattr(guider, "set_conds"):
+            guider.set_conds(positive, negative)
+        elif hasattr(guider, "inner_set_conds"):
+            guider.inner_set_conds({"positive": positive, "negative": negative})
+        else:
+            logger.warning(
+                "ScaleLockedDetailerHook: guider %s does not expose set_conds/inner_set_conds.",
+                type(guider).__name__,
+            )
+    except Exception as exc:
+        logger.warning(
+            "ScaleLockedDetailerHook: failed to sync guider conditions on %s: %r",
+            type(guider).__name__,
+            exc,
         )
 
 
-class _ScaleLockedGuiderProxy:
-    def __init__(self, base_guider, runtime, config: ScaleLockConfig):
-        self._base_guider = base_guider
-        init_scale_lock_state(
-            self,
-            model=runtime.model,
-            anchors_x0_cpu=runtime.anchors_x0,
-            planner_sigmas=runtime.planner_sigmas,
-            lock_strength=config.lock_strength,
-            lock_strength_start=config.lock_strength_start,
-            lock_strength_end=config.lock_strength_end,
-            cutoff=config.cutoff,
-            mid_cutoff=config.mid_cutoff,
-            mid_strength=config.mid_strength,
-            schedule=config.schedule,
-            schedule_power=config.schedule_power,
-            schedule_hold=config.schedule_hold,
-            mid_strength_start=config.mid_strength_start,
-            mid_strength_end=config.mid_strength_end,
-            mid_schedule=config.mid_schedule,
-            mid_schedule_power=config.mid_schedule_power,
-            mid_schedule_hold=config.mid_schedule_hold,
-            spatial_mask=config.spatial_mask,
-            manifold_enabled=config.manifold_enabled,
-            manifold_strength=config.manifold_strength,
-            manifold_strength_start=config.manifold_strength_start,
-            manifold_strength_end=config.manifold_strength_end,
-            manifold_schedule=config.manifold_schedule,
-            manifold_schedule_power=config.manifold_schedule_power,
-            manifold_schedule_hold=config.manifold_schedule_hold,
-            manifold_cutoff=config.manifold_cutoff,
-            manifold_radial_strength=config.manifold_radial_strength,
-            manifold_anisotropy=config.manifold_anisotropy,
-            manifold_translation_strength=config.manifold_translation_strength,
-            manifold_anchor_mix=config.manifold_anchor_mix,
-            manifold_mean_anchor_mix=config.manifold_mean_anchor_mix,
-            manifold_contrast_restore=config.manifold_contrast_restore,
-            manifold_energy_tether=config.manifold_energy_tether,
-            manifold_channel_tether=config.manifold_channel_tether,
-            manifold_energy_gain_cap=config.manifold_energy_gain_cap,
-            manifold_max_shift_px=config.manifold_max_shift_px,
-            manifold_spatial_mask=config.manifold_spatial_mask,
+def _sync_impact_guider_cfg(guider, cfg: float) -> None:
+    try:
+        if hasattr(guider, "set_scales"):
+            w_ag = getattr(guider, "w_ag", None)
+            if w_ag is None:
+                w_ag = getattr(guider, "w_autoguide", 2.0)
+            guider.set_scales(cfg=float(cfg), w_ag=float(w_ag))
+        elif hasattr(guider, "set_cfg"):
+            guider.set_cfg(float(cfg))
+        else:
+            guider.cfg = float(cfg)
+    except Exception as exc:
+        logger.warning(
+            "ScaleLockedDetailerHook: failed to sync guider cfg/scales on %s: %r",
+            type(guider).__name__,
+            exc,
         )
 
-    def __getattr__(self, name: str):
-        return getattr(self._base_guider, name)
 
-    def __call__(self, x, timestep, model_options=None, seed=None):
-        if model_options is None:
-            model_options = {}
-        base_noise = self._base_guider(x, timestep, model_options=model_options, seed=seed)
-        return apply_scale_lock_to_noise_prediction(self, base_noise, x, timestep)
+def _apply_impact_model_options(guider, extra_args: dict[str, Any] | None) -> None:
+    if not isinstance(extra_args, dict):
+        return
+    model_options = extra_args.get("model_options", None)
+    if not isinstance(model_options, dict):
+        return
+    try:
+        guider.model_options = dict(model_options)
+    except Exception as exc:
+        logger.warning(
+            "ScaleLockedDetailerHook: failed to copy model_options onto guider %s: %r",
+            type(guider).__name__,
+            exc,
+        )
+
+
+def _build_impact_effective_guider(
+    request: "_ImpactSampleRequest",
+    model_wrap,
+    extra_args: dict[str, Any] | None,
+    guider_template=None,
+):
+    if guider_template is None:
+        if _is_impact_guider_like(model_wrap):
+            guider_template = model_wrap
+        else:
+            guider_template = _resolve_impact_ag_guider_template(request, model_wrap)
+
+    if guider_template is None:
+        guider = create_cfg_guider(request.model, request.positive, request.negative, float(request.cfg))
+    else:
+        guider = clone_guider_for_scale_lock(guider_template)
+        _sync_impact_guider_conditions(guider, request.positive, request.negative)
+        _sync_impact_guider_cfg(guider, float(request.cfg))
+
+    _apply_impact_model_options(guider, extra_args)
+
+    return guider
 
 
 class _ScaleLockedImpactSampler:
@@ -817,51 +831,61 @@ class _ScaleLockedImpactSampler:
                 planner_latent["noise_mask"] = denoise_mask
 
             base_sampler = comfy.samplers.sampler_object(request.sampler_name)
+            guider_template = (
+                model_wrap
+                if _is_impact_guider_like(model_wrap)
+                else _resolve_impact_ag_guider_template(request, model_wrap)
+            )
+            planner_guider = _build_impact_effective_guider(
+                request,
+                model_wrap,
+                extra_args,
+                guider_template=guider_template,
+            )
             state = self._hook._prepare_runtime_state_for_sampler(
                 request=request,
-                model_wrap=model_wrap,
+                guider=planner_guider,
                 sampler=base_sampler,
                 sigmas=sigmas,
-                extra_args=extra_args,
                 live_latent=planner_latent,
             )
-            proxy = _ScaleLockedGuiderProxy(model_wrap, state.runtime, state.config)
 
-            sampling_noise = noise
-            fallback_device = latent_image.device if latent_image is not None else noise.device
-            target_device = _resolve_sampler_device(model_wrap, fallback_device)
-            target_dtype = latent_image.dtype if latent_image is not None else noise.dtype
+            sample_guider = _build_impact_effective_guider(
+                request,
+                model_wrap,
+                extra_args,
+                guider_template=guider_template,
+            )
+            apply_scale_lock_to_guider(sample_guider, state.runtime, state.config)
 
-            prepared_noise = state.runtime.highres_noise
-            if tuple(prepared_noise.shape) == tuple(noise.shape):
-                sampling_noise = prepared_noise.to(
-                    device=target_device,
-                    dtype=target_dtype,
-                    non_blocking=True,
-                ).clone()
-            else:
-                sampling_noise = sampling_noise.to(
-                    device=target_device,
-                    dtype=target_dtype,
-                    non_blocking=True,
-                )
+            target_device = state.runtime.highres_latent["samples"].device
+            target_dtype = state.runtime.highres_latent["samples"].dtype
+            sampling_noise = state.runtime.highres_noise
+            sampling_latent = state.runtime.highres_latent["samples"]
+            sampling_mask = state.runtime.highres_latent.get("noise_mask", denoise_mask)
 
-            sampling_latent = latent_image if latent_image is not None else state.runtime.highres_latent["samples"]
+            if tuple(sampling_noise.shape) != tuple(noise.shape):
+                sampling_noise = noise
+                if latent_image is not None:
+                    sampling_latent = latent_image
+                else:
+                    sampling_latent = planner_latent["samples"]
+                sampling_mask = denoise_mask
+
+            sampling_noise = sampling_noise.to(device=target_device, dtype=target_dtype, non_blocking=True)
             sampling_latent = sampling_latent.to(device=target_device, dtype=target_dtype, non_blocking=True)
-            sigmas = sigmas.to(device=target_device, non_blocking=True)
-            if isinstance(denoise_mask, torch.Tensor):
-                denoise_mask = denoise_mask.to(device=target_device, non_blocking=True)
-            sample_extra_args = _normalize_sampler_extra_args(extra_args, sigmas, target_device)
+            if isinstance(sampling_mask, torch.Tensor):
+                sampling_mask = sampling_mask.to(device=target_device, non_blocking=True)
 
-            return base_sampler.sample(
-                proxy,
-                sigmas,
-                sample_extra_args,
-                callback,
+            return sample_guider.sample(
                 sampling_noise,
-                latent_image=sampling_latent,
-                denoise_mask=denoise_mask,
+                sampling_latent,
+                base_sampler,
+                state.runtime.sigmas,
+                denoise_mask=sampling_mask,
+                callback=callback,
                 disable_pbar=disable_pbar,
+                seed=state.runtime.noise_seed,
             )
         finally:
             self._hook._clear_sampler_state()
@@ -912,20 +936,17 @@ class _ScaleLockedDetailerHook:
     def _prepare_runtime_state_for_sampler(
         self,
         request: _ImpactSampleRequest,
-        model_wrap,
+        guider,
         sampler,
         sigmas,
-        extra_args,
         live_latent: dict[str, Any] | None = None,
     ) -> _ScaleLockedImpactRuntimeState:
         guard_sampler_alignment(request.sampler_name, self._settings.sampler_guard)
         planner_noise = _ScaleLockedPlannerNoise(request.seed, disable_noise=not self._settings.add_noise)
-        planner_model = getattr(model_wrap, "model_patcher", request.model)
-        planner_guider = _ScaleLockedPlannerGuiderProxy(planner_model, model_wrap, extra_args)
         planner_latent = request.latent if live_latent is None else live_latent
         runtime = build_runtime_context_from_advanced(
             noise=planner_noise,
-            guider=planner_guider,
+            guider=guider,
             sampler=sampler,
             sigmas=sigmas,
             latent_image=planner_latent,
