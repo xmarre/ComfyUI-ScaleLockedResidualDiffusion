@@ -1,7 +1,7 @@
 [project]
 name = "scale-locked-residual-diffusion"
 description = "A ComfyUI custom node pack implementing Scale-Locked Residual Diffusion for high-resolution composition and anatomy stability."
-version = "1.0.18"
+version = "1.0.19"
 license = { file = "LICENSE" }
 
 [project.urls]
