@@ -655,6 +655,21 @@ def _combine_masks(*masks: torch.Tensor | None) -> torch.Tensor | None:
     return None if combined is None else combined.clamp(0.0, 1.0)
 
 
+_DETAILER_SUPPORT_MASK_EPS = 1e-3
+
+
+def _detailer_support_mask_for_like(mask: torch.Tensor | None, like: torch.Tensor) -> torch.Tensor | None:
+    expanded = _expand_mask_for_like(mask, like)
+    if expanded is None:
+        return None
+
+    # Impact detailer masks are compositing weights. Preserving their soft latent-cell
+    # variation turns them into a spatially varying SLRD strength field, which causes
+    # blotchy low-frequency corrections inside smooth regions. SLRD should see a support
+    # mask here: on inside the selected region, off outside it.
+    return expanded.gt(_DETAILER_SUPPORT_MASK_EPS).to(dtype=like.dtype)
+
+
 def _canonicalize_impact_noise_mask(mask: Any) -> torch.Tensor | None:
     if not isinstance(mask, torch.Tensor):
         return None
@@ -1172,7 +1187,7 @@ class _ScaleLockedDetailerHook:
         cfg = self._settings.config
 
         detailer_mask_source = runtime_mask if runtime_mask is not None else self._upscale_mask
-        detailer_mask = _expand_mask_for_like(detailer_mask_source, samples)
+        detailer_mask = _detailer_support_mask_for_like(detailer_mask_source, samples)
         lock_mask = _combine_masks(detailer_mask, _expand_mask_for_like(cfg.spatial_mask, samples))
         manifold_source = cfg.manifold_spatial_mask if cfg.manifold_spatial_mask is not None else cfg.spatial_mask
         manifold_mask = _combine_masks(detailer_mask, _expand_mask_for_like(manifold_source, samples))
