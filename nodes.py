@@ -1080,6 +1080,7 @@ class _ScaleLockedImpactSampler:
                 sigmas=sigmas,
                 extra_args=extra_args,
                 live_latent=planner_latent,
+                runtime_mask=planner_mask,
             )
 
             proxy = _ScaleLockedGuiderProxy(model_wrap, state.runtime, state.config)
@@ -1163,13 +1164,18 @@ class _ScaleLockedDetailerHook:
             stage,
         )
 
-    def _effective_config_for_samples(self, samples: torch.Tensor) -> ScaleLockConfig:
+    def _effective_config_for_samples(
+        self,
+        samples: torch.Tensor,
+        runtime_mask: torch.Tensor | None = None,
+    ) -> ScaleLockConfig:
         cfg = self._settings.config
 
-        face_mask = _expand_mask_for_like(self._upscale_mask, samples)
-        lock_mask = _combine_masks(face_mask, _expand_mask_for_like(cfg.spatial_mask, samples))
+        detailer_mask_source = runtime_mask if runtime_mask is not None else self._upscale_mask
+        detailer_mask = _expand_mask_for_like(detailer_mask_source, samples)
+        lock_mask = _combine_masks(detailer_mask, _expand_mask_for_like(cfg.spatial_mask, samples))
         manifold_source = cfg.manifold_spatial_mask if cfg.manifold_spatial_mask is not None else cfg.spatial_mask
-        manifold_mask = _combine_masks(face_mask, _expand_mask_for_like(manifold_source, samples))
+        manifold_mask = _combine_masks(detailer_mask, _expand_mask_for_like(manifold_source, samples))
         return replace(cfg, spatial_mask=lock_mask, manifold_spatial_mask=manifold_mask)
 
     def _prepare_runtime_state_for_sampler(
@@ -1180,6 +1186,7 @@ class _ScaleLockedDetailerHook:
         sigmas,
         extra_args: dict[str, Any] | None,
         live_latent: dict[str, Any] | None = None,
+        runtime_mask: torch.Tensor | None = None,
     ) -> _ScaleLockedImpactRuntimeState:
         """
         Builds and registers a scale-locked impact runtime state for the given impact sampling request.
@@ -1191,6 +1198,7 @@ class _ScaleLockedDetailerHook:
             sigmas (torch.Tensor): Noise schedule tensor to use for runtime construction.
             extra_args (dict | None): Optional extra model arguments forwarded into the planner guider proxy (e.g., model_options).
             live_latent (dict | None): Optional override latent to use for planning instead of request.latent.
+            runtime_mask (torch.Tensor | None): Optional latent-space mask actually used by the detailer sampler for this cycle.
         
         Returns:
             _ScaleLockedImpactRuntimeState: The created runtime state containing the original request, the prepared runtime context, and the effective ScaleLockConfig computed for the planner latent.
@@ -1212,7 +1220,7 @@ class _ScaleLockedDetailerHook:
         state = _ScaleLockedImpactRuntimeState(
             request=request,
             runtime=runtime,
-            config=self._effective_config_for_samples(runtime.highres_latent["samples"]),
+            config=self._effective_config_for_samples(runtime.highres_latent["samples"], runtime_mask=runtime_mask),
         )
         self._active_runtime = state
         return state
