@@ -1127,20 +1127,25 @@ class _ScaleLockedImpactSampler:
 
             proxy = _ScaleLockedGuiderProxy(model_wrap, state.runtime, state.config)
 
-            sampling_noise = noise
             fallback_device = latent_image.device if latent_image is not None else noise.device
             target_device = _resolve_sampler_device(model_wrap, fallback_device)
             target_dtype = latent_image.dtype if latent_image is not None else noise.dtype
+            sampling_mask = planner_mask
 
             prepared_noise = state.runtime.highres_noise
-            if tuple(prepared_noise.shape) == tuple(noise.shape):
+            use_prepared_noise = (
+                not isinstance(sampling_mask, torch.Tensor)
+                and tuple(prepared_noise.shape) == tuple(noise.shape)
+            )
+
+            if use_prepared_noise:
                 sampling_noise = prepared_noise.to(
                     device=target_device,
                     dtype=target_dtype,
                     non_blocking=True,
                 ).clone()
             else:
-                sampling_noise = sampling_noise.to(
+                sampling_noise = noise.to(
                     device=target_device,
                     dtype=target_dtype,
                     non_blocking=True,
@@ -1153,7 +1158,6 @@ class _ScaleLockedImpactSampler:
                 non_blocking=True,
             )
 
-            sampling_mask = planner_mask
             sigmas = sigmas.to(device=target_device, non_blocking=True)
             if isinstance(sampling_mask, torch.Tensor):
                 sampling_mask = sampling_mask.to(device=target_device, non_blocking=True)
