@@ -1217,11 +1217,19 @@ class _ScaleLockedDetailerHook:
     ) -> ScaleLockConfig:
         cfg = self._settings.config
 
-        detailer_mask_source = runtime_mask if runtime_mask is not None else self._upscale_mask
-        detailer_mask = _detailer_support_mask_for_like(detailer_mask_source, samples)
-        lock_mask = _combine_masks(detailer_mask, _expand_mask_for_like(cfg.spatial_mask, samples))
+        del runtime_mask
+
+        # Do not implicitly reuse the detailer/inpaint mask as an SLRD correction mask.
+        #
+        # The detailer crop and the sampler's own denoise_mask already define where masked
+        # denoising/compositing happens. Intersecting SLRD's residual/manifold correction
+        # field with that mask a second time creates a discontinuous correction field inside
+        # the crop, which shows up as halos, blur, and chroma blotches in masked detailer runs.
+        #
+        # Preserve only explicit user-provided SLRD masks here.
+        lock_mask = _expand_mask_for_like(cfg.spatial_mask, samples)
         manifold_source = cfg.manifold_spatial_mask if cfg.manifold_spatial_mask is not None else cfg.spatial_mask
-        manifold_mask = _combine_masks(detailer_mask, _expand_mask_for_like(manifold_source, samples))
+        manifold_mask = _expand_mask_for_like(manifold_source, samples)
         return replace(cfg, spatial_mask=lock_mask, manifold_spatial_mask=manifold_mask)
 
     def _prepare_runtime_state_for_sampler(
