@@ -1126,7 +1126,7 @@ class _ScaleLockedImpactSampler:
                 non_blocking=True,
             )
 
-            sampling_mask = planner_mask if planner_mask is not None else denoise_mask
+            sampling_mask = denoise_mask
             sigmas = sigmas.to(device=target_device, non_blocking=True)
             if isinstance(sampling_mask, torch.Tensor):
                 sampling_mask = sampling_mask.to(device=target_device, non_blocking=True)
