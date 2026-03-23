@@ -9,7 +9,7 @@ import math
 import torch
 import comfy.samplers
 
-from .slrd_core import build_nested_noise, clone_latent, init_scale_lock_state, resize_4d_tensor
+from .slrd_core import build_nested_noise, clone_latent, init_scale_lock_state, resize_4d_tensor, resize_mask
 from .slrd_runtime import (
     LOCK_SCHEDULE_OPTIONS,
     MID_SCHEDULE_OPTIONS,
@@ -689,6 +689,29 @@ def _canonicalize_impact_noise_mask(mask: Any) -> torch.Tensor | None:
     return None
 
 
+def _resolve_impact_sampling_mask(
+    latent_samples: torch.Tensor,
+    latent_mask: Any,
+    denoise_mask: Any,
+) -> torch.Tensor | None:
+    target_hw = tuple(latent_samples.shape[-2:])
+    batch = latent_samples.shape[0]
+
+    def _normalize(mask: Any) -> torch.Tensor | None:
+        canonical = _canonicalize_impact_noise_mask(mask)
+        if canonical is None:
+            return None
+        resized = resize_mask(canonical, target_hw, batch, 1)
+        if resized is None:
+            return None
+        return resized[:, :1, :, :].squeeze(1).contiguous()
+
+    sampler_mask = _normalize(denoise_mask)
+    if sampler_mask is not None:
+        return sampler_mask
+    return _normalize(latent_mask)
+
+
 def _impact_request_tuple_from_kwargs(kwargs: dict[str, Any]) -> tuple[Any, ...]:
     if not kwargs:
         return ()
@@ -1081,11 +1104,15 @@ class _ScaleLockedImpactSampler:
             if latent_image is not None:
                 planner_latent["samples"] = latent_image
 
-            planner_mask = _canonicalize_impact_noise_mask(planner_latent.get("noise_mask", None))
-            if planner_mask is None:
-                planner_mask = _canonicalize_impact_noise_mask(denoise_mask)
+            planner_mask = _resolve_impact_sampling_mask(
+                planner_latent["samples"],
+                planner_latent.get("noise_mask", None),
+                denoise_mask,
+            )
             if planner_mask is not None:
                 planner_latent["noise_mask"] = planner_mask
+            else:
+                planner_latent.pop("noise_mask", None)
 
             base_sampler = comfy.samplers.sampler_object(request.sampler_name)
             state = self._hook._prepare_runtime_state_for_sampler(
@@ -1126,7 +1153,7 @@ class _ScaleLockedImpactSampler:
                 non_blocking=True,
             )
 
-            sampling_mask = denoise_mask
+            sampling_mask = planner_mask
             sigmas = sigmas.to(device=target_device, non_blocking=True)
             if isinstance(sampling_mask, torch.Tensor):
                 sampling_mask = sampling_mask.to(device=target_device, non_blocking=True)
