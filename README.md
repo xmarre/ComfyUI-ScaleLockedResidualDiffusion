@@ -55,13 +55,15 @@ One-node version of the modular custom-sampling workflow. Internally it now call
 
 Experimental Impact Pack / FaceDetailer integration path.
 
-This node returns a `DETAILER_HOOK` object that preserves the FaceDetailer crop mask, records the encoded crop latent as the anchor in `post_encode(...)`, and applies one-shot residual/manifold correction in `pre_decode(...)`.
+This node returns a `DETAILER_HOOK` object that captures the FaceDetailer crop mask in `post_upscale(...)` and drives the masked residual/manifold correction through the hook's sampler path.
 
-This provider no longer advertises sampler-runtime controls that do not participate in its one-shot hook path. The exposed knobs are the ones that still affect the masked latent correction directly:
+The live hook path is `pre_ksample(...)` plus the custom sampler/runtime integration, not the inert `post_encode(...)` / `pre_decode(...)` pair.
+
+This provider no longer advertises sampler-runtime controls that do not participate in its live sampler-driven hook path. The exposed knobs are the ones that still affect the masked latent correction directly:
 
 - residual lock strength and cutoffs,
 - optional manifold companding controls,
-- optional `lock_mask` / `manifold_mask`, which are intersected with the FaceDetailer mask.
+- optional `lock_mask` / `manifold_mask`, which are intersected with the FaceDetailer support mask.
 
 Compatibility note: this provider's input signature changed when the inert detailer-only sampler/runtime controls were removed. Older saved workflows that used the previous `Scale-Locked Detailer Hook Provider` input surface will need to be re-wired to the current node inputs.
 
@@ -90,9 +92,8 @@ A public guider node alone does not make FaceDetailer use SLRD. `Scale-Locked De
 The current hook implementation is duck-typed rather than source-verified against a live Impact Pack checkout:
 
 - FaceDetailer mask capture via `post_upscale(...)`,
-- self-anchoring via `post_encode(...)`,
 - alias-tolerant request capture via `pre_ksample(...)`,
-- masked latent correction via `pre_decode(...)`.
+- masked latent correction via the custom sampler/runtime path.
 
 Because Impact Pack's internal contracts can move, this integration should be treated as unverified runtime glue until it is exercised against the current Impact Pack source.
 

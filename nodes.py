@@ -1217,19 +1217,23 @@ class _ScaleLockedDetailerHook:
     ) -> ScaleLockConfig:
         cfg = self._settings.config
 
-        del runtime_mask
+        detailer_support = _detailer_support_mask_for_like(
+            runtime_mask if runtime_mask is not None else self._upscale_mask,
+            samples,
+        )
 
-        # Do not implicitly reuse the detailer/inpaint mask as an SLRD correction mask.
-        #
-        # The detailer crop and the sampler's own denoise_mask already define where masked
-        # denoising/compositing happens. Intersecting SLRD's residual/manifold correction
-        # field with that mask a second time creates a discontinuous correction field inside
-        # the crop, which shows up as halos, blur, and chroma blotches in masked detailer runs.
-        #
-        # Preserve only explicit user-provided SLRD masks here.
-        lock_mask = _expand_mask_for_like(cfg.spatial_mask, samples)
-        manifold_source = cfg.manifold_spatial_mask if cfg.manifold_spatial_mask is not None else cfg.spatial_mask
-        manifold_mask = _expand_mask_for_like(manifold_source, samples)
+        # In the detailer hook path, SLRD must not extend beyond the region that the
+        # detailer actually denoises/composites for this crop. Treat the live sampler mask
+        # or captured upscale mask as the default support mask, then let explicit user masks
+        # further restrict that support.
+        explicit_lock_mask = _expand_mask_for_like(cfg.spatial_mask, samples)
+        lock_mask = _combine_masks(detailer_support, explicit_lock_mask)
+
+        explicit_manifold_source = (
+            cfg.manifold_spatial_mask if cfg.manifold_spatial_mask is not None else cfg.spatial_mask
+        )
+        explicit_manifold_mask = _expand_mask_for_like(explicit_manifold_source, samples)
+        manifold_mask = _combine_masks(detailer_support, explicit_manifold_mask)
         return replace(cfg, spatial_mask=lock_mask, manifold_spatial_mask=manifold_mask)
 
     def _prepare_runtime_state_for_sampler(
