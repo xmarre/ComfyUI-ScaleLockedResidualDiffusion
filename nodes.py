@@ -29,6 +29,7 @@ from .slrd_runtime import (
     sample_with_runtime,
     apply_scale_lock_to_guider,
     clone_guider_for_scale_lock,
+    restore_original_predict_noise,
 )
 
 
@@ -1076,7 +1077,7 @@ class _ScaleLockedImpactSampler:
 
     def sample(self, model_wrap, sigmas, extra_args, callback, noise, latent_image=None, denoise_mask=None, disable_pbar=False):
         """
-        Dispatches a scale-locked sampling run through the underlying sampler using a guider proxy and device-aware tensors.
+        Dispatches a scale-locked sampling run through the underlying sampler using an effective guider and device-aware tensors.
         
         Parameters:
             model_wrap: Model wrapper or model object used to resolve device information and guider behavior.
@@ -1115,17 +1116,15 @@ class _ScaleLockedImpactSampler:
                 planner_latent.pop("noise_mask", None)
 
             base_sampler = comfy.samplers.sampler_object(request.sampler_name)
+            effective_guider = _build_impact_effective_guider(request, model_wrap, extra_args)
             state = self._hook._prepare_runtime_state_for_sampler(
                 request=request,
-                model_wrap=model_wrap,
+                guider=effective_guider,
                 sampler=base_sampler,
                 sigmas=sigmas,
-                extra_args=extra_args,
                 live_latent=planner_latent,
                 runtime_mask=planner_mask,
             )
-
-            proxy = _ScaleLockedGuiderProxy(model_wrap, state.runtime, state.config)
 
             fallback_device = latent_image.device if latent_image is not None else noise.device
             target_device = _resolve_sampler_device(model_wrap, fallback_device)
@@ -1159,17 +1158,20 @@ class _ScaleLockedImpactSampler:
             if isinstance(sampling_mask, torch.Tensor):
                 sampling_mask = sampling_mask.to(device=target_device, non_blocking=True)
 
-            sample_extra_args = _normalize_sampler_extra_args(extra_args, sigmas, target_device)
-            return base_sampler.sample(
-                proxy,
-                sigmas,
-                sample_extra_args,
-                callback,
-                sampling_noise,
-                latent_image=sampling_latent,
-                denoise_mask=sampling_mask,
-                disable_pbar=disable_pbar,
-            )
+            apply_scale_lock_to_guider(effective_guider, state.runtime, state.config)
+            try:
+                return effective_guider.sample(
+                    sampling_noise,
+                    sampling_latent,
+                    base_sampler,
+                    sigmas,
+                    denoise_mask=sampling_mask,
+                    callback=callback,
+                    disable_pbar=disable_pbar,
+                    seed=state.runtime.noise_seed,
+                )
+            finally:
+                restore_original_predict_noise(effective_guider)
         finally:
             self._hook._clear_sampler_state()
 
@@ -1236,10 +1238,9 @@ class _ScaleLockedDetailerHook:
     def _prepare_runtime_state_for_sampler(
         self,
         request: _ImpactSampleRequest,
-        model_wrap,
+        guider,
         sampler,
         sigmas,
-        extra_args: dict[str, Any] | None,
         live_latent: dict[str, Any] | None = None,
         runtime_mask: torch.Tensor | None = None,
     ) -> _ScaleLockedImpactRuntimeState:
@@ -1248,10 +1249,9 @@ class _ScaleLockedDetailerHook:
         
         Parameters:
             request (_ImpactSampleRequest): Canonicalized impact sampling request containing model, seed, sampler name, and latent.
-            model_wrap: Model or model wrapper used to construct the planner guider proxy and to resolve runtime device/dtype.
+            guider: Effective guider used for the planner runtime build.
             sampler: Sampler instance to be used for planning and runtime creation.
             sigmas (torch.Tensor): Noise schedule tensor to use for runtime construction.
-            extra_args (dict | None): Optional extra model arguments forwarded into the planner guider proxy (e.g., model_options).
             live_latent (dict | None): Optional override latent to use for planning instead of request.latent.
             runtime_mask (torch.Tensor | None): Optional latent-space mask actually used by the detailer sampler for this cycle.
         
@@ -1261,10 +1261,9 @@ class _ScaleLockedDetailerHook:
         guard_sampler_alignment(request.sampler_name, self._settings.sampler_guard)
         planner_noise = _ScaleLockedPlannerNoise(request.seed, disable_noise=not self._settings.add_noise)
         planner_latent = request.latent if live_latent is None else live_latent
-        planner_guider = _ScaleLockedPlannerGuiderProxy(model_wrap, extra_args)
         runtime = build_runtime_context_from_advanced(
             noise=planner_noise,
-            guider=planner_guider,
+            guider=guider,
             sampler=sampler,
             sigmas=sigmas,
             latent_image=planner_latent,
