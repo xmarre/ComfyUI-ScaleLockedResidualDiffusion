@@ -1133,10 +1133,7 @@ class _ScaleLockedImpactSampler:
             sampling_mask = planner_mask
 
             prepared_noise = state.runtime.highres_noise
-            use_prepared_noise = (
-                not isinstance(sampling_mask, torch.Tensor)
-                and tuple(prepared_noise.shape) == tuple(noise.shape)
-            )
+            use_prepared_noise = tuple(prepared_noise.shape) == tuple(noise.shape)
 
             if use_prepared_noise:
                 sampling_noise = prepared_noise.to(
