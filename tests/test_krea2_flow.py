@@ -14,6 +14,110 @@ spec = importlib.util.spec_from_file_location(
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 build_patch_coupled_noise = module.build_patch_coupled_noise
+PatchMeanProjection = module.PatchMeanProjection
+
+
+def grouped_phase_means(target, source_hw):
+    """Independent slice-based oracle, including unequal parent group sizes."""
+    image = target.squeeze(2) if target.ndim == 5 else target
+    sh, sw = source_hw
+    th, tw = image.shape[-2:]
+    result = image.new_empty((*image.shape[:2], sh, sw))
+    for y in range(sh // 2):
+        ys = [i for i in range(th // 2) if i * (sh // 2) // (th // 2) == y]
+        for x in range(sw // 2):
+            xs = [i for i in range(tw // 2) if i * (sw // 2) // (tw // 2) == x]
+            for py in range(2):
+                for px in range(2):
+                    group = image[..., 2 * ys[0] + py:2 * ys[-1] + py + 1:2,
+                                  2 * xs[0] + px:2 * xs[-1] + px + 1:2]
+                    result[..., 2 * y + py, 2 * x + px] = group.mean((-2, -1))
+    return result.unsqueeze(2) if target.ndim == 5 else result
+
+
+@pytest.mark.parametrize("low, high", [((8, 10), (16, 20)), ((8, 10), (14, 24)),
+                                         ((8, 10), (8, 14)), ((10, 6), (16, 10))])
+@pytest.mark.parametrize("temporal", [False, True])
+def test_exact_patch_mean_lock_preserves_detail_and_is_idempotent(low, high, temporal):
+    shape = (2, 16, 1) if temporal else (2, 16)
+    generator = torch.Generator().manual_seed(94)
+    base = torch.randn((*shape, *high), generator=generator, dtype=torch.float64)
+    planner = torch.randn((*shape, *low), generator=generator, dtype=torch.float64)
+    projection = PatchMeanProjection(low, high)
+    original, original_planner = base.clone(), planner.clone()
+    corrected = projection.correct(base, planner, 1.0)
+    assert torch.allclose(grouped_phase_means(corrected, low), planner, atol=1e-12, rtol=1e-12)
+    assert torch.allclose(projection.correct(corrected, planner, 1.0), corrected, atol=1e-12, rtol=1e-12)
+    # The zero-mean residual within each parent phase group remains available
+    # to the target denoiser. The correction cannot add a competing residual.
+    before_detail = base - projection.lift(grouped_phase_means(base, low))
+    after_detail = corrected - projection.lift(grouped_phase_means(corrected, low))
+    assert torch.allclose(after_detail, before_detail, atol=1e-12, rtol=1e-12)
+    assert torch.equal(base, original)
+    assert torch.equal(planner, original_planner)
+
+
+@pytest.mark.parametrize("strength", [0.0, 0.5, 1.0])
+def test_mid_band_candidate_cannot_override_requested_coarse_constraint(strength):
+    g = torch.Generator().manual_seed(73)
+    base = torch.randn((1, 16, 14, 24), generator=g, dtype=torch.float64)
+    planner = torch.randn((1, 16, 8, 10), generator=g, dtype=torch.float64)
+    candidate = torch.randn(base.shape, generator=g, dtype=torch.float64) * 3.0
+    projection = PatchMeanProjection((8, 10), (14, 24))
+    result = projection.correct(base, planner, strength, candidate)
+    expected = torch.lerp(grouped_phase_means(base, (8, 10)), planner, strength)
+    assert torch.allclose(grouped_phase_means(result, (8, 10)), expected, atol=1e-12, rtol=1e-12)
+    assert torch.allclose(result - projection.lift(expected),
+                          candidate - projection.lift(grouped_phase_means(candidate, (8, 10))),
+                          atol=1e-12, rtol=1e-12)
+
+
+@pytest.mark.parametrize("dtype, tolerance", [(torch.float32, 2e-6),
+                                             (torch.float16, 2e-3), (torch.bfloat16, 2e-2)])
+def test_patch_lock_preserves_model_dtype_and_zero_lock_identity(dtype, tolerance):
+    g = torch.Generator().manual_seed(23)
+    base = torch.randn((1, 16, 1, 14, 24), generator=g).to(dtype)
+    planner = torch.randn((1, 16, 1, 8, 10), generator=g).to(dtype)
+    projection = PatchMeanProjection((8, 10), (14, 24))
+    assert projection.correct(base, planner, 0.0) is base
+    result = projection.correct(base, planner, 1.0)
+    assert result.dtype == dtype
+    assert bool(torch.isfinite(result).all())
+    assert torch.allclose(grouped_phase_means(result.float(), (8, 10)), planner.float(),
+                          atol=tolerance, rtol=tolerance)
+
+
+def test_patch_projection_uses_the_noise_ownership_partition():
+    g = torch.Generator().manual_seed(18)
+    source = torch.randn((1, 16, 8, 10), generator=g, dtype=torch.float64)
+    target = build_patch_coupled_noise(source, (1, 16, 14, 24), seed=89)
+    projection = PatchMeanProjection((8, 10), (14, 24))
+    # Noise has normalized-sum constraints, signals have mean constraints.
+    # Derive unequal group counts independently from the owner definition.
+    cy = torch.bincount(torch.arange(7) * 4 // 7, minlength=4)
+    cx = torch.bincount(torch.arange(12) * 5 // 12, minlength=5)
+    counts = (cy[:, None] * cx[None, :]).repeat_interleave(2, 0).repeat_interleave(2, 1)
+    assert torch.allclose(projection.reduce(target) * counts.sqrt(), source, atol=2e-6, rtol=2e-6)
+
+
+@pytest.mark.parametrize("low, high", [((7, 8), (14, 16)), ((8, 8), (6, 16)), ((0, 8), (8, 16))])
+def test_invalid_projection_geometry(low, high):
+    with pytest.raises(ValueError):
+        PatchMeanProjection(low, high)
+
+
+def test_patch_lock_validates_layout_and_strength():
+    projection = PatchMeanProjection((8, 10), (14, 24))
+    base = torch.zeros(1, 16, 14, 24)
+    planner = torch.zeros(1, 16, 8, 10)
+    for strength in (-0.1, 1.1, float("nan")):
+        with pytest.raises(ValueError, match="strength"):
+            projection.correct(base, planner, strength)
+    with pytest.raises(ValueError, match="layouts"):
+        projection.correct(base, planner.repeat(2, 1, 1, 1), 1.0)
+    with pytest.raises(ValueError, match="image latents"):
+        projection.correct(base.unsqueeze(2).repeat(1, 1, 2, 1, 1),
+                           planner.unsqueeze(2).repeat(1, 1, 2, 1, 1), 1.0)
 
 
 @pytest.mark.parametrize(

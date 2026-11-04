@@ -227,8 +227,10 @@ class Krea2TurboFlowAlignedRegenerate:
                 "latent_image": ("LATENT",),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
                 "planner_megapixels": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 4.0, "step": 0.05}),
-                "coarse_lock_strength": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "mid_lock_strength": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "coarse_lock_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Held through every target step. At 1, each patch-group mean follows the matching planner prediction."}),
+                "mid_lock_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Optional mid-band correction within the coarse constraint; 0 preserves target detail."}),
             },
             "optional": {
                 "steps": ("INT", {"default": 8, "min": 1, "max": 10000,
@@ -280,11 +282,11 @@ class Krea2TurboFlowAlignedRegenerate:
         config = ScaleLockConfig(
             lock_strength=coarse_lock_strength,
             lock_strength_start=1.0,
-            lock_strength_end=0.20,
+            lock_strength_end=1.0,
             cutoff=0.33,
             mid_cutoff=0.60,
             mid_strength=mid_lock_strength,
-            schedule="hold_then_drop",
+            schedule="flat",
             schedule_power=2.0,
             schedule_hold=0.25,
             mid_strength_start=1.0,
@@ -292,6 +294,7 @@ class Krea2TurboFlowAlignedRegenerate:
             mid_schedule="linked",
             mid_schedule_power=2.0,
             mid_schedule_hold=0.0,
+            structure_mode="patch_mean",
         )
         result = run_scale_locked_ksampler(
             model=model,

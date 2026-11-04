@@ -3,6 +3,114 @@ from __future__ import annotations
 import torch
 
 
+class PatchMeanProjection:
+    """Disjoint patch-group means and their phase-preserving right inverse.
+
+    The ownership partition matches ``build_patch_coupled_noise``. Denoised
+    signals use arithmetic means to preserve their amplitude; Gaussian noise
+    uses normalized sums instead. These normalizations are not interchangeable.
+    """
+
+    def __init__(self, source_hw: tuple[int, int], target_hw: tuple[int, int]):
+        self.source_hw = tuple(map(int, source_hw))
+        self.target_hw = tuple(map(int, target_hw))
+        if len(self.source_hw) != 2 or len(self.target_hw) != 2:
+            raise ValueError("patch projection requires spatial H/W pairs")
+        if any(v < 2 or v % 2 for v in (*self.source_hw, *self.target_hw)):
+            raise ValueError("patch projection requires positive even latent H/W")
+        if any(t < s for s, t in zip(self.source_hw, self.target_hw)):
+            raise ValueError("target patch grid cannot shrink the planner")
+
+    @staticmethod
+    def _image(x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 5 and x.shape[2] == 1:
+            return x.squeeze(2)
+        if x.ndim != 4:
+            raise ValueError("patch projection requires BCHW or BC1HW image latents")
+        return x
+
+    @staticmethod
+    def _phases(x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        return x.reshape(b, c, h // 2, 2, w // 2, 2).permute(0, 1, 3, 5, 2, 4)
+
+    @staticmethod
+    def _unphases(x: torch.Tensor) -> torch.Tensor:
+        b, c, _, _, h, w = x.shape
+        return x.permute(0, 1, 4, 2, 5, 3).reshape(b, c, h * 2, w * 2)
+
+    @staticmethod
+    def _axis_means(x: torch.Tensor, groups: int) -> torch.Tensor:
+        length = x.shape[-1]
+        bounds = torch.div(
+            torch.arange(groups + 1, device=x.device) * length + groups - 1,
+            groups, rounding_mode="floor",
+        )
+        prefix = torch.cat((torch.zeros_like(x[..., :1]), x.cumsum(dim=-1)), dim=-1)
+        sums = prefix.index_select(-1, bounds[1:]) - prefix.index_select(-1, bounds[:-1])
+        return sums / (bounds[1:] - bounds[:-1]).to(dtype=x.dtype)
+
+    def reduce(self, target: torch.Tensor) -> torch.Tensor:
+        """Return one arithmetic mean per planner patch phase and parent cell."""
+        image = self._image(target)
+        if tuple(image.shape[-2:]) != self.target_hw:
+            raise ValueError("target prediction shape differs from the projection grid")
+        phases = self._phases(image)
+        reduced = self._axis_means(phases, self.source_hw[1] // 2)
+        reduced = self._axis_means(reduced.transpose(-1, -2), self.source_hw[0] // 2)
+        out = self._unphases(reduced.transpose(-1, -2))
+        return out.unsqueeze(2) if target.ndim == 5 else out
+
+    def lift(self, planner: torch.Tensor) -> torch.Tensor:
+        """Repeat parent values within each phase, without mixing patch phases."""
+        image = self._image(planner)
+        if tuple(image.shape[-2:]) != self.source_hw:
+            raise ValueError("planner prediction shape differs from the projection grid")
+        sh, sw = (v // 2 for v in self.source_hw)
+        th, tw = (v // 2 for v in self.target_hw)
+        owner_y = torch.arange(th, device=image.device) * sh // th
+        owner_x = torch.arange(tw, device=image.device) * sw // tw
+        phases = self._phases(image).index_select(-2, owner_y).index_select(-1, owner_x)
+        out = self._unphases(phases)
+        return out.unsqueeze(2) if planner.ndim == 5 else out
+
+    def correct(
+        self,
+        base: torch.Tensor,
+        planner: torch.Tensor,
+        strength: float,
+        candidate: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Replace coarse means while preserving the candidate's detail residual.
+
+        A candidate may contain an optional mid-band edit. Its coarse component
+        is removed, so mid-band strength cannot weaken or overshoot this lock.
+        At strength one, reduce(output) == planner and the correction is
+        idempotent up to floating point rounding. No input tensor is mutated.
+        """
+        strength = float(strength)
+        if not 0.0 <= strength <= 1.0:
+            raise ValueError("patch lock strength must be finite and in [0, 1]")
+        if candidate is None:
+            candidate = base
+        if base.shape != candidate.shape or base.shape[:2] != planner.shape[:2] or base.ndim != planner.ndim:
+            raise ValueError("planner, base and candidate layouts must match")
+        self._image(base)
+        self._image(planner)
+        if strength == 0.0 and candidate is base:
+            return base
+        # Accumulate in float32 for low-precision model predictions. Preserve
+        # float64 for numerical checks and return the model's original dtype.
+        dtype = torch.float64 if base.dtype == torch.float64 else torch.float32
+        work = base.to(dtype=dtype)
+        anchor = planner.to(device=base.device, dtype=dtype)
+        edited = candidate.to(device=base.device, dtype=dtype)
+        coarse = self.reduce(work)
+        desired = torch.lerp(coarse, anchor, strength)
+        out = edited + self.lift(desired - self.reduce(edited))
+        return out.to(dtype=base.dtype)
+
+
 def build_patch_coupled_noise(
     lowres_noise: torch.Tensor,
     target_shape: tuple[int, ...],
