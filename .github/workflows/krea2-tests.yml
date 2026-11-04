@@ -35,4 +35,4 @@ jobs:
         run: python -m py_compile krea2_flow.py nodes.py slrd_runtime.py
       - name: Validate nested-noise coupling
         working-directory: tests
-        run: python -m pytest -q test_krea2_flow.py
+        run: python -m pytest -q --rootdir=. --confcutdir=. test_krea2_flow.py
