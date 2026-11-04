@@ -30,6 +30,9 @@ runtime and does not load weights independently.
 - Input `latent_image` defines the final pixel canvas (8-pixel VAE stride,
   two-pixel latent DiT patch; use multiples of 16 pixels). ComfyUI's standard
   four-channel empty latent is expanded to Krea 2's 16 channels at preflight.
+  Native single-frame `B×16×1×H×W` image latents are preserved through
+  planning, patch-coupled noise and spatial locking; multi-frame video latents
+  are not supported by this image node.
 - The node performs a full eight-step, approximately 1 MP planner pass, then
   eight high-resolution steps with structure anchoring to the planner trajectory.
 - The fixed Krea 2 Turbo sampling profile is ComfyUI CFG **1.0** (no

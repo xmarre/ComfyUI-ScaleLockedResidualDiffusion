@@ -50,6 +50,10 @@ def _interp_mode(src_hw: tuple[int, int], dst_hw: tuple[int, int]) -> str:
 
 def resize_4d_tensor(x: torch.Tensor, size_hw: tuple[int, int]) -> torch.Tensor:
     """Resize BCHW tensor with sane defaults for latent tensors."""
+    if x.ndim == 5 and x.shape[2] == 1:
+        # Native image models may retain a singleton temporal axis. Resize only
+        # their spatial plane while preserving the native latent layout.
+        return resize_4d_tensor(x.squeeze(2), size_hw).unsqueeze(2)
     if tuple(x.shape[-2:]) == tuple(size_hw):
         return x
     mode = _interp_mode(tuple(x.shape[-2:]), tuple(size_hw))
@@ -97,7 +101,9 @@ def latent_target_hw_from_megapixels(
     Compute a target latent spatial size that preserves aspect ratio while targeting a pixel-space megapixel count.
     Latent tensors are expected to be 8x downsampled in H/W for standard image models used by ComfyUI.
     """
-    _, _, h_lat, w_lat = latent_bchw.shape
+    if latent_bchw.ndim != 4 and not (latent_bchw.ndim == 5 and latent_bchw.shape[2] == 1):
+        raise ValueError("Expected an image latent BCHW or BC1HW")
+    h_lat, w_lat = latent_bchw.shape[-2:]
     h_px = h_lat * 8
     w_px = w_lat * 8
     aspect = w_px / max(1.0, float(h_px))

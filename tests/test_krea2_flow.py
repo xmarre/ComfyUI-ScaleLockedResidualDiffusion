@@ -90,3 +90,35 @@ def test_nonfinite_source_rejected():
     source[0, 0, 0, 0] = float("nan")
     with pytest.raises(ValueError, match="finite"):
         build_patch_coupled_noise(source, (1, 16, 16, 20), seed=1)
+
+
+def test_single_frame_noise_preserves_native_layout_and_four_dimensional_coupling():
+    source = torch.randn((2, 16, 1, 8, 10), generator=torch.Generator().manual_seed(73))
+    target = build_patch_coupled_noise(source, (2, 16, 1, 14, 24), seed=19)
+    expected = build_patch_coupled_noise(source.squeeze(2), (2, 16, 14, 24), seed=19)
+    assert target.shape == (2, 16, 1, 14, 24)
+    assert torch.equal(target.squeeze(2), expected)
+
+
+def test_multiple_temporal_slices_are_not_image_noise():
+    with pytest.raises(ValueError, match="single temporal slice"):
+        build_patch_coupled_noise(torch.zeros(1, 16, 2, 8, 10), (1, 16, 2, 16, 20), seed=1)
+
+
+def test_single_frame_spatial_helpers_preserve_native_latent_layout():
+    import sys
+    core_spec = importlib.util.spec_from_file_location(
+        "slrd_core_image_test", Path(__file__).resolve().parents[1] / "slrd_core.py"
+    )
+    core = importlib.util.module_from_spec(core_spec)
+    sys.modules[core_spec.name] = core
+    core_spec.loader.exec_module(core)
+    source = torch.randn((2, 16, 1, 8, 10), generator=torch.Generator().manual_seed(23))
+    image = source.squeeze(2)
+    for size in ((4, 6), (14, 24), (8, 10)):
+        out = core.resize_4d_tensor(source, size)
+        assert out.shape == (2, 16, 1, *size)
+        assert torch.equal(out.squeeze(2), core.resize_4d_tensor(image, size))
+    assert core.latent_target_hw_from_megapixels(source, 1.0) == core.latent_target_hw_from_megapixels(image, 1.0)
+    with pytest.raises(ValueError, match="image latent"):
+        core.latent_target_hw_from_megapixels(source.repeat(1, 1, 2, 1, 1), 1.0)

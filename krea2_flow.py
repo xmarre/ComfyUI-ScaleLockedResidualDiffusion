@@ -5,7 +5,7 @@ import torch
 
 def build_patch_coupled_noise(
     lowres_noise: torch.Tensor,
-    target_shape: tuple[int, int, int, int],
+    target_shape: tuple[int, ...],
     seed: int,
 ) -> torch.Tensor:
     """Lift low-grid Gaussian noise onto the finer Krea 2 patch lattice.
@@ -17,6 +17,12 @@ def build_patch_coupled_noise(
 
     This is a *noise coupling*, not an upscaler or a guarantee of visual quality.
     """
+    if isinstance(lowres_noise, torch.Tensor) and lowres_noise.ndim == 5:
+        if lowres_noise.shape[2] != 1 or len(target_shape) != 5 or target_shape[2] != 1:
+            raise ValueError("Krea 2 image noise requires a single temporal slice")
+        return build_patch_coupled_noise(
+            lowres_noise.squeeze(2), tuple(target_shape[:2]) + tuple(target_shape[-2:]), seed
+        ).unsqueeze(2)
     if not isinstance(lowres_noise, torch.Tensor) or lowres_noise.ndim != 4:
         raise TypeError("source noise must be BxCxHxW")
     if not lowres_noise.is_floating_point() or not bool(torch.isfinite(lowres_noise).all()):

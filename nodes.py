@@ -251,8 +251,9 @@ class Krea2TurboFlowAlignedRegenerate:
         # then expands them to sixteen channels during normal sampler preflight.
         prepared_latent = fix_latent_channels(model, latent_image)
         latent = prepared_latent["samples"]
-        if latent.ndim != 4 or latent.shape[1] != 16:
-            raise ValueError("Krea 2 requires a Bx16xHxW LATENT after native empty-latent conversion")
+        image_layout = latent.ndim == 4 or (latent.ndim == 5 and latent.shape[2] == 1)
+        if not image_layout or latent.shape[1] != 16:
+            raise ValueError("Krea 2 requires a Bx16xHxW or Bx16x1xHxW image LATENT after native empty-latent conversion")
         target_h, target_w = map(int, latent.shape[-2:])
         if target_h % 2 or target_w % 2:
             raise ValueError("Krea 2 requires even latent dimensions (16-pixel output alignment)")
