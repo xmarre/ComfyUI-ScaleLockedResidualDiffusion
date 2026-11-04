@@ -33,9 +33,11 @@ runtime and does not load weights independently.
   Native single-frame `B×16×1×H×W` image latents are preserved through
   planning, patch-coupled noise and spatial locking; multi-frame video latents
   are not supported by this image node.
-- The node performs a full eight-step, approximately 1 MP planner pass, then
+- The node defaults to an eight-step, approximately 1 MP planner pass, then
   eight high-resolution steps with structure anchoring to the planner trajectory.
-- The fixed Krea 2 Turbo sampling profile is ComfyUI CFG **1.0** (no
+  The optional `steps` input controls both passes (default 8). Connect the same
+  step count to a native sampler for matched target-pass comparisons.
+- The Krea 2 Turbo sampling profile is ComfyUI CFG **1.0** (no
   classifier-free guidance), Euler, `simple` scheduler, shift **1.15**.
   This is for **Turbo**, not the undistilled RAW checkpoint.
 - High-resolution noise is drawn from an exact *Gaussian conditional coupling*:
@@ -59,6 +61,7 @@ canvases are experimental and may run out of memory or generate artifacts.
 
 A meaningful A/B must compare the same high-resolution model, eight steps,
 seed, prompt and conditioning both **with and without** the two-pass method.
+Connect one step-count input to both nodes when comparing other step budgets.
 Judge composition/subject preservation, duplicated objects, typography,
 fine-texture detail and wall time/VRAM. The algorithm has **not** yet been
 validated against real Krea 2 GPU outputs; there is no claimed quality or

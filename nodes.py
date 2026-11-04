@@ -229,7 +229,11 @@ class Krea2TurboFlowAlignedRegenerate:
                 "planner_megapixels": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 4.0, "step": 0.05}),
                 "coarse_lock_strength": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "mid_lock_strength": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 1.0, "step": 0.05}),
-            }
+            },
+            "optional": {
+                "steps": ("INT", {"default": 8, "min": 1, "max": 10000,
+                                   "tooltip": "Steps in each pass. Connect the same value to a native sampler for matched target-pass comparisons."}),
+            },
         }
 
     def sample(
@@ -242,6 +246,7 @@ class Krea2TurboFlowAlignedRegenerate:
         planner_megapixels,
         coarse_lock_strength,
         mid_lock_strength,
+        steps=8,
     ):
         if not isinstance(getattr(model, "model", None), comfy.model_base.Krea2):
             raise ValueError("Krea 2 Turbo Flow-Aligned Regenerate requires a native ComfyUI Krea2 MODEL")
@@ -294,7 +299,7 @@ class Krea2TurboFlowAlignedRegenerate:
             negative=negative,
             latent_image=prepared_latent,
             seed=seed,
-            steps=8,
+            steps=steps,
             cfg=1.0,
             sampler_name="euler",
             scheduler="simple",

@@ -45,21 +45,32 @@ def main():
     positive = [[torch.randn(1, 3, 32), {}]]
     negative = [[torch.zeros(1, 3, 32), {}]]
     cases = [("native", model)]
+    reports_context = None
     if args.spectrum_root:
         sys.path.insert(0, str(args.spectrum_root.resolve()))
         from comfyui_spectrum_krea2.nodes import SpectrumApplyKrea2
+        from comfyui_spectrum_krea2.runtime import REPORTS
+        reports_context = REPORTS
         cases.append(("spectrum", SpectrumApplyKrea2().apply(model, preset="turbo")[0]))
-    for label, selected in cases:
+    for label, selected, steps in [(label,selected,steps) for label,selected in cases for steps in (8,12)]:
+        reports = []
+        token = reports_context.set(reports) if reports_context is not None else None
         with torch.inference_mode():
             # Small latent canvases keep genuine CPU model execution practical.
             result = node.sample(selected, positive, negative,
-                                 {"samples": torch.zeros(1, 4, 16, 20)}, 42, .01, .75, .2)
+                                 {"samples": torch.zeros(1, 4, 16, 20)}, 42, .01, .75, .2, steps=steps)
+        if reports_context is not None:
+            reports_context.reset(token)
+        if label == "spectrum":
+            assert len(reports) == 2
+            assert all(r["outer_steps"] == steps for r in reports)
+            assert all(r["forecast"] > 0 and r["fallback"] is None for r in reports)
         shapes = [list(x["samples"].shape) for x in result]
         assert shapes[0] == shapes[2] == [1, 16, 1, 16, 20]
         assert all(torch.isfinite(x["samples"]).all() for x in result)
         assert shapes[1][2] == 1
         assert not base.diffusion_model.last._forward_pre_hooks
-        print(json.dumps({"case": label, "output_shapes": shapes}))
+        print(json.dumps({"case": label, "steps_per_pass": steps, "output_shapes": shapes, "reports": reports}))
 
 
 if __name__ == "__main__":
