@@ -8,8 +8,9 @@ from typing import Any
 import math
 import torch
 import comfy.samplers
+import comfy.model_base
 
-from .slrd_core import build_nested_noise, clone_latent, init_scale_lock_state, resize_4d_tensor, resize_mask
+from .slrd_core import build_nested_noise, clone_latent, init_scale_lock_state, latent_target_hw_from_megapixels, resize_4d_tensor, resize_mask
 from .slrd_runtime import (
     LOCK_SCHEDULE_OPTIONS,
     MID_SCHEDULE_OPTIONS,
@@ -204,6 +205,100 @@ class ScaleLockedResidualKSampler:
                 lock_mask=lock_mask,
                 manifold_mask=manifold_mask,
             ),
+        )
+        return (result.output, result.lowres_planner, result.denoised_output)
+
+
+class Krea2TurboFlowAlignedRegenerate:
+    """Experimental Krea 2 Turbo two-pass composition-lock sampler."""
+
+    CATEGORY = "sampling/scale_locked"
+    RETURN_TYPES = ("LATENT", "LATENT", "LATENT")
+    RETURN_NAMES = ("output", "lowres_planner", "denoised_output")
+    FUNCTION = "sample"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "latent_image": ("LATENT",),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
+                "planner_megapixels": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 4.0, "step": 0.05}),
+                "coarse_lock_strength": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "mid_lock_strength": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 1.0, "step": 0.05}),
+            }
+        }
+
+    def sample(
+        self,
+        model,
+        positive,
+        negative,
+        latent_image,
+        seed,
+        planner_megapixels,
+        coarse_lock_strength,
+        mid_lock_strength,
+    ):
+        if not isinstance(getattr(model, "model", None), comfy.model_base.Krea2):
+            raise ValueError("Krea 2 Turbo Flow-Aligned Regenerate requires a native ComfyUI Krea2 MODEL")
+        latent = latent_image.get("samples") if isinstance(latent_image, dict) else None
+        if not isinstance(latent, torch.Tensor) or latent.ndim != 4 or latent.shape[1] != 16:
+            raise ValueError("Krea 2 requires a Bx16xHxW LATENT")
+        target_h, target_w = map(int, latent.shape[-2:])
+        if target_h % 2 or target_w % 2:
+            raise ValueError("Krea 2 requires even latent dimensions (16-pixel output alignment)")
+        low_h, low_w = latent_target_hw_from_megapixels(latent, planner_megapixels)
+        if low_h > target_h or low_w > target_w or (low_h, low_w) == (target_h, target_w):
+            raise ValueError("Final LATENT must be larger than the planner canvas")
+
+        model_sampling = model.get_model_object("model_sampling")
+        if abs(float(getattr(model_sampling, "shift", float("nan"))) - 1.15) > 1e-5:
+            raise ValueError("Krea 2 Turbo mode requires the native flow sampling shift 1.15")
+        if max(target_h, target_w) * 8 > 2048:
+            logger.warning(
+                "Krea 2 Turbo experimental target %sx%s exceeds the official "
+                "2048-pixel-axis inference range; visual fidelity and VRAM use are unvalidated",
+                target_w * 8, target_h * 8,
+            )
+
+        config = ScaleLockConfig(
+            lock_strength=coarse_lock_strength,
+            lock_strength_start=1.0,
+            lock_strength_end=0.20,
+            cutoff=0.33,
+            mid_cutoff=0.60,
+            mid_strength=mid_lock_strength,
+            schedule="hold_then_drop",
+            schedule_power=2.0,
+            schedule_hold=0.25,
+            mid_strength_start=1.0,
+            mid_strength_end=0.0,
+            mid_schedule="linked",
+            mid_schedule_power=2.0,
+            mid_schedule_hold=0.0,
+        )
+        result = run_scale_locked_ksampler(
+            model=model,
+            positive=positive,
+            negative=negative,
+            latent_image=latent_image,
+            seed=seed,
+            steps=8,
+            cfg=1.0,
+            sampler_name="euler",
+            scheduler="simple",
+            denoise=1.0,
+            target_megapixels=planner_megapixels,
+            nested_noise_strength=1.0,
+            add_noise=True,
+            pin_anchors=True,
+            sampler_guard="error",
+            config=config,
+            noise_mode="patch_coupled",
         )
         return (result.output, result.lowres_planner, result.denoised_output)
 
@@ -1646,6 +1741,7 @@ def _snapshot_impact_latent(latent: dict[str, Any]) -> dict[str, Any]:
 
 NODE_CLASS_MAPPINGS = {
     "ScaleLockedResidualKSampler": ScaleLockedResidualKSampler,
+    "Krea2TurboFlowAlignedRegenerate": Krea2TurboFlowAlignedRegenerate,
     "ScaleLockedRuntimeContextBuilder": ScaleLockedRuntimeContextBuilder,
     "ScaleLockedCFGGuider": ScaleLockedCFGGuiderNode,
     "ScaleLockedResidualSamplerCustomAdvanced": ScaleLockedResidualSamplerCustomAdvanced,
@@ -1655,6 +1751,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ScaleLockedResidualKSampler": "Scale-Locked Residual KSampler",
+    "Krea2TurboFlowAlignedRegenerate": "Krea 2 Turbo Flow-Aligned Regenerate [Experimental]",
     "ScaleLockedRuntimeContextBuilder": "Scale-Locked Runtime Context",
     "ScaleLockedCFGGuider": "Scale-Locked CFG Guider",
     "ScaleLockedResidualSamplerCustomAdvanced": "Scale-Locked Residual SamplerCustomAdvanced",

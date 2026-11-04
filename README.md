@@ -19,6 +19,50 @@ In practice, this is meant to reduce:
 - scene re-planning between 1 MP and 4 MP,
 - the "looks like a different sample entirely" problem.
 
+## Krea 2 Turbo: experimental flow-aligned regeneration
+
+The `Krea 2 Turbo Flow-Aligned Regenerate [Experimental]` node is a compact
+Krea-2-specific integration of the existing scale-locked image sampling path.
+It uses the native ComfyUI Krea2 model, the Qwen Image VAE and a matching
+Krea2 text encoder. It is not a port of MiniMax H3's audio/video/Continuum
+runtime and does not load weights independently.
+
+- Input `latent_image` defines the final pixel canvas (8-pixel VAE stride,
+  two-pixel latent DiT patch; use multiples of 16 pixels).
+- The node performs a full eight-step, approximately 1 MP planner pass, then
+  eight high-resolution steps with structure anchoring to the planner trajectory.
+- The fixed Krea 2 Turbo sampling profile is ComfyUI CFG **1.0** (no
+  classifier-free guidance), Euler, `simple` scheduler, shift **1.15**.
+  This is for **Turbo**, not the undistilled RAW checkpoint.
+- High-resolution noise is drawn from an exact *Gaussian conditional coupling*:
+  within every 2x2 transformer-patch phase the normalized grouped projection
+  matches the source Gaussian field, including noninteger upscaling ratios.
+  This is a stochastic consistency invariant, not a learned image upscaler.
+- `coarse_lock_strength` and `mid_lock_strength` determine how tightly the
+  high-resolution denoised prediction follows the planner at low and middle
+  spatial frequencies. Fine detail remains available to the high-resolution
+  denoiser. The built-in weights are **starting hypotheses**, not calibrated
+  Krea-2-specific optima.
+- The `output` is the high-resolution LATENT, `lowres_planner` is the planner
+  LATENT, and `denoised_output` is the available final x0 preview LATENT.
+
+For an initial experiment, use a **1024x1024 planner (1.0 MP)** and a
+**2048x2048 final latent (4.19 MP)**. Use the same native model, prompt,
+seed, LoRAs and reference conditioning in both stages, all supplied through
+the single node. The source/target widths need not have an integral ratio.
+The official Krea 2 Turbo range is roughly 1K–2K per axis; larger target
+canvases are experimental and may run out of memory or generate artifacts.
+
+A meaningful A/B must compare the same high-resolution model, eight steps,
+seed, prompt and conditioning both **with and without** the two-pass method.
+Judge composition/subject preservation, duplicated objects, typography,
+fine-texture detail and wall time/VRAM. The algorithm has **not** yet been
+validated against real Krea 2 GPU outputs; there is no claimed quality or
+speed improvement. It generally costs an additional eight low-resolution
+DiT evaluations and is intended to improve structural consistency, not
+throughput. For RAW, custom samplers and advanced research controls, use
+the generic Scale-Locked Residual KSampler instead.
+
 ## Nodes
 
 ### 1. Scale-Locked Residual KSampler

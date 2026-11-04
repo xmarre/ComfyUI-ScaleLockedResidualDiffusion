@@ -14,6 +14,8 @@ import comfy.samplers
 import comfy.utils
 import latent_preview
 
+from .krea2_flow import build_patch_coupled_noise
+
 from .slrd_core import (
     TrajectoryRecorder,
     build_nested_noise,
@@ -561,7 +563,13 @@ def _run_lowres_planner(
     return out, recorder.x0_steps, planner_sigmas, planner_noise
 
 
-def _build_highres_noise(highres_latent: dict, lowres_noise: torch.Tensor, seed: int, hf_strength: float):
+def _build_highres_noise(
+    highres_latent: dict,
+    lowres_noise: torch.Tensor,
+    seed: int,
+    hf_strength: float,
+    mode: str = "legacy",
+):
     highres_samples = highres_latent["samples"]
     target_device = highres_samples.device
     target_dtype = highres_samples.dtype
@@ -572,6 +580,15 @@ def _build_highres_noise(highres_latent: dict, lowres_noise: torch.Tensor, seed:
             layout=highres_samples.layout,
             device=target_device,
         )
+
+    if mode == "patch_coupled":
+        return build_patch_coupled_noise(
+            lowres_noise=lowres_noise,
+            target_shape=tuple(highres_samples.shape),
+            seed=seed,
+        ).to(device=target_device, dtype=target_dtype, non_blocking=True)
+    if mode != "legacy":
+        raise ValueError(f"unsupported nested-noise mode: {mode}")
 
     return build_nested_noise(
         lowres_noise=lowres_noise,
@@ -727,6 +744,7 @@ def run_scale_locked_ksampler(
     pin_anchors,
     sampler_guard,
     config: ScaleLockConfig,
+    noise_mode: str = "legacy",
 ) -> ScaleLockedSampleResult:
     if steps < 1:
         raise ValueError("steps must be >= 1")
@@ -775,6 +793,7 @@ def run_scale_locked_ksampler(
             lowres_noise=lowres_noise,
             seed=detail_seed,
             hf_strength=nested_noise_strength,
+            mode=noise_mode,
         ),
         noise_seed=detail_seed,
     )
