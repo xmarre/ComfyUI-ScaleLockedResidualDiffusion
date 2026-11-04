@@ -28,7 +28,8 @@ Krea2 text encoder. It is not a port of MiniMax H3's audio/video/Continuum
 runtime and does not load weights independently.
 
 - Input `latent_image` defines the final pixel canvas (8-pixel VAE stride,
-  two-pixel latent DiT patch; use multiples of 16 pixels).
+  two-pixel latent DiT patch; use multiples of 16 pixels). ComfyUI's standard
+  four-channel empty latent is expanded to Krea 2's 16 channels at preflight.
 - The node performs a full eight-step, approximately 1 MP planner pass, then
   eight high-resolution steps with structure anchoring to the planner trajectory.
 - The fixed Krea 2 Turbo sampling profile is ComfyUI CFG **1.0** (no

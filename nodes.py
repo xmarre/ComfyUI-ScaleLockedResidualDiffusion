@@ -245,9 +245,14 @@ class Krea2TurboFlowAlignedRegenerate:
     ):
         if not isinstance(getattr(model, "model", None), comfy.model_base.Krea2):
             raise ValueError("Krea 2 Turbo Flow-Aligned Regenerate requires a native ComfyUI Krea2 MODEL")
-        latent = latent_image.get("samples") if isinstance(latent_image, dict) else None
-        if not isinstance(latent, torch.Tensor) or latent.ndim != 4 or latent.shape[1] != 16:
-            raise ValueError("Krea 2 requires a Bx16xHxW LATENT")
+        if not isinstance(latent_image, dict) or not isinstance(latent_image.get("samples"), torch.Tensor):
+            raise TypeError("Krea 2 requires a LATENT dictionary with tensor samples")
+        # Native ComfyUI uses four-channel EmptyLatentImage placeholders for Krea 2,
+        # then expands them to sixteen channels during normal sampler preflight.
+        prepared_latent = fix_latent_channels(model, latent_image)
+        latent = prepared_latent["samples"]
+        if latent.ndim != 4 or latent.shape[1] != 16:
+            raise ValueError("Krea 2 requires a Bx16xHxW LATENT after native empty-latent conversion")
         target_h, target_w = map(int, latent.shape[-2:])
         if target_h % 2 or target_w % 2:
             raise ValueError("Krea 2 requires even latent dimensions (16-pixel output alignment)")
@@ -256,7 +261,8 @@ class Krea2TurboFlowAlignedRegenerate:
             raise ValueError("Final LATENT must be larger than the planner canvas")
 
         model_sampling = model.get_model_object("model_sampling")
-        if abs(float(getattr(model_sampling, "shift", float("nan"))) - 1.15) > 1e-5:
+        shift = float(getattr(model_sampling, "shift", float("nan")))
+        if not math.isfinite(shift) or abs(shift - 1.15) > 1e-5:
             raise ValueError("Krea 2 Turbo mode requires the native flow sampling shift 1.15")
         if max(target_h, target_w) * 8 > 2048:
             logger.warning(
@@ -285,7 +291,7 @@ class Krea2TurboFlowAlignedRegenerate:
             model=model,
             positive=positive,
             negative=negative,
-            latent_image=latent_image,
+            latent_image=prepared_latent,
             seed=seed,
             steps=8,
             cfg=1.0,
