@@ -80,6 +80,18 @@ DiT evaluations and is intended to improve structural consistency, not
 throughput. For RAW, custom samplers and advanced research controls, use
 the generic Scale-Locked Residual KSampler instead.
 
+CPU validation covers 33 numerical/layout cases and seven full native ComfyUI
+generation cases with small random Krea 2 weights, including the Spectrum
+wrapper. The native checks verify matching planner/target step indices, a
+constant requested lock strength, and the group-mean constraint at every
+target step. At full coarse strength the final output's group means also
+match the final planner latent after native latent-format conversion.
+Zero-strength execution and reuse of a guider by generic sampler nodes are
+checked separately. These checks establish the constraint and execution
+behavior; they do not establish real-checkpoint visual quality. A hard
+constraint can preserve planner errors, and unconstrained target detail can
+still contain artifacts.
+
 ## Nodes
 
 ### 1. Scale-Locked Residual KSampler

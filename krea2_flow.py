@@ -42,6 +42,8 @@ class PatchMeanProjection:
     @staticmethod
     def _axis_means(x: torch.Tensor, groups: int) -> torch.Tensor:
         length = x.shape[-1]
+        if length == groups:
+            return x
         bounds = torch.div(
             torch.arange(groups + 1, device=x.device) * length + groups - 1,
             groups, rounding_mode="floor",
@@ -107,7 +109,8 @@ class PatchMeanProjection:
         edited = candidate.to(device=base.device, dtype=dtype)
         coarse = self.reduce(work)
         desired = torch.lerp(coarse, anchor, strength)
-        out = edited + self.lift(desired - self.reduce(edited))
+        edited_coarse = coarse if candidate is base else self.reduce(edited)
+        out = edited + self.lift(desired - edited_coarse)
         return out.to(dtype=base.dtype)
 
 

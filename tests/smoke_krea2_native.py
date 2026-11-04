@@ -150,6 +150,10 @@ def main():
         assert shapes[0] == shapes[2] == [1, 16, 1, 16, 20]
         assert all(torch.isfinite(x["samples"]).all() for x in result)
         assert shapes[1][2] == 1
+        if coarse == 1.0:
+            projection = runtime_module.PatchMeanProjection(tuple(shapes[1][-2:]), tuple(shapes[0][-2:]))
+            assert torch.allclose(projection.reduce(result[0]["samples"]), result[1]["samples"],
+                                  atol=2e-5, rtol=2e-5)
         assert not base.diffusion_model.last._forward_pre_hooks
         print(json.dumps({"case": label, "steps_per_pass": steps, "coarse": coarse, "mid": mid,
                           "constrained_steps": checks, "output_shapes": shapes, "reports": reports}))

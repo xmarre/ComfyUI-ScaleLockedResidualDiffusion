@@ -325,7 +325,9 @@ def apply_scale_lock_to_noise_prediction(guider, base_noise: torch.Tensor, x, ti
     low_strength, mid_strength = scale_lock_strengths_for_step(guider, idx)
     projection = getattr(guider, "_slrd_patch_projection", None)
     if projection is not None:
-        anchor = guider._slrd_anchors_x0_cpu[idx].to(device=base_noise.device, dtype=base_noise.dtype)
+        anchor = guider._slrd_anchors_x0_cpu[idx].to(
+            device=base_noise.device, dtype=base_noise.dtype, non_blocking=True,
+        )
         candidate = None
         if mid_strength > 0.0:
             candidate = residual_lock_multiband(
