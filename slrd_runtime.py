@@ -14,7 +14,7 @@ import comfy.samplers
 import comfy.utils
 import latent_preview
 
-from .krea2_flow import PatchMeanProjection, build_patch_coupled_noise
+from .krea2_flow import build_patch_coupled_noise
 
 from .slrd_core import (
     TrajectoryRecorder,
@@ -106,7 +106,6 @@ class ScaleLockConfig:
     manifold_energy_gain_cap: float = 1.75
     manifold_max_shift_px: float = 3.0
     manifold_spatial_mask: Optional[torch.Tensor] = None
-    structure_mode: str = "multiband"
 
 
 @dataclass
@@ -322,23 +321,10 @@ def apply_scale_lock_to_noise_prediction(guider, base_noise: torch.Tensor, x, ti
         return base_noise
 
     idx = resolve_scale_lock_step_index(guider, timestep)
-    low_strength, mid_strength = scale_lock_strengths_for_step(guider, idx)
-    projection = getattr(guider, "_slrd_patch_projection", None)
-    if projection is not None:
-        anchor = guider._slrd_anchors_x0_cpu[idx].to(
-            device=base_noise.device, dtype=base_noise.dtype, non_blocking=True,
-        )
-        candidate = None
-        if mid_strength > 0.0:
-            candidate = residual_lock_multiband(
-                base_noise, projection.lift(anchor), low_strength=0.0,
-                mid_strength=mid_strength, low_cutoff=guider._slrd_cutoff,
-                mid_cutoff=guider._slrd_mid_cutoff,
-            )
-        return projection.correct(base_noise, anchor, low_strength, candidate)
-
     anchor = scale_lock_anchor_for(guider, idx, base_noise)
+
     corrected = base_noise
+    low_strength, mid_strength = scale_lock_strengths_for_step(guider, idx)
     if low_strength > 0.0 or mid_strength > 0.0:
         corrected = residual_lock_multiband(
             corrected,
@@ -384,16 +370,6 @@ def clone_guider_for_scale_lock(guider):
 
 
 def apply_scale_lock_to_guider(guider, runtime: ScaleLockedRuntimeContext, config: ScaleLockConfig):
-    if config.structure_mode not in {"multiband", "patch_mean"}:
-        raise ValueError(f"unsupported structure lock mode: {config.structure_mode}")
-    if config.structure_mode == "patch_mean" and (config.manifold_enabled or config.spatial_mask is not None):
-        raise ValueError("patch-mean locking does not support manifold correction or spatial masks")
-    projection = None
-    if config.structure_mode == "patch_mean":
-        projection = PatchMeanProjection(
-            tuple(runtime.lowres_latent["samples"].shape[-2:]),
-            tuple(runtime.highres_latent["samples"].shape[-2:]),
-        )
     spatial_mask = prepare_spatial_lock_mask(config.spatial_mask, runtime.highres_latent["samples"])
     manifold_spatial_mask = prepare_spatial_lock_mask(
         config.manifold_spatial_mask if config.manifold_spatial_mask is not None else config.spatial_mask,
@@ -440,9 +416,6 @@ def apply_scale_lock_to_guider(guider, runtime: ScaleLockedRuntimeContext, confi
         manifold_spatial_mask=manifold_spatial_mask,
     )
 
-    # Assign on every use, including a subsequent generic invocation on the
-    # same guider. A previous Krea-specific projection must not leak into it.
-    guider._slrd_patch_projection = projection
     original_predict_noise = getattr(guider, "_slrd_original_predict_noise", guider.predict_noise)
     guider._slrd_original_predict_noise = original_predict_noise
 

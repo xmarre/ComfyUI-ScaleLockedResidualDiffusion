@@ -8,7 +8,6 @@ on:
       - "slrd_core.py"
       - "nodes.py"
       - "tests/test_krea2_flow.py"
-      - "tests/smoke_krea2_native.py"
       - ".github/workflows/krea2-tests.yml"
   push:
     branches: [main]
@@ -18,7 +17,6 @@ on:
       - "slrd_core.py"
       - "nodes.py"
       - "tests/test_krea2_flow.py"
-      - "tests/smoke_krea2_native.py"
       - ".github/workflows/krea2-tests.yml"
 
 jobs:
@@ -37,31 +35,6 @@ jobs:
           python -m pip install pytest
       - name: Compile changed Python
         run: python -m py_compile krea2_flow.py nodes.py slrd_runtime.py slrd_core.py
-      - name: Validate noise coupling and structural projection
+      - name: Validate nested-noise coupling
         working-directory: tests
         run: python -m pytest -q --rootdir=. --confcutdir=. test_krea2_flow.py
-
-  native-cpu:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: actions/checkout@v4
-        with:
-          repository: Comfy-Org/ComfyUI
-          ref: 7ad7adb38f6cbb6c2b0713d3bd44c3fb2b9c8ebe
-          path: _comfy
-      - uses: actions/checkout@v4
-        with:
-          repository: xmarre/ComfyUI-Spectrum-Krea2
-          ref: 1ab50da413298596387b73289d2916837a433950
-          path: _spectrum
-      - name: Install native CPU dependencies
-        run: |
-          python -m pip install torch==2.15.0 torchvision==0.29.2 --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install pytest torchsde==0.2.6 scipy safetensors Pillow tqdm psutil pyyaml sentencepiece transformers==5.22.1 requests comfy-kitchen==0.2.40 comfy-aimdo==0.6.0 einops
-      - name: Exercise native planner, target constraints and Spectrum combination
-        run: python tests/smoke_krea2_native.py --comfy-root _comfy --spectrum-root _spectrum

@@ -44,21 +44,11 @@ runtime and does not load weights independently.
   within every 2x2 transformer-patch phase the normalized grouped projection
   matches the source Gaussian field, including noninteger upscaling ratios.
   This is a stochastic consistency invariant, not a learned image upscaler.
-- `coarse_lock_strength` is held constant through every target step (default
-  **1.0**). The coarse correction uses the same disjoint patch ownership groups
-  as the noise transport, preserving all four within-patch phases. Denoised
-  signals use arithmetic group means to preserve signal amplitude; noise uses
-  normalized sums to preserve Gaussian variance. At strength 1, the corrected
-  prediction's group means equal the matching planner prediction, while its
-  zero-mean within-group detail is preserved. This correction is idempotent up
-  to floating point rounding; it does not repeatedly blur or weaken the lock.
-- `mid_lock_strength` defaults to **0.0**. Optional mid-band edits are projected
-  into the zero-mean detail space so they cannot undo the coarse constraint.
-  Stronger mid corrections can still distort detail. Existing saved workflows
-  retain their stored widget values; use coarse **1.0**, mid **0.0** as the
-  initial comparison settings. The Krea node no longer fades coarse strength
-  to 20% or uses the generic area/bilinear coarse blend. Generic sampler nodes
-  retain their existing multiband correction and schedules.
+- `coarse_lock_strength` and `mid_lock_strength` determine how tightly the
+  high-resolution denoised prediction follows the planner at low and middle
+  spatial frequencies. Fine detail remains available to the high-resolution
+  denoiser. The built-in weights are **starting hypotheses**, not calibrated
+  Krea-2-specific optima.
 - The `output` is the high-resolution LATENT, `lowres_planner` is the planner
   LATENT, and `denoised_output` is the available final x0 preview LATENT.
 
@@ -79,18 +69,6 @@ speed improvement. It generally costs an additional eight low-resolution
 DiT evaluations and is intended to improve structural consistency, not
 throughput. For RAW, custom samplers and advanced research controls, use
 the generic Scale-Locked Residual KSampler instead.
-
-CPU validation covers 33 numerical/layout cases and seven full native ComfyUI
-generation cases with small random Krea 2 weights, including the Spectrum
-wrapper. The native checks verify matching planner/target step indices, a
-constant requested lock strength, and the group-mean constraint at every
-target step. At full coarse strength the final output's group means also
-match the final planner latent after native latent-format conversion.
-Zero-strength execution and reuse of a guider by generic sampler nodes are
-checked separately. These checks establish the constraint and execution
-behavior; they do not establish real-checkpoint visual quality. A hard
-constraint can preserve planner errors, and unconstrained target detail can
-still contain artifacts.
 
 ## Nodes
 
