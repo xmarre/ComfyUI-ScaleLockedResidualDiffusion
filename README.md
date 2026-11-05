@@ -110,6 +110,18 @@ evaluations; it is intended to improve structural consistency, not
 throughput. For RAW, custom samplers and advanced research controls, use
 the generic Scale-Locked Residual KSampler instead.
 
+## Resolution Selector (Uncapped)
+
+`Resolution Selector (Uncapped)` (category `utilities`) behaves like ComfyUI's
+built-in Resolution Selector: the same aspect ratios, megapixel convention
+(1 MP = 1024x1024 pixels), `multiple` rounding and live resolution preview.
+The built-in node caps `megapixels` at 16; this one accepts up to 256, the
+largest square canvas ComfyUI latents allow (16384 pixels per side). A ratio
+and size that would exceed 16384 pixels on either side is rejected with an
+error instead of failing later in the empty-latent node. On ComfyUI versions
+without the preview widget it falls back to the same calculation without the
+preview.
+
 ## Nodes
 
 ### 1. Scale-Locked Residual KSampler

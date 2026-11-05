@@ -11,6 +11,7 @@ import comfy.samplers
 import comfy.model_base
 
 from .slrd_core import build_nested_noise, clone_latent, full_lock_prefix_length, init_scale_lock_state, latent_target_hw_from_megapixels, parse_stage_megapixels, plan_stage_megapixels, resize_4d_tensor, resize_mask
+from .resolution import DISPLAY_NAME as RESOLUTION_DISPLAY_NAME, NODE_ID as RESOLUTION_NODE_ID, ResolutionSelectorUncapped
 from .slrd_runtime import (
     LOCK_SCHEDULE_OPTIONS,
     MID_SCHEDULE_OPTIONS,
@@ -1809,6 +1810,7 @@ def _snapshot_impact_latent(latent: dict[str, Any]) -> dict[str, Any]:
 NODE_CLASS_MAPPINGS = {
     "ScaleLockedResidualKSampler": ScaleLockedResidualKSampler,
     "Krea2TurboFlowAlignedRegenerate": Krea2TurboFlowAlignedRegenerate,
+    RESOLUTION_NODE_ID: ResolutionSelectorUncapped,
     "ScaleLockedRuntimeContextBuilder": ScaleLockedRuntimeContextBuilder,
     "ScaleLockedCFGGuider": ScaleLockedCFGGuiderNode,
     "ScaleLockedResidualSamplerCustomAdvanced": ScaleLockedResidualSamplerCustomAdvanced,
@@ -1819,6 +1821,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ScaleLockedResidualKSampler": "Scale-Locked Residual KSampler",
     "Krea2TurboFlowAlignedRegenerate": "Krea 2 Turbo Flow-Aligned Regenerate [Experimental]",
+    RESOLUTION_NODE_ID: RESOLUTION_DISPLAY_NAME,
     "ScaleLockedRuntimeContextBuilder": "Scale-Locked Runtime Context",
     "ScaleLockedCFGGuider": "Scale-Locked CFG Guider",
     "ScaleLockedResidualSamplerCustomAdvanced": "Scale-Locked Residual SamplerCustomAdvanced",

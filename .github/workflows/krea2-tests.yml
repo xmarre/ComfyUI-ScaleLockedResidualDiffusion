@@ -7,6 +7,7 @@ on:
       - "slrd_runtime.py"
       - "slrd_core.py"
       - "nodes.py"
+      - "resolution.py"
       - "tests/test_krea2_flow.py"
       - "tests/test_krea2_composition_lock.py"
       - ".github/workflows/krea2-tests.yml"
@@ -17,6 +18,7 @@ on:
       - "slrd_runtime.py"
       - "slrd_core.py"
       - "nodes.py"
+      - "resolution.py"
       - "tests/test_krea2_flow.py"
       - "tests/test_krea2_composition_lock.py"
       - ".github/workflows/krea2-tests.yml"
@@ -36,7 +38,7 @@ jobs:
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
           python -m pip install pytest
       - name: Compile changed Python
-        run: python -m py_compile krea2_flow.py nodes.py slrd_runtime.py slrd_core.py
+        run: python -m py_compile krea2_flow.py nodes.py slrd_runtime.py slrd_core.py resolution.py
       - name: Validate nested-noise coupling
         working-directory: tests
         run: python -m pytest -q --rootdir=. --confcutdir=. test_krea2_flow.py test_krea2_composition_lock.py
