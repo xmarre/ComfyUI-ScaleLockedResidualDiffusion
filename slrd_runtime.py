@@ -33,6 +33,7 @@ from .slrd_core import (
     scale_lock_full_lock_active,
     full_lock_prefix_length,
     flow_euler_locked_clean_state,
+    split_free_steps,
     scale_lock_manifold_mask_for,
     scale_lock_manifold_strength_for_step,
     scale_lock_mask_for,
@@ -800,6 +801,163 @@ def sample_with_runtime(
     )
 
 
+def _stage_seed(detail_seed: int, stage_index: int) -> int:
+    return (int(detail_seed) ^ ((stage_index + 1) * 0xD1B54A32D192ED03)) & 0xFFFFFFFFFFFFFFFF
+
+
+def _run_resolution_ladder(
+    *,
+    model,
+    positive,
+    negative,
+    cfg,
+    sampler_name: str,
+    sigmas: torch.Tensor,
+    highres_latent: dict,
+    lowres_latent: dict,
+    lowres_out: dict,
+    anchors_x0: list,
+    planner_sigmas: list,
+    lowres_noise: torch.Tensor,
+    detail_seed: int,
+    nested_noise_strength: float,
+    noise_mode: str,
+    config: ScaleLockConfig,
+    stage_hw: tuple,
+) -> ScaleLockedSampleResult:
+    """Continue one flow-Euler trajectory through increasing resolutions.
+
+    The planner owns every step above the composition lock. The remaining
+    steps are split over the stages in order, and each stage evaluates only
+    its own share. A stage starts in closed form from all earlier
+    predictions (planner and lower stages), each resized from its native
+    resolution, combined with the stage's own patch-coupled noise. Every step
+    of the schedule is therefore evaluated exactly once, at the highest
+    resolution reached at that point.
+    """
+    if config.full_lock_sigma is None:
+        raise ValueError("resolution stages require the composition lock")
+    if _normalize_sampler_name(sampler_name) != "euler" or not isinstance(
+        _model_sampling_obj(model), comfy.model_sampling.CONST
+    ):
+        raise ValueError("resolution stages require Euler with flow model sampling")
+    if (
+        isinstance(highres_latent.get("noise_mask"), torch.Tensor)
+        or config.spatial_mask is not None
+        or config.manifold_enabled
+    ):
+        raise ValueError("resolution stages do not support latent noise masks, spatial lock masks or manifold correction")
+
+    target = highres_latent["samples"]
+    sigma_values = [float(v) for v in sigmas.detach().cpu().tolist()]
+    total_steps = len(sigma_values) - 1
+    first_release = full_lock_prefix_length(sigma_values, config.full_lock_sigma)
+    sizes = [tuple(map(int, hw)) for hw in stage_hw] + [tuple(map(int, target.shape[-2:]))]
+    previous = tuple(map(int, lowres_latent["samples"].shape[-2:]))
+    for hw in sizes:
+        if hw[0] < previous[0] or hw[1] < previous[1] or hw == previous or hw[0] % 2 or hw[1] % 2:
+            raise ValueError("resolution stages must grow monotonically in both dimensions on the 16-pixel grid")
+        previous = hw
+    counts = split_free_steps(total_steps - first_release, len(sizes))
+    bounds = [first_release]
+    for count in counts:
+        bounds.append(bounds[-1] + count)
+
+    references = list(anchors_x0[:first_release])
+    stage_noise = lowres_noise
+    sampler = comfy.samplers.sampler_object(sampler_name)
+    disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+    store_dtype = _store_dtype_for(target)
+    x0_output: dict = {}
+    samples = None
+
+    for index, hw in enumerate(sizes):
+        final = index == len(sizes) - 1
+        start, end = bounds[index], bounds[index + 1]
+        stage_latent = highres_latent if final else resize_latent_dict(highres_latent, hw)
+        stage_samples = stage_latent["samples"]
+        seed = detail_seed if final else _stage_seed(detail_seed, index)
+        stage_noise = _build_highres_noise(
+            highres_latent=stage_latent,
+            lowres_noise=stage_noise,
+            seed=seed,
+            hf_strength=nested_noise_strength,
+            mode=noise_mode,
+        )
+
+        start_latent = stage_samples
+        if start > 0:
+            initial = stage_samples
+            if torch.count_nonzero(initial) > 0:
+                initial = model.model.process_latent_in(initial)
+            predictions = (
+                resize_4d_tensor(
+                    references[k].to(device=stage_samples.device, dtype=torch.float32, non_blocking=True), hw
+                )
+                for k in range(start)
+            )
+            clean = flow_euler_locked_clean_state(initial, predictions, sigma_values[: start + 1])
+            start_latent = model.model.process_latent_out(clean).to(dtype=stage_samples.dtype)
+
+        stage_runtime = ScaleLockedRuntimeContext(
+            model=model,
+            highres_latent=stage_latent,
+            lowres_latent=lowres_latent,
+            lowres_out=lowres_out,
+            sigmas=sigmas,
+            anchors_x0=anchors_x0,
+            planner_sigmas=planner_sigmas,
+            highres_noise=stage_noise,
+            noise_seed=seed,
+        )
+        guider = create_cfg_guider(model, positive, negative, cfg)
+        apply_scale_lock_to_guider(guider, stage_runtime, config)
+        recorder = TrajectoryRecorder(store_dtype=store_dtype, capture_noisy_xt=False, pin_memory=False)
+        stage_x0: dict = {}
+        preview = make_preview_callback(model, end - start, stage_x0)
+
+        def callback(step, x0, x, total, _recorder=recorder, _preview=preview):
+            _recorder.callback(step, x0, x, total)
+            _preview(step, x0, x, total)
+
+        try:
+            samples = guider.sample(
+                stage_noise,
+                start_latent,
+                sampler,
+                sigmas[start : end + 1],
+                denoise_mask=None,
+                callback=callback,
+                disable_pbar=disable_pbar,
+                seed=seed,
+            )
+        finally:
+            restore_original_predict_noise(guider)
+        if len(recorder.x0_steps) != end - start:
+            raise RuntimeError("resolution stage recorded an unexpected number of predictions")
+        if final:
+            x0_output = stage_x0
+        else:
+            # The returned latent of a partial schedule is not an image; only
+            # the predictions carry over to the next stage.
+            references.extend(recorder.x0_steps)
+            samples = None
+
+    samples = samples.to(comfy.model_management.intermediate_device())
+    out = clean_latent(highres_latent)
+    out["samples"] = samples
+    if "x0" in x0_output:
+        try:
+            x0_out = model.model.process_latent_out(x0_output["x0"].cpu())
+        except Exception:
+            x0_out = x0_output["x0"].detach().cpu()
+        denoised = clean_latent(highres_latent)
+        denoised["samples"] = x0_out
+    else:
+        denoised = out
+    return ScaleLockedSampleResult(output=out, lowres_planner=clean_latent(lowres_out), denoised_output=denoised)
+
+
 def run_scale_locked_ksampler(
     *,
     model,
@@ -819,6 +977,7 @@ def run_scale_locked_ksampler(
     sampler_guard,
     config: ScaleLockConfig,
     noise_mode: str = "legacy",
+    stage_hw: tuple = (),
 ) -> ScaleLockedSampleResult:
     if steps < 1:
         raise ValueError("steps must be >= 1")
@@ -853,6 +1012,16 @@ def run_scale_locked_ksampler(
     )
     if len(anchors_x0) == 0:
         raise RuntimeError("ScaleLockedResidualKSampler: planner pass did not record any x0 anchors.")
+
+    if stage_hw:
+        return _run_resolution_ladder(
+            model=model, positive=positive, negative=negative, cfg=cfg,
+            sampler_name=sampler_name, sigmas=sigmas, highres_latent=highres_latent,
+            lowres_latent=lowres_latent, lowres_out=lowres_out, anchors_x0=anchors_x0,
+            planner_sigmas=planner_sigmas, lowres_noise=lowres_noise, detail_seed=detail_seed,
+            nested_noise_strength=nested_noise_strength, noise_mode=noise_mode,
+            config=config, stage_hw=tuple(stage_hw),
+        )
 
     runtime = ScaleLockedRuntimeContext(
         model=model,

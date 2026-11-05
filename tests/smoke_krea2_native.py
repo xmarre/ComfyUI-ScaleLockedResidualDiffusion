@@ -108,6 +108,48 @@ def main():
         print(json.dumps({"case": label, "steps_per_pass": steps, "locked_target_steps": locked,
                           "target_model_calls": target_calls, "output_shapes": shapes, "reports": reports}))
 
+    # Resolution ladder: planner 12x14 -> stage 16x20 -> output 24x28 latent cells.
+    ladder_shares = {8: (2, 2), 12: (3, 3)}
+    for label, selected, steps in [(label,selected,steps) for label,selected in cases for steps in (8,12)]:
+        for stage_options in ({"stage_megapixels": "0.02"}, {"max_stage_upscale": 2.0}):
+            reports = []
+            token = reports_context.set(reports) if reports_context is not None else None
+            calls.clear()
+            hook = (base.diffusion_model.register_forward_pre_hook(
+                lambda module, args: calls.append(tuple(args[0].shape[-2:]))) if label == "native" else None)
+            try:
+                with torch.inference_mode():
+                    result = node.sample(selected, positive, negative, {"samples": torch.zeros(1, 4, 24, 28)},
+                                         42, .01, 0.0, 0.0, steps=steps, **stage_options)
+            finally:
+                if hook is not None:
+                    hook.remove()
+                if reports_context is not None:
+                    reports_context.reset(token)
+            shares = ladder_shares[steps]
+            if label == "native":
+                counts = {shape: calls.count(shape) for shape in set(calls)}
+                # Every schedule step is evaluated once, at one resolution.
+                assert counts == {(12, 14): steps, (16, 20): shares[0], (24, 28): shares[1]}, counts
+            else:
+                assert [r["outer_steps"] for r in reports] == [steps, *shares], reports
+                assert all(r["fallback"] is None for r in reports)
+            shapes = [list(x["samples"].shape) for x in result]
+            assert shapes[0] == shapes[2] == [1, 16, 1, 24, 28]
+            assert shapes[1] == [1, 16, 1, 12, 14]
+            assert all(torch.isfinite(x["samples"]).all() for x in result)
+            assert not base.diffusion_model._forward_pre_hooks
+            print(json.dumps({"case": label + "_ladder", "options": stage_options, "steps_per_pass": steps,
+                              "stage_steps": shares, "output_shapes": shapes, "reports": reports}))
+
+    try:
+        node.sample(model, positive, negative, {"samples": torch.zeros(1, 4, 24, 28)},
+                    42, .01, 0.0, 0.0, steps=2, stage_megapixels="0.02")
+    except ValueError as exc:
+        assert "raise steps" in str(exc)
+    else:
+        raise AssertionError("too few steps for the stages must be rejected before sampling")
+
 
 if __name__ == "__main__":
     main()

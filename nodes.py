@@ -10,13 +10,14 @@ import torch
 import comfy.samplers
 import comfy.model_base
 
-from .slrd_core import build_nested_noise, clone_latent, init_scale_lock_state, latent_target_hw_from_megapixels, resize_4d_tensor, resize_mask
+from .slrd_core import build_nested_noise, clone_latent, full_lock_prefix_length, init_scale_lock_state, latent_target_hw_from_megapixels, parse_stage_megapixels, plan_stage_megapixels, resize_4d_tensor, resize_mask, split_free_steps
 from .slrd_runtime import (
     LOCK_SCHEDULE_OPTIONS,
     MID_SCHEDULE_OPTIONS,
     ScaleLockConfig,
     _resolve_sampler_device,
     apply_scale_lock_to_noise_prediction,
+    calculate_sigmas,
     build_runtime_context_from_advanced,
     clean_latent,
     compat_sampler_names,
@@ -241,6 +242,13 @@ class Krea2TurboFlowAlignedRegenerate:
                     "tooltip": "Target steps starting above this noise level reuse the complete planner prediction, "
                                "so the high-resolution pass cannot form a second, displaced composition. "
                                "Lower values keep more planner structure; 1.0 disables the full lock."}),
+                "max_stage_upscale": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 64.0, "step": 0.25,
+                    "tooltip": "Largest pixel-area growth per resolution stage (4.0 = 2x per side). Larger jumps are "
+                               "split into geometrically spaced intermediate stages. 0 always jumps from the planner "
+                               "straight to the output size. Ignored when stage_megapixels is set."}),
+                "stage_megapixels": ("STRING", {"default": "", "multiline": False,
+                    "tooltip": "Optional explicit intermediate stage sizes in megapixels, ascending and between the "
+                               "planner and the output, e.g. '4, 8'. Empty uses max_stage_upscale."}),
             },
         }
 
@@ -256,6 +264,8 @@ class Krea2TurboFlowAlignedRegenerate:
         mid_lock_strength,
         steps=8,
         composition_lock_sigma=0.80,
+        max_stage_upscale=4.0,
+        stage_megapixels="",
     ):
         composition_lock_sigma = float(composition_lock_sigma)
         if not math.isfinite(composition_lock_sigma) or not 0.0 <= composition_lock_sigma <= 1.0:
@@ -277,6 +287,38 @@ class Krea2TurboFlowAlignedRegenerate:
         low_h, low_w = latent_target_hw_from_megapixels(latent, planner_megapixels)
         if low_h > target_h or low_w > target_w or (low_h, low_w) == (target_h, target_w):
             raise ValueError("Final LATENT must be larger than the planner canvas")
+
+        explicit_stages = parse_stage_megapixels(stage_megapixels)
+        if explicit_stages:
+            stage_mp = explicit_stages
+        else:
+            stage_mp = plan_stage_megapixels(low_h * low_w * 64.0, target_h * target_w * 64.0, max_stage_upscale)
+        stage_hw = []
+        previous = (low_h, low_w)
+        for megapixels in stage_mp:
+            hw = latent_target_hw_from_megapixels(latent, megapixels)
+            if hw == previous and not explicit_stages:
+                continue  # Rounding to the 16-pixel grid merged two automatic stages.
+            if hw[0] < previous[0] or hw[1] < previous[1] or hw == previous:
+                raise ValueError(
+                    "stage_megapixels must increase from the planner size, and each stage must grow on the 16-pixel grid"
+                )
+            stage_hw.append(hw)
+            previous = hw
+        if stage_hw and (target_h < previous[0] or target_w < previous[1] or (target_h, target_w) == previous):
+            if explicit_stages:
+                raise ValueError("stage_megapixels must stay below the output LATENT size")
+            stage_hw.pop()
+        if stage_hw:
+            # Fail before the planner pass when the schedule cannot give every stage a step.
+            schedule = [float(v) for v in calculate_sigmas(model, scheduler="simple", steps=steps, denoise=1.0).tolist()]
+            split_free_steps(
+                len(schedule) - 1 - full_lock_prefix_length(schedule, composition_lock_sigma), len(stage_hw) + 1
+            )
+            logger.info(
+                "Krea 2 resolution stages: planner %sx%s -> %s -> output %sx%s",
+                low_w * 8, low_h * 8, " -> ".join(f"{w * 8}x{h * 8}" for h, w in stage_hw), target_w * 8, target_h * 8,
+            )
 
         model_sampling = model.get_model_object("model_sampling")
         shift = float(getattr(model_sampling, "shift", float("nan")))
@@ -324,6 +366,7 @@ class Krea2TurboFlowAlignedRegenerate:
             sampler_guard="error",
             config=config,
             noise_mode="patch_coupled",
+            stage_hw=tuple(stage_hw),
         )
         return (result.output, result.lowres_planner, result.denoised_output)
 

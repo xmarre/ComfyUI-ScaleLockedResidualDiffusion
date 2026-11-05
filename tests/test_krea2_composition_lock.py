@@ -246,3 +246,35 @@ def test_invalid_threshold_rejected(value):
             schedule_hold=0.0, mid_strength_start=1.0, mid_strength_end=0.0, mid_schedule="linked",
             mid_schedule_power=2.0, mid_schedule_hold=0.0, spatial_mask=None, full_lock_sigma=value,
         )
+
+
+def test_stage_planning_is_geometric_and_bounded():
+    planner, target = 3.0e6, 14.0e6
+    stages = core.plan_stage_megapixels(planner, target, 4.0)
+    assert len(stages) == 1
+    assert stages[0] == pytest.approx((3.0 * 14.0) ** 0.5)
+    sizes = [planner / 1e6, *stages, target / 1e6]
+    assert all(b / a <= 4.0 + 1e-9 for a, b in zip(sizes, sizes[1:]))
+    assert len(core.plan_stage_megapixels(1.0e6, 64.0e6, 4.0)) == 2
+    # Exactly the limit needs no intermediate stage, despite rounding in the logarithm.
+    assert core.plan_stage_megapixels(1048576.0, 4194304.0, 4.0) == []
+    assert core.plan_stage_megapixels(1.0e6, 14.0e6, 0.0) == []
+    with pytest.raises(ValueError, match="max_stage_upscale"):
+        core.plan_stage_megapixels(1.0e6, 14.0e6, 1.0)
+
+
+def test_stage_megapixels_parsing():
+    assert core.parse_stage_megapixels("") == []
+    assert core.parse_stage_megapixels(" 4, 8.5 ;12 ") == [4.0, 8.5, 12.0]
+    with pytest.raises(ValueError, match="not a number"):
+        core.parse_stage_megapixels("4, big")
+    with pytest.raises(ValueError, match="positive"):
+        core.parse_stage_megapixels("4, -1")
+
+
+def test_free_steps_split_favours_later_stages():
+    assert core.split_free_steps(8, 2) == [4, 4]
+    assert core.split_free_steps(8, 3) == [2, 3, 3]
+    assert sum(core.split_free_steps(13, 4)) == 13
+    with pytest.raises(ValueError, match="raise steps"):
+        core.split_free_steps(2, 3)

@@ -839,6 +839,50 @@ def full_lock_prefix_length(sigmas: Sequence[float], threshold: Optional[float])
     return count
 
 
+def parse_stage_megapixels(text: str) -> list[float]:
+    """Parse a comma- or space-separated list of intermediate stage sizes."""
+    values = []
+    for part in str(text or "").replace(";", ",").replace(" ", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = float(part)
+        except ValueError as exc:
+            raise ValueError(f"stage_megapixels entry {part!r} is not a number") from exc
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError("stage_megapixels entries must be positive megapixel values")
+        values.append(value)
+    return values
+
+
+def plan_stage_megapixels(planner_area_px: float, target_area_px: float, max_stage_upscale: float) -> list[float]:
+    """Geometric intermediate stage sizes so no stage grows the area by more than the limit."""
+    max_stage_upscale = float(max_stage_upscale)
+    if max_stage_upscale <= 0.0:
+        return []
+    if not math.isfinite(max_stage_upscale) or max_stage_upscale <= 1.0:
+        raise ValueError("max_stage_upscale must be 0 (single stage) or greater than 1")
+    ratio = float(target_area_px) / float(planner_area_px)
+    if ratio <= 1.0:
+        return []
+    stages = max(1, math.ceil(math.log(ratio) / math.log(max_stage_upscale) - 1e-9))
+    return [planner_area_px * ratio ** (i / stages) / 1_000_000.0 for i in range(1, stages)]
+
+
+def split_free_steps(free_steps: int, stages: int) -> list[int]:
+    """Split the steps after the first release over the stages, later stages first for the remainder."""
+    if stages < 1:
+        raise ValueError("at least one stage is required")
+    if free_steps < stages:
+        raise ValueError(
+            f"{stages} resolution stages need at least {stages} steps after the composition lock, "
+            f"but only {free_steps} remain; raise steps or composition_lock_sigma, or use fewer stages"
+        )
+    base, extra = divmod(int(free_steps), stages)
+    return [base + (1 if i >= stages - extra else 0) for i in range(stages)]
+
+
 def flow_euler_locked_clean_state(
     initial_clean: torch.Tensor,
     predictions: Iterable[torch.Tensor],
