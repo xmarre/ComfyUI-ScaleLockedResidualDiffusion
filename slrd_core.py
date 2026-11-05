@@ -728,7 +728,13 @@ def init_scale_lock_state(
     manifold_energy_gain_cap: float = 1.75,
     manifold_max_shift_px: float = 3.0,
     manifold_spatial_mask: Optional[torch.Tensor] = None,
+    full_lock_sigma: Optional[float] = None,
 ) -> None:
+    if full_lock_sigma is not None:
+        full_lock_sigma = float(full_lock_sigma)
+        if not math.isfinite(full_lock_sigma) or full_lock_sigma < 0.0:
+            raise ValueError("full_lock_sigma must be a finite non-negative noise level")
+    guider._slrd_full_lock_sigma = full_lock_sigma
     guider._slrd_model = model
     guider._slrd_anchors_x0_cpu = list(anchors_x0_cpu)
     guider._slrd_planner_sigmas = [float(x) for x in planner_sigmas] if planner_sigmas is not None else None
@@ -809,6 +815,16 @@ def resolve_scale_lock_step_index(guider, timestep: torch.Tensor | float | int) 
     if not guider._slrd_anchors_x0_cpu:
         return 0
     return min(step_index, len(guider._slrd_anchors_x0_cpu) - 1)
+
+
+def scale_lock_full_lock_active(guider, timestep: torch.Tensor | float | int) -> bool:
+    """Whether this target step reuses the complete planner prediction.
+
+    While active, the target state stays the planner state with the target
+    noise field. Its own composition cannot enter any frequency band.
+    """
+    threshold = getattr(guider, "_slrd_full_lock_sigma", None)
+    return threshold is not None and _sigma_scalar(timestep) > threshold
 
 
 def scale_lock_strength_for_step(guider, idx: int) -> float:

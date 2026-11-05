@@ -8,6 +8,7 @@ on:
       - "slrd_core.py"
       - "nodes.py"
       - "tests/test_krea2_flow.py"
+      - "tests/test_krea2_composition_lock.py"
       - ".github/workflows/krea2-tests.yml"
   push:
     branches: [main]
@@ -17,6 +18,7 @@ on:
       - "slrd_core.py"
       - "nodes.py"
       - "tests/test_krea2_flow.py"
+      - "tests/test_krea2_composition_lock.py"
       - ".github/workflows/krea2-tests.yml"
 
 jobs:
@@ -37,4 +39,4 @@ jobs:
         run: python -m py_compile krea2_flow.py nodes.py slrd_runtime.py slrd_core.py
       - name: Validate nested-noise coupling
         working-directory: tests
-        run: python -m pytest -q --rootdir=. --confcutdir=. test_krea2_flow.py
+        run: python -m pytest -q --rootdir=. --confcutdir=. test_krea2_flow.py test_krea2_composition_lock.py

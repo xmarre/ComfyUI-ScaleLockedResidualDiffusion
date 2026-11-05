@@ -28,6 +28,7 @@ from .slrd_core import (
     resize_mask,
     residual_lock_multiband,
     scale_lock_anchor_for,
+    scale_lock_full_lock_active,
     scale_lock_manifold_mask_for,
     scale_lock_manifold_strength_for_step,
     scale_lock_mask_for,
@@ -106,6 +107,9 @@ class ScaleLockConfig:
     manifold_energy_gain_cap: float = 1.75
     manifold_max_shift_px: float = 3.0
     manifold_spatial_mask: Optional[torch.Tensor] = None
+    # Target steps whose input sigma exceeds this value use the planner
+    # prediction in every frequency band. None disables the full lock.
+    full_lock_sigma: Optional[float] = None
 
 
 @dataclass
@@ -323,6 +327,13 @@ def apply_scale_lock_to_noise_prediction(guider, base_noise: torch.Tensor, x, ti
     idx = resolve_scale_lock_step_index(guider, timestep)
     anchor = scale_lock_anchor_for(guider, idx, base_noise)
 
+    if scale_lock_full_lock_active(guider, timestep):
+        mask = scale_lock_mask_for(guider, base_noise)
+        if mask is None:
+            # The anchor may alias stored planner state; never hand it out.
+            return anchor.clone()
+        return base_noise + mask * (anchor - base_noise)
+
     corrected = base_noise
     low_strength, mid_strength = scale_lock_strengths_for_step(guider, idx)
     if low_strength > 0.0 or mid_strength > 0.0:
@@ -414,6 +425,7 @@ def apply_scale_lock_to_guider(guider, runtime: ScaleLockedRuntimeContext, confi
         manifold_energy_gain_cap=config.manifold_energy_gain_cap,
         manifold_max_shift_px=config.manifold_max_shift_px,
         manifold_spatial_mask=manifold_spatial_mask,
+        full_lock_sigma=config.full_lock_sigma,
     )
 
     original_predict_noise = getattr(guider, "_slrd_original_predict_noise", guider.predict_noise)

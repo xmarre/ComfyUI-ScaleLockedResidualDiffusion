@@ -34,7 +34,8 @@ runtime and does not load weights independently.
   planning, patch-coupled noise and spatial locking; multi-frame video latents
   are not supported by this image node.
 - The node defaults to an eight-step, approximately 1 MP planner pass, then
-  eight high-resolution steps with structure anchoring to the planner trajectory.
+  eight high-resolution steps: the first ones follow the planner trajectory
+  completely, the remaining ones add detail with structure anchoring.
   The optional `steps` input controls both passes (default 8). Connect the same
   step count to a native sampler for matched target-pass comparisons.
 - The Krea 2 Turbo sampling profile is ComfyUI CFG **1.0** (no
@@ -44,11 +45,21 @@ runtime and does not load weights independently.
   within every 2x2 transformer-patch phase the normalized grouped projection
   matches the source Gaussian field, including noninteger upscaling ratios.
   This is a stochastic consistency invariant, not a learned image upscaler.
-- `coarse_lock_strength` and `mid_lock_strength` determine how tightly the
-  high-resolution denoised prediction follows the planner at low and middle
-  spatial frequencies. Fine detail remains available to the high-resolution
-  denoiser. The built-in weights are **starting hypotheses**, not calibrated
-  Krea-2-specific optima.
+- `composition_lock_sigma` (optional, default 0.60) sets where the
+  high-resolution pass takes over. Target steps that start above this noise
+  level use the planner's denoised prediction in every frequency band, so the
+  target state is exactly the resized planner state carrying the target noise.
+  At those noise levels the high-resolution model would otherwise commit to its
+  own composition; mixing only the planner's coarse bands into it can
+  superimpose two layouts, visible as duplicated or displaced contours. Lower values
+  keep more of the planner image and leave fewer steps for new detail; 1.0
+  disables the full lock. With Euler/simple and shift 1.15, the default locks
+  four of eight steps (six of twelve).
+- After that, `coarse_lock_strength` and `mid_lock_strength` determine how
+  tightly the high-resolution denoised prediction follows the planner at low
+  and middle spatial frequencies. Fine detail remains available to the
+  high-resolution denoiser. All built-in values are **starting hypotheses**,
+  not calibrated Krea-2-specific optima.
 - The `output` is the high-resolution LATENT, `lowres_planner` is the planner
   LATENT, and `denoised_output` is the available final x0 preview LATENT.
 

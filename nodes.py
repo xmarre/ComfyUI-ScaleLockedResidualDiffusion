@@ -233,6 +233,10 @@ class Krea2TurboFlowAlignedRegenerate:
             "optional": {
                 "steps": ("INT", {"default": 8, "min": 1, "max": 10000,
                                    "tooltip": "Steps in each pass. Connect the same value to a native sampler for matched target-pass comparisons."}),
+                "composition_lock_sigma": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Target steps starting above this noise level reuse the complete planner prediction, "
+                               "so the high-resolution pass cannot form a second, displaced composition. "
+                               "Lower values keep more planner structure; 1.0 disables the full lock."}),
             },
         }
 
@@ -247,7 +251,11 @@ class Krea2TurboFlowAlignedRegenerate:
         coarse_lock_strength,
         mid_lock_strength,
         steps=8,
+        composition_lock_sigma=0.60,
     ):
+        composition_lock_sigma = float(composition_lock_sigma)
+        if not math.isfinite(composition_lock_sigma) or not 0.0 <= composition_lock_sigma <= 1.0:
+            raise ValueError("composition_lock_sigma must be within [0, 1]")
         if not isinstance(getattr(model, "model", None), comfy.model_base.Krea2):
             raise ValueError("Krea 2 Turbo Flow-Aligned Regenerate requires a native ComfyUI Krea2 MODEL")
         if not isinstance(latent_image, dict) or not isinstance(latent_image.get("samples"), torch.Tensor):
@@ -292,6 +300,7 @@ class Krea2TurboFlowAlignedRegenerate:
             mid_schedule="linked",
             mid_schedule_power=2.0,
             mid_schedule_hold=0.0,
+            full_lock_sigma=composition_lock_sigma,
         )
         result = run_scale_locked_ksampler(
             model=model,
