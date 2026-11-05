@@ -451,6 +451,17 @@ def restore_original_predict_noise(guider) -> None:
         guider.predict_noise = original_predict_noise
 
 
+def _planner_callback(model, recorder: TrajectoryRecorder, sigmas: torch.Tensor):
+    """Record planner anchors and report progress like the other passes."""
+    preview = make_preview_callback(model, max(0, len(sigmas) - 1), {})
+
+    def callback(step, x0, x, total_steps):
+        recorder.callback(step, x0, x, total_steps)
+        preview(step, x0, x, total_steps)
+
+    return callback
+
+
 def _run_lowres_planner_advanced(
     *,
     guider,
@@ -493,8 +504,8 @@ def _run_lowres_planner_advanced(
         sampler,
         sigmas,
         denoise_mask=noise_mask,
-        callback=recorder.callback,
-        disable_pbar=True,
+        callback=_planner_callback(model, recorder, sigmas),
+        disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
         seed=noise_seed(noise),
     )
     samples = samples.to(comfy.model_management.intermediate_device())
@@ -564,8 +575,8 @@ def _run_lowres_planner(
         sampler_obj,
         sigmas,
         denoise_mask=noise_mask,
-        callback=recorder.callback,
-        disable_pbar=True,
+        callback=_planner_callback(model, recorder, sigmas),
+        disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
         seed=seed,
     )
     samples = samples.to(comfy.model_management.intermediate_device())
