@@ -9,6 +9,7 @@ from typing import Any, Optional
 import torch
 
 import comfy.model_management
+import comfy.model_sampling
 import comfy.sample
 import comfy.samplers
 import comfy.utils
@@ -24,11 +25,14 @@ from .slrd_core import (
     latent_manifold_compand,
     latent_target_hw_from_megapixels,
     resolve_scale_lock_step_index,
+    resize_4d_tensor,
     resize_latent_dict,
     resize_mask,
     residual_lock_multiband,
     scale_lock_anchor_for,
     scale_lock_full_lock_active,
+    full_lock_prefix_length,
+    flow_euler_locked_clean_state,
     scale_lock_manifold_mask_for,
     scale_lock_manifold_strength_for_step,
     scale_lock_mask_for,
@@ -683,6 +687,44 @@ def build_runtime_context_from_advanced(
     )
 
 
+def _full_lock_handoff(runtime: ScaleLockedRuntimeContext, config: ScaleLockConfig):
+    """Target state at the composition-lock release, without model calls.
+
+    Locked steps discard the target prediction, so evaluating the model there
+    is wasted work. For flow-matching Euler the state after those steps is
+    ``sigma * noise + (1 - sigma) * clean`` with ``clean`` a fixed convex
+    combination of the resized planner predictions. Returns
+    ``(locked_steps, clean)`` in the model's internal latent space, or None
+    when no step is locked or the masked fallback path must run instead.
+    """
+    sigma_values = [float(v) for v in runtime.sigmas.detach().cpu().tolist()]
+    locked_steps = full_lock_prefix_length(sigma_values, config.full_lock_sigma)
+    if locked_steps == 0:
+        return None
+    if config.spatial_mask is not None or isinstance(runtime.highres_latent.get("noise_mask"), torch.Tensor):
+        # Masked locks blend with the target prediction; it must be evaluated.
+        return None
+    if config.manifold_enabled:
+        return None
+    if len(runtime.anchors_x0) < locked_steps:
+        raise RuntimeError("planner recorded fewer anchors than locked target steps")
+
+    target = runtime.highres_latent["samples"]
+    initial = target
+    if torch.count_nonzero(initial) > 0:
+        # Mirrors CFGGuider.inner_sample, which leaves empty latents unshifted.
+        initial = runtime.model.model.process_latent_in(initial)
+    predictions = (
+        resize_4d_tensor(
+            runtime.anchors_x0[i].to(device=target.device, dtype=torch.float32, non_blocking=True),
+            tuple(target.shape[-2:]),
+        )
+        for i in range(locked_steps)
+    )
+    clean = flow_euler_locked_clean_state(initial, predictions, sigma_values[: locked_steps + 1])
+    return locked_steps, clean
+
+
 def sample_with_runtime(
     *,
     guider,
@@ -690,24 +732,44 @@ def sample_with_runtime(
     runtime: ScaleLockedRuntimeContext,
     config: ScaleLockConfig,
     restore_after: bool = True,
+    analytic_full_lock: bool = False,
 ) -> ScaleLockedSampleResult:
     if runtime.sigmas.numel() == 0:
         out = clean_latent(runtime.highres_latent)
         return ScaleLockedSampleResult(output=out, lowres_planner=clean_latent(runtime.lowres_out), denoised_output=out)
 
+    sigmas = runtime.sigmas
+    latent_samples = runtime.highres_latent["samples"]
+    handoff = _full_lock_handoff(runtime, config) if analytic_full_lock else None
+    if handoff is not None:
+        locked_steps, clean = handoff
+        if locked_steps == len(sigmas) - 1:
+            # Every step is locked: the result is the final clean state.
+            out = clean_latent(runtime.highres_latent)
+            out["samples"] = runtime.model.model.process_latent_out(clean).to(
+                comfy.model_management.intermediate_device()
+            )
+            return ScaleLockedSampleResult(
+                output=out, lowres_planner=clean_latent(runtime.lowres_out), denoised_output=out
+            )
+        # The sampler re-applies process_latent_in and the flow noise scaling,
+        # reproducing sigma * noise + (1 - sigma) * clean at the release step.
+        sigmas = sigmas[locked_steps:]
+        latent_samples = runtime.model.model.process_latent_out(clean).to(dtype=latent_samples.dtype)
+
     apply_scale_lock_to_guider(guider, runtime, config)
 
     x0_output = {}
-    callback = make_preview_callback(runtime.model, len(runtime.sigmas) - 1, x0_output)
+    callback = make_preview_callback(runtime.model, len(sigmas) - 1, x0_output)
     noise_mask = runtime.highres_latent.get("noise_mask", None)
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
     try:
         samples = guider.sample(
             runtime.highres_noise,
-            runtime.highres_latent["samples"],
+            latent_samples,
             sampler,
-            runtime.sigmas,
+            sigmas,
             denoise_mask=noise_mask,
             callback=callback,
             disable_pbar=disable_pbar,
@@ -811,5 +873,14 @@ def run_scale_locked_ksampler(
     )
     guider = create_cfg_guider(model, positive, negative, cfg)
     sampler = comfy.samplers.sampler_object(sampler_name)
-    return sample_with_runtime(guider=guider, sampler=sampler, runtime=runtime, config=config)
+    # The closed-form lock handoff is exact only for the flow-matching Euler update.
+    analytic_full_lock = (
+        config.full_lock_sigma is not None
+        and _normalize_sampler_name(sampler_name) == "euler"
+        and isinstance(_model_sampling_obj(model), comfy.model_sampling.CONST)
+    )
+    return sample_with_runtime(
+        guider=guider, sampler=sampler, runtime=runtime, config=config,
+        analytic_full_lock=analytic_full_lock,
+    )
 

@@ -55,6 +55,11 @@ runtime and does not load weights independently.
   keep more of the planner image and leave fewer steps for new detail; 1.0
   disables the full lock. With ComfyUI's Krea 2 schedule (Euler/simple,
   shift 1.15), the default locks four of eight steps (six of twelve).
+  Locked steps cost no high-resolution model evaluations: the target state at
+  the release is computed in closed form from the planner predictions, and
+  the sampler starts there. With a target spatial mask or latent noise mask,
+  locked steps are evaluated instead, because the mask blends in the
+  target prediction.
 - After the release, the high-resolution pass refines freely by default.
   `coarse_lock_strength` and `mid_lock_strength` (default 0) optionally keep
   blending the low and middle spatial frequencies of each denoised prediction
@@ -80,8 +85,9 @@ Connect one step-count input to both nodes when comparing other step budgets.
 Judge composition/subject preservation, duplicated objects, typography,
 fine-texture detail and wall time/VRAM. Real Krea 2 checks so far are
 limited to individual visual comparisons, not a systematic evaluation;
-there is no claimed quality or speed improvement. It generally costs an additional eight low-resolution
-DiT evaluations and is intended to improve structural consistency, not
+there is no claimed quality or speed improvement. Against a native eight-step target-resolution run, the
+default replaces four target-resolution DiT evaluations with eight planner
+evaluations; it is intended to improve structural consistency, not
 throughput. For RAW, custom samplers and advanced research controls, use
 the generic Scale-Locked Residual KSampler instead.
 

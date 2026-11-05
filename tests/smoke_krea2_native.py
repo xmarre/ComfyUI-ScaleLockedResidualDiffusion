@@ -52,25 +52,61 @@ def main():
         from comfyui_spectrum_krea2.runtime import REPORTS
         reports_context = REPORTS
         cases.append(("spectrum", SpectrumApplyKrea2().apply(model, preset="turbo")[0]))
-    for label, selected, steps in [(label,selected,steps) for label,selected in cases for steps in (8,12)]:
+    runtime = sys.modules[spec.name + ".slrd_runtime"]
+    calls = []
+    locked_by_steps = {8: 4, 12: 6}
+
+    def run(selected, steps, analytic=True, count_calls=False):
         reports = []
         token = reports_context.set(reports) if reports_context is not None else None
-        with torch.inference_mode():
-            # Small latent canvases keep genuine CPU model execution practical.
-            result = node.sample(selected, positive, negative,
-                                 {"samples": torch.zeros(1, 4, 16, 20)}, 42, .01, 0.0, 0.0, steps=steps)
-        if reports_context is not None:
-            reports_context.reset(token)
+        original = runtime._full_lock_handoff
+        if not analytic:
+            runtime._full_lock_handoff = lambda *args, **kwargs: None
+        calls.clear()
+        # Spectrum declines hooked models, so only count calls without it.
+        hook = (base.diffusion_model.register_forward_pre_hook(
+            lambda module, args: calls.append(tuple(args[0].shape[-2:]))) if count_calls else None)
+        try:
+            with torch.inference_mode():
+                # Small latent canvases keep genuine CPU model execution practical.
+                result = node.sample(selected, positive, negative,
+                                     {"samples": torch.zeros(1, 4, 16, 20)}, 42, .01, 0.0, 0.0, steps=steps)
+        finally:
+            if hook is not None:
+                hook.remove()
+            runtime._full_lock_handoff = original
+            if reports_context is not None:
+                reports_context.reset(token)
+        target_calls = sum(shape == (16, 20) for shape in calls)
+        return result, reports, target_calls
+
+    for label, selected, steps in [(label,selected,steps) for label,selected in cases for steps in (8,12)]:
+        locked = locked_by_steps[steps]
+        result, reports, target_calls = run(selected, steps, count_calls=label == "native")
+        if label == "native":
+            # Locked target steps are skipped, not evaluated and discarded.
+            assert target_calls == steps - locked, (target_calls, steps, locked)
+            evaluated, _, evaluated_calls = run(selected, steps, analytic=False, count_calls=True)
+            assert evaluated_calls == steps
+            for fast, slow in zip(result, evaluated):
+                difference = float((fast["samples"] - slow["samples"]).abs().max())
+                scale = float(slow["samples"].abs().max())
+                assert difference <= 1e-4 * max(1.0, scale), (difference, scale)
         if label == "spectrum":
             assert len(reports) == 2
-            assert all(r["outer_steps"] == steps for r in reports)
-            assert all(r["forecast"] > 0 and r["fallback"] is None for r in reports)
+            assert reports[0]["outer_steps"] == steps
+            assert reports[1]["outer_steps"] == steps - locked
+            assert reports[1]["denoiser_calls"] == steps - locked
+            assert all(r["fallback"] is None for r in reports)
+            assert reports[0]["forecast"] > 0
         shapes = [list(x["samples"].shape) for x in result]
         assert shapes[0] == shapes[2] == [1, 16, 1, 16, 20]
         assert all(torch.isfinite(x["samples"]).all() for x in result)
         assert shapes[1][2] == 1
+        assert not base.diffusion_model._forward_pre_hooks
         assert not base.diffusion_model.last._forward_pre_hooks
-        print(json.dumps({"case": label, "steps_per_pass": steps, "output_shapes": shapes, "reports": reports}))
+        print(json.dumps({"case": label, "steps_per_pass": steps, "locked_target_steps": locked,
+                          "target_model_calls": target_calls, "output_shapes": shapes, "reports": reports}))
 
 
 if __name__ == "__main__":

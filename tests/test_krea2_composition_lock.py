@@ -21,10 +21,10 @@ PACKAGE = "slrd_composition_lock_test"
 
 
 def _load_runtime():
-    for name in ("comfy", "comfy.model_management", "comfy.sample", "comfy.samplers", "comfy.utils", "latent_preview"):
+    for name in ("comfy", "comfy.model_management", "comfy.model_sampling", "comfy.sample", "comfy.samplers", "comfy.utils", "latent_preview"):
         sys.modules.setdefault(name, types.ModuleType(name))
     comfy = sys.modules["comfy"]
-    for child in ("model_management", "sample", "samplers", "utils"):
+    for child in ("model_management", "model_sampling", "sample", "samplers", "utils"):
         setattr(comfy, child, sys.modules[f"comfy.{child}"])
     package = types.ModuleType(PACKAGE)
     package.__path__ = [str(ROOT)]
@@ -141,6 +141,43 @@ def test_locked_target_state_is_planner_state_with_target_noise(layout):
     expected = sigma * target_noise + core.resize_4d_tensor(planner_clean, high_shape[-2:])
     assert torch.allclose(x, expected, atol=1e-10, rtol=1e-10)
     assert guider.calls == locked_steps
+
+
+@pytest.mark.parametrize("steps, release", [(8, 0.8), (12, 0.8), (8, 0.6), (5, 0.0)])
+def test_closed_form_handoff_matches_locked_euler_steps(steps, release):
+    sigmas = _flow_sigmas(steps)
+    low_shape, high_shape = (1, 16, 8, 10), (1, 16, 14, 18)
+    _, anchors, _ = _planner(low_shape, sigmas)
+    planner_sigmas = [float(s) for s in sigmas[:-1]]
+    locked = core.full_lock_prefix_length([float(s) for s in sigmas], release)
+    assert locked == sum(float(s) > release for s in sigmas[:-1])
+
+    target_noise = torch.randn(high_shape, generator=torch.Generator().manual_seed(4), dtype=torch.float64)
+    guider = _locked_guider(lambda x, s: x * 0.0 + 5.0, anchors, planner_sigmas,
+                            torch.zeros(high_shape, dtype=torch.float64), release)
+    x = target_noise
+    for i in range(locked):
+        denoised = guider.predict_noise(x, sigmas[i])
+        x = x + (x - denoised) / sigmas[i] * (sigmas[i + 1] - sigmas[i])
+
+    clean = core.flow_euler_locked_clean_state(
+        torch.zeros(high_shape, dtype=torch.float64),
+        (core.resize_4d_tensor(anchors[i], high_shape[-2:]) for i in range(locked)),
+        [float(s) for s in sigmas[: locked + 1]],
+    )
+    sigma = float(sigmas[locked])
+    # Same tolerance class as float32 accumulation in the closed form.
+    assert torch.allclose(sigma * target_noise + (1.0 - sigma) * clean.double(), x, atol=1e-5, rtol=1e-5)
+
+
+def test_closed_form_handoff_rejects_invalid_schedules():
+    zero = torch.zeros(1, 16, 4, 4)
+    with pytest.raises(ValueError, match="one more sigma"):
+        core.flow_euler_locked_clean_state(zero, [zero], [1.0])
+    with pytest.raises(ValueError, match="decrease"):
+        core.flow_euler_locked_clean_state(zero, [zero], [0.5, 0.7])
+    assert core.full_lock_prefix_length([1.0, 0.5, 0.0], None) == 0
+    assert core.full_lock_prefix_length([1.0, 0.9, 0.0], 0.0) == 2
 
 
 def test_release_threshold_is_strict_and_none_disables():

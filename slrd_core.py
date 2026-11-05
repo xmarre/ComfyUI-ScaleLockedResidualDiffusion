@@ -827,6 +827,43 @@ def scale_lock_full_lock_active(guider, timestep: torch.Tensor | float | int) ->
     return threshold is not None and _sigma_scalar(timestep) > threshold
 
 
+def full_lock_prefix_length(sigmas: Sequence[float], threshold: Optional[float]) -> int:
+    """Number of leading sampler steps whose input sigma exceeds the threshold."""
+    if threshold is None:
+        return 0
+    count = 0
+    for sigma in list(sigmas)[:-1]:
+        if float(sigma) <= threshold:
+            break
+        count += 1
+    return count
+
+
+def flow_euler_locked_clean_state(
+    initial_clean: torch.Tensor,
+    predictions: Iterable[torch.Tensor],
+    sigmas: Sequence[float],
+) -> torch.Tensor:
+    """Clean component after flow-matching Euler steps with given predictions.
+
+    Flow Euler keeps ``x_k = sigma_k * noise + (1 - sigma_k) * C_k``. Each
+    step replaces ``C`` by a convex combination of ``C`` and the prediction,
+    so the recurrence needs no division by ``1 - sigma``. ``sigmas`` holds one
+    more entry than ``predictions``; the result is ``C`` at the last sigma.
+    """
+    sigmas = [float(v) for v in sigmas]
+    predictions = list(predictions)
+    if len(sigmas) != len(predictions) + 1:
+        raise ValueError("flow Euler state needs one more sigma than predictions")
+    clean = initial_clean.to(dtype=torch.float32)
+    for sigma, sigma_next, prediction in zip(sigmas[:-1], sigmas[1:], predictions):
+        if not (sigma > sigma_next >= 0.0) or sigma > 1.0:
+            raise ValueError("flow Euler sigmas must decrease within [0, 1]")
+        keep = 0.0 if sigma >= 1.0 else sigma_next * (1.0 - sigma) / (sigma * (1.0 - sigma_next))
+        clean = torch.lerp(prediction.to(device=clean.device, dtype=torch.float32), clean, keep)
+    return clean
+
+
 def scale_lock_strength_for_step(guider, idx: int) -> float:
     return scale_lock_strengths_for_step(guider, idx)[0]
 
