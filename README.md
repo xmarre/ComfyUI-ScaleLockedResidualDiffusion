@@ -263,7 +263,7 @@ What is not implemented yet:
 - explicit residual-only tiled model execution,
 - sigma-perfect trajectory matching for samplers that perform unusual extra model evaluations,
 - scheduled cutoff animation for coarse or mid bands,
-- multi-stage 1 MP -> 2 MP -> 4 MP progressive ladder inside one node,
+- multi-stage progressive ladders in the generic Scale-Locked samplers (the Krea 2 Turbo node supports resolution stages),
 - exact support tuning for every possible exotic custom sampler,
 - verified bindings for every historical Impact Pack hook/provider variant.
 
