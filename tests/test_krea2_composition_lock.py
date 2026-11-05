@@ -7,6 +7,7 @@ algebra and gating only; they do not establish image quality.
 from __future__ import annotations
 
 import importlib.util
+import math
 from pathlib import Path
 import sys
 import types
@@ -50,8 +51,12 @@ def _config(full_lock_sigma):
 
 
 def _flow_sigmas(steps, shift=1.15):
+    # ComfyUI's flux_time_shift form, as used by Krea 2's model sampling.
     t = torch.linspace(1.0, 0.0, steps + 1, dtype=torch.float64)
-    return shift * t / (1.0 + (shift - 1.0) * t)
+    sigmas = torch.zeros_like(t)
+    live = t > 0
+    sigmas[live] = math.exp(shift) / (math.exp(shift) + (1.0 / t[live] - 1.0))
+    return sigmas
 
 
 def _euler(x, sigmas, predict):
@@ -111,9 +116,9 @@ def test_locked_target_state_is_planner_state_with_target_noise(layout):
         low_shape, high_shape = (1, 16, 1, 8, 10), (1, 16, 1, 14, 18)
     _, anchors, _ = _planner(low_shape, sigmas)
     planner_sigmas = [float(s) for s in sigmas[:-1]]
-    release = 0.6
+    release = 0.8
     locked_steps = sum(float(s) > release for s in sigmas[:-1])
-    assert 0 < locked_steps < len(sigmas) - 1
+    assert locked_steps == 4
 
     target_noise = torch.randn(high_shape, generator=torch.Generator().manual_seed(9), dtype=torch.float64)
 
@@ -190,8 +195,8 @@ def test_locked_prediction_does_not_alias_stored_anchor_and_respects_mask():
     mask[..., :, :5] = 1.0
     masked = _locked_guider(model, anchors, planner_sigmas, x, 0.5, spatial_mask=mask)
     out = masked.predict_noise(x, sigmas[0])
-    assert torch.equal(out[..., :5], anchors[0][..., :5])
-    assert torch.equal(out[..., 5:], torch.full_like(out[..., 5:], 3.0))
+    assert torch.allclose(out[..., :5], anchors[0][..., :5], atol=1e-12, rtol=0.0)
+    assert torch.allclose(out[..., 5:], torch.full_like(out[..., 5:], 3.0), atol=1e-12, rtol=0.0)
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.1])

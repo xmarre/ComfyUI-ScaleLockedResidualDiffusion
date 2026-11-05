@@ -233,7 +233,7 @@ class Krea2TurboFlowAlignedRegenerate:
             "optional": {
                 "steps": ("INT", {"default": 8, "min": 1, "max": 10000,
                                    "tooltip": "Steps in each pass. Connect the same value to a native sampler for matched target-pass comparisons."}),
-                "composition_lock_sigma": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.01,
+                "composition_lock_sigma": ("FLOAT", {"default": 0.80, "min": 0.0, "max": 1.0, "step": 0.01,
                     "tooltip": "Target steps starting above this noise level reuse the complete planner prediction, "
                                "so the high-resolution pass cannot form a second, displaced composition. "
                                "Lower values keep more planner structure; 1.0 disables the full lock."}),
@@ -251,7 +251,7 @@ class Krea2TurboFlowAlignedRegenerate:
         coarse_lock_strength,
         mid_lock_strength,
         steps=8,
-        composition_lock_sigma=0.60,
+        composition_lock_sigma=0.80,
     ):
         composition_lock_sigma = float(composition_lock_sigma)
         if not math.isfinite(composition_lock_sigma) or not 0.0 <= composition_lock_sigma <= 1.0:

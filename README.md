@@ -45,7 +45,7 @@ runtime and does not load weights independently.
   within every 2x2 transformer-patch phase the normalized grouped projection
   matches the source Gaussian field, including noninteger upscaling ratios.
   This is a stochastic consistency invariant, not a learned image upscaler.
-- `composition_lock_sigma` (optional, default 0.60) sets where the
+- `composition_lock_sigma` (optional, default 0.80) sets where the
   high-resolution pass takes over. Target steps that start above this noise
   level use the planner's denoised prediction in every frequency band, so the
   target state is exactly the resized planner state carrying the target noise.
@@ -53,8 +53,8 @@ runtime and does not load weights independently.
   own composition; mixing only the planner's coarse bands into it can
   superimpose two layouts, visible as duplicated or displaced contours. Lower values
   keep more of the planner image and leave fewer steps for new detail; 1.0
-  disables the full lock. With Euler/simple and shift 1.15, the default locks
-  four of eight steps (six of twelve).
+  disables the full lock. With ComfyUI's Krea 2 schedule (Euler/simple,
+  shift 1.15), the default locks four of eight steps (six of twelve).
 - After that, `coarse_lock_strength` and `mid_lock_strength` determine how
   tightly the high-resolution denoised prediction follows the planner at low
   and middle spatial frequencies. Fine detail remains available to the
