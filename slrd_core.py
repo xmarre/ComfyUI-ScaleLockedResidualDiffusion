@@ -50,6 +50,10 @@ def _interp_mode(src_hw: tuple[int, int], dst_hw: tuple[int, int]) -> str:
 
 def resize_4d_tensor(x: torch.Tensor, size_hw: tuple[int, int]) -> torch.Tensor:
     """Resize BCHW tensor with sane defaults for latent tensors."""
+    if x.ndim == 5 and x.shape[2] == 1:
+        # Native image models may retain a singleton temporal axis. Resize only
+        # their spatial plane while preserving the native latent layout.
+        return resize_4d_tensor(x.squeeze(2), size_hw).unsqueeze(2)
     if tuple(x.shape[-2:]) == tuple(size_hw):
         return x
     mode = _interp_mode(tuple(x.shape[-2:]), tuple(size_hw))
@@ -97,7 +101,9 @@ def latent_target_hw_from_megapixels(
     Compute a target latent spatial size that preserves aspect ratio while targeting a pixel-space megapixel count.
     Latent tensors are expected to be 8x downsampled in H/W for standard image models used by ComfyUI.
     """
-    _, _, h_lat, w_lat = latent_bchw.shape
+    if latent_bchw.ndim != 4 and not (latent_bchw.ndim == 5 and latent_bchw.shape[2] == 1):
+        raise ValueError("Expected an image latent BCHW or BC1HW")
+    h_lat, w_lat = latent_bchw.shape[-2:]
     h_px = h_lat * 8
     w_px = w_lat * 8
     aspect = w_px / max(1.0, float(h_px))
@@ -722,7 +728,13 @@ def init_scale_lock_state(
     manifold_energy_gain_cap: float = 1.75,
     manifold_max_shift_px: float = 3.0,
     manifold_spatial_mask: Optional[torch.Tensor] = None,
+    full_lock_sigma: Optional[float] = None,
 ) -> None:
+    if full_lock_sigma is not None:
+        full_lock_sigma = float(full_lock_sigma)
+        if not math.isfinite(full_lock_sigma) or full_lock_sigma < 0.0:
+            raise ValueError("full_lock_sigma must be a finite non-negative noise level")
+    guider._slrd_full_lock_sigma = full_lock_sigma
     guider._slrd_model = model
     guider._slrd_anchors_x0_cpu = list(anchors_x0_cpu)
     guider._slrd_planner_sigmas = [float(x) for x in planner_sigmas] if planner_sigmas is not None else None
@@ -803,6 +815,84 @@ def resolve_scale_lock_step_index(guider, timestep: torch.Tensor | float | int) 
     if not guider._slrd_anchors_x0_cpu:
         return 0
     return min(step_index, len(guider._slrd_anchors_x0_cpu) - 1)
+
+
+def scale_lock_full_lock_active(guider, timestep: torch.Tensor | float | int) -> bool:
+    """Whether this target step reuses the complete planner prediction.
+
+    While active, the target state stays the planner state with the target
+    noise field. Its own composition cannot enter any frequency band.
+    """
+    threshold = getattr(guider, "_slrd_full_lock_sigma", None)
+    return threshold is not None and _sigma_scalar(timestep) > threshold
+
+
+def full_lock_prefix_length(sigmas: Sequence[float], threshold: Optional[float]) -> int:
+    """Number of leading sampler steps whose input sigma exceeds the threshold."""
+    if threshold is None:
+        return 0
+    count = 0
+    for sigma in list(sigmas)[:-1]:
+        if float(sigma) <= threshold:
+            break
+        count += 1
+    return count
+
+
+def parse_stage_megapixels(text: str) -> list[float]:
+    """Parse a comma- or space-separated list of intermediate stage sizes."""
+    values = []
+    for part in str(text or "").replace(";", ",").replace(" ", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = float(part)
+        except ValueError as exc:
+            raise ValueError(f"stage_megapixels entry {part!r} is not a number") from exc
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError("stage_megapixels entries must be positive megapixel values")
+        values.append(value)
+    return values
+
+
+def plan_stage_megapixels(planner_area_px: float, target_area_px: float, max_stage_upscale: float) -> list[float]:
+    """Geometric intermediate stage sizes so no stage grows the area by more than the limit."""
+    max_stage_upscale = float(max_stage_upscale)
+    if max_stage_upscale <= 0.0:
+        return []
+    if not math.isfinite(max_stage_upscale) or max_stage_upscale <= 1.0:
+        raise ValueError("max_stage_upscale must be 0 (single stage) or greater than 1")
+    ratio = float(target_area_px) / float(planner_area_px)
+    if ratio <= 1.0:
+        return []
+    stages = max(1, math.ceil(math.log(ratio) / math.log(max_stage_upscale) - 1e-9))
+    return [planner_area_px * ratio ** (i / stages) / 1_000_000.0 for i in range(1, stages)]
+
+
+def flow_euler_locked_clean_state(
+    initial_clean: torch.Tensor,
+    predictions: Iterable[torch.Tensor],
+    sigmas: Sequence[float],
+) -> torch.Tensor:
+    """Clean component after flow-matching Euler steps with given predictions.
+
+    Flow Euler keeps ``x_k = sigma_k * noise + (1 - sigma_k) * C_k``. Each
+    step replaces ``C`` by a convex combination of ``C`` and the prediction,
+    so the recurrence needs no division by ``1 - sigma``. ``sigmas`` holds one
+    more entry than ``predictions``; the result is ``C`` at the last sigma.
+    """
+    sigmas = [float(v) for v in sigmas]
+    predictions = list(predictions)
+    if len(sigmas) != len(predictions) + 1:
+        raise ValueError("flow Euler state needs one more sigma than predictions")
+    clean = initial_clean.to(dtype=torch.float32)
+    for sigma, sigma_next, prediction in zip(sigmas[:-1], sigmas[1:], predictions):
+        if not (sigma > sigma_next >= 0.0) or sigma > 1.0:
+            raise ValueError("flow Euler sigmas must decrease within [0, 1]")
+        keep = 0.0 if sigma >= 1.0 else sigma_next * (1.0 - sigma) / (sigma * (1.0 - sigma_next))
+        clean = torch.lerp(prediction.to(device=clean.device, dtype=torch.float32), clean, keep)
+    return clean
 
 
 def scale_lock_strength_for_step(guider, idx: int) -> float:

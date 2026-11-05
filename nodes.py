@@ -8,14 +8,17 @@ from typing import Any
 import math
 import torch
 import comfy.samplers
+import comfy.model_base
 
-from .slrd_core import build_nested_noise, clone_latent, init_scale_lock_state, resize_4d_tensor, resize_mask
+from .slrd_core import build_nested_noise, clone_latent, full_lock_prefix_length, init_scale_lock_state, latent_target_hw_from_megapixels, parse_stage_megapixels, plan_stage_megapixels, resize_4d_tensor, resize_mask
+from .resolution import DISPLAY_NAME as RESOLUTION_DISPLAY_NAME, NODE_ID as RESOLUTION_NODE_ID, ResolutionSelectorUncapped
 from .slrd_runtime import (
     LOCK_SCHEDULE_OPTIONS,
     MID_SCHEDULE_OPTIONS,
     ScaleLockConfig,
     _resolve_sampler_device,
     apply_scale_lock_to_noise_prediction,
+    calculate_sigmas,
     build_runtime_context_from_advanced,
     clean_latent,
     compat_sampler_names,
@@ -204,6 +207,166 @@ class ScaleLockedResidualKSampler:
                 lock_mask=lock_mask,
                 manifold_mask=manifold_mask,
             ),
+        )
+        return (result.output, result.lowres_planner, result.denoised_output)
+
+
+class Krea2TurboFlowAlignedRegenerate:
+    """Experimental Krea 2 Turbo two-pass composition-lock sampler."""
+
+    CATEGORY = "sampling/scale_locked"
+    RETURN_TYPES = ("LATENT", "LATENT", "LATENT")
+    RETURN_NAMES = ("output", "lowres_planner", "denoised_output")
+    FUNCTION = "sample"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "latent_image": ("LATENT",),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
+                "planner_megapixels": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 4.0, "step": 0.05}),
+                "coarse_lock_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Low-band pull toward the planner after the composition lock releases. "
+                               "0 lets the high-resolution pass refine freely; nonzero values can double fine contours and soften detail."}),
+                "mid_lock_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Mid-band pull toward the planner after the composition lock releases, relative to the low band. "
+                               "0 is recommended; nonzero values can double fine contours and soften detail."}),
+            },
+            "optional": {
+                "steps": ("INT", {"default": 8, "min": 1, "max": 10000,
+                                   "tooltip": "Steps in each pass. Connect the same value to a native sampler for matched target-pass comparisons."}),
+                "composition_lock_sigma": ("FLOAT", {"default": 0.80, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Target steps starting above this noise level reuse the complete planner prediction, "
+                               "so the high-resolution pass cannot form a second, displaced composition. "
+                               "Lower values keep more planner structure; 1.0 disables the full lock."}),
+                "max_stage_upscale": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 64.0, "step": 0.25,
+                    "tooltip": "Largest pixel-area growth per resolution stage (4.0 = 2x per side). Larger jumps are "
+                               "split into geometrically spaced intermediate stages. 0 always jumps from the planner "
+                               "straight to the output size. Ignored when stage_megapixels is set."}),
+                "stage_megapixels": ("STRING", {"default": "", "multiline": False,
+                    "tooltip": "Optional explicit intermediate stage sizes in megapixels, ascending and between the "
+                               "planner and the output, e.g. '4, 8'. Empty uses max_stage_upscale."}),
+            },
+        }
+
+    def sample(
+        self,
+        model,
+        positive,
+        negative,
+        latent_image,
+        seed,
+        planner_megapixels,
+        coarse_lock_strength,
+        mid_lock_strength,
+        steps=8,
+        composition_lock_sigma=0.80,
+        max_stage_upscale=4.0,
+        stage_megapixels="",
+    ):
+        composition_lock_sigma = float(composition_lock_sigma)
+        if not math.isfinite(composition_lock_sigma) or not 0.0 <= composition_lock_sigma <= 1.0:
+            raise ValueError("composition_lock_sigma must be within [0, 1]")
+        if not isinstance(getattr(model, "model", None), comfy.model_base.Krea2):
+            raise ValueError("Krea 2 Turbo Flow-Aligned Regenerate requires a native ComfyUI Krea2 MODEL")
+        if not isinstance(latent_image, dict) or not isinstance(latent_image.get("samples"), torch.Tensor):
+            raise TypeError("Krea 2 requires a LATENT dictionary with tensor samples")
+        # Native ComfyUI uses four-channel EmptyLatentImage placeholders for Krea 2,
+        # then expands them to sixteen channels during normal sampler preflight.
+        prepared_latent = fix_latent_channels(model, latent_image)
+        latent = prepared_latent["samples"]
+        image_layout = latent.ndim == 4 or (latent.ndim == 5 and latent.shape[2] == 1)
+        if not image_layout or latent.shape[1] != 16:
+            raise ValueError("Krea 2 requires a Bx16xHxW or Bx16x1xHxW image LATENT after native empty-latent conversion")
+        target_h, target_w = map(int, latent.shape[-2:])
+        if target_h % 2 or target_w % 2:
+            raise ValueError("Krea 2 requires even latent dimensions (16-pixel output alignment)")
+        low_h, low_w = latent_target_hw_from_megapixels(latent, planner_megapixels)
+        if low_h > target_h or low_w > target_w or (low_h, low_w) == (target_h, target_w):
+            raise ValueError("Final LATENT must be larger than the planner canvas")
+
+        explicit_stages = parse_stage_megapixels(stage_megapixels)
+        if explicit_stages:
+            stage_mp = explicit_stages
+        else:
+            stage_mp = plan_stage_megapixels(low_h * low_w * 64.0, target_h * target_w * 64.0, max_stage_upscale)
+        stage_hw = []
+        previous = (low_h, low_w)
+        for megapixels in stage_mp:
+            hw = latent_target_hw_from_megapixels(latent, megapixels)
+            if hw == previous and not explicit_stages:
+                continue  # Rounding to the 16-pixel grid merged two automatic stages.
+            if hw[0] < previous[0] or hw[1] < previous[1] or hw == previous:
+                raise ValueError(
+                    "stage_megapixels must increase from the planner size, and each stage must grow on the 16-pixel grid"
+                )
+            stage_hw.append(hw)
+            previous = hw
+        if stage_hw and (target_h < previous[0] or target_w < previous[1] or (target_h, target_w) == previous):
+            if explicit_stages:
+                raise ValueError("stage_megapixels must stay below the output LATENT size")
+            stage_hw.pop()
+        if stage_hw:
+            # Fail before the planner pass when no step remains after the lock.
+            schedule = [float(v) for v in calculate_sigmas(model, scheduler="simple", steps=steps, denoise=1.0).tolist()]
+            if full_lock_prefix_length(schedule, composition_lock_sigma) >= len(schedule) - 1:
+                raise ValueError("resolution stages need at least one step after the composition lock; raise steps or composition_lock_sigma")
+            logger.info(
+                "Krea 2 resolution stages: planner %sx%s -> %s -> output %sx%s",
+                low_w * 8, low_h * 8, " -> ".join(f"{w * 8}x{h * 8}" for h, w in stage_hw), target_w * 8, target_h * 8,
+            )
+
+        model_sampling = model.get_model_object("model_sampling")
+        shift = float(getattr(model_sampling, "shift", float("nan")))
+        if not math.isfinite(shift) or abs(shift - 1.15) > 1e-5:
+            raise ValueError("Krea 2 Turbo mode requires the native flow sampling shift 1.15")
+        if max(target_h, target_w) * 8 > 2048:
+            logger.warning(
+                "Krea 2 Turbo experimental target %sx%s exceeds the official "
+                "2048-pixel-axis inference range; visual fidelity and VRAM use are unvalidated",
+                target_w * 8, target_h * 8,
+            )
+
+        config = ScaleLockConfig(
+            lock_strength=coarse_lock_strength,
+            lock_strength_start=1.0,
+            lock_strength_end=0.20,
+            cutoff=0.33,
+            mid_cutoff=0.60,
+            mid_strength=mid_lock_strength,
+            schedule="hold_then_drop",
+            schedule_power=2.0,
+            schedule_hold=0.25,
+            mid_strength_start=1.0,
+            mid_strength_end=0.0,
+            mid_schedule="linked",
+            mid_schedule_power=2.0,
+            mid_schedule_hold=0.0,
+            full_lock_sigma=composition_lock_sigma,
+        )
+        result = run_scale_locked_ksampler(
+            model=model,
+            positive=positive,
+            negative=negative,
+            latent_image=prepared_latent,
+            seed=seed,
+            steps=steps,
+            cfg=1.0,
+            sampler_name="euler",
+            scheduler="simple",
+            denoise=1.0,
+            target_megapixels=planner_megapixels,
+            nested_noise_strength=1.0,
+            add_noise=True,
+            pin_anchors=True,
+            sampler_guard="error",
+            config=config,
+            noise_mode="patch_coupled",
+            stage_hw=tuple(stage_hw),
         )
         return (result.output, result.lowres_planner, result.denoised_output)
 
@@ -1646,6 +1809,8 @@ def _snapshot_impact_latent(latent: dict[str, Any]) -> dict[str, Any]:
 
 NODE_CLASS_MAPPINGS = {
     "ScaleLockedResidualKSampler": ScaleLockedResidualKSampler,
+    "Krea2TurboFlowAlignedRegenerate": Krea2TurboFlowAlignedRegenerate,
+    RESOLUTION_NODE_ID: ResolutionSelectorUncapped,
     "ScaleLockedRuntimeContextBuilder": ScaleLockedRuntimeContextBuilder,
     "ScaleLockedCFGGuider": ScaleLockedCFGGuiderNode,
     "ScaleLockedResidualSamplerCustomAdvanced": ScaleLockedResidualSamplerCustomAdvanced,
@@ -1655,6 +1820,8 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ScaleLockedResidualKSampler": "Scale-Locked Residual KSampler",
+    "Krea2TurboFlowAlignedRegenerate": "Krea 2 Turbo Flow-Aligned Regenerate [Experimental]",
+    RESOLUTION_NODE_ID: RESOLUTION_DISPLAY_NAME,
     "ScaleLockedRuntimeContextBuilder": "Scale-Locked Runtime Context",
     "ScaleLockedCFGGuider": "Scale-Locked CFG Guider",
     "ScaleLockedResidualSamplerCustomAdvanced": "Scale-Locked Residual SamplerCustomAdvanced",
