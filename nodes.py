@@ -10,7 +10,7 @@ import torch
 import comfy.samplers
 import comfy.model_base
 
-from .slrd_core import build_nested_noise, clone_latent, full_lock_prefix_length, init_scale_lock_state, latent_target_hw_from_megapixels, parse_stage_megapixels, plan_stage_megapixels, resize_4d_tensor, resize_mask, split_free_steps
+from .slrd_core import build_nested_noise, clone_latent, full_lock_prefix_length, init_scale_lock_state, latent_target_hw_from_megapixels, parse_stage_megapixels, plan_stage_megapixels, resize_4d_tensor, resize_mask
 from .slrd_runtime import (
     LOCK_SCHEDULE_OPTIONS,
     MID_SCHEDULE_OPTIONS,
@@ -310,11 +310,10 @@ class Krea2TurboFlowAlignedRegenerate:
                 raise ValueError("stage_megapixels must stay below the output LATENT size")
             stage_hw.pop()
         if stage_hw:
-            # Fail before the planner pass when the schedule cannot give every stage a step.
+            # Fail before the planner pass when no step remains after the lock.
             schedule = [float(v) for v in calculate_sigmas(model, scheduler="simple", steps=steps, denoise=1.0).tolist()]
-            split_free_steps(
-                len(schedule) - 1 - full_lock_prefix_length(schedule, composition_lock_sigma), len(stage_hw) + 1
-            )
+            if full_lock_prefix_length(schedule, composition_lock_sigma) >= len(schedule) - 1:
+                raise ValueError("resolution stages need at least one step after the composition lock; raise steps or composition_lock_sigma")
             logger.info(
                 "Krea 2 resolution stages: planner %sx%s -> %s -> output %sx%s",
                 low_w * 8, low_h * 8, " -> ".join(f"{w * 8}x{h * 8}" for h, w in stage_hw), target_w * 8, target_h * 8,

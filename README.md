@@ -61,23 +61,24 @@ runtime and does not load weights independently.
   locked steps are evaluated instead, because the mask blends in the
   target prediction.
 - **Resolution stages.** Large jumps from the planner to the output are split
-  into a ladder of intermediate resolutions. The ladder continues one sampling
-  trajectory: the planner owns every step above `composition_lock_sigma`, and
-  the remaining steps are divided over the stages in order, with any
-  remainder going to the later stages. Each stage starts from all earlier
-  predictions (planner and lower stages), resized to its own size, with its
-  own patch-coupled noise. Every step of the schedule is therefore evaluated
-  exactly once, at the highest resolution reached by then. Higher stages
-  start later in the schedule, so they have less freedom to re-plan the
-  composition and mostly sharpen it.
+  into a ladder of intermediate resolutions, so no single handoff upscales by
+  more than `max_stage_upscale`. The first stage starts at the
+  composition-lock release from the planner predictions, exactly like a
+  single-stage run. Each later stage takes the finished image of the stage
+  below, resized to its own size, re-noises it to the same release noise
+  level with its own patch-coupled noise, and runs the remaining steps. Every
+  stage therefore repeats the bounded planner-to-target handoff from a sharp
+  image. Handing over mid-schedule predictions instead was observed to fail:
+  they are blurry noise-conditional averages, and a later, lower-noise start
+  rendered that blur as defocus with speckle.
   - `max_stage_upscale` (default 4.0, i.e. 2x per side) is the largest
     pixel-area growth per stage. Jumps larger than that get geometrically
     spaced intermediate stages; 0 always jumps straight to the output.
   - `stage_megapixels` lists explicit intermediate sizes, e.g. `4, 8`, and
     overrides `max_stage_upscale`.
-  - Each stage needs at least one step after the composition lock. With
-    eight steps and the default lock, four steps remain; raise `steps` to
-    give every stage more of them.
+  - Every stage runs all steps after the release, so each intermediate
+    stage adds that many evaluations at its own size. With eight steps and
+    the default lock, that is four per stage.
 - After the release, the high-resolution pass refines freely by default.
   `coarse_lock_strength` and `mid_lock_strength` (default 0) optionally keep
   blending the low and middle spatial frequencies of each denoised prediction

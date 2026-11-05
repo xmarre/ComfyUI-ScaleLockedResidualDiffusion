@@ -33,7 +33,6 @@ from .slrd_core import (
     scale_lock_full_lock_active,
     full_lock_prefix_length,
     flow_euler_locked_clean_state,
-    split_free_steps,
     scale_lock_manifold_mask_for,
     scale_lock_manifold_strength_for_step,
     scale_lock_mask_for,
@@ -825,15 +824,16 @@ def _run_resolution_ladder(
     config: ScaleLockConfig,
     stage_hw: tuple,
 ) -> ScaleLockedSampleResult:
-    """Continue one flow-Euler trajectory through increasing resolutions.
+    """Refine through increasing resolutions, each stage finishing its image.
 
-    The planner owns every step above the composition lock. The remaining
-    steps are split over the stages in order, and each stage evaluates only
-    its own share. A stage starts in closed form from all earlier
-    predictions (planner and lower stages), each resized from its native
-    resolution, combined with the stage's own patch-coupled noise. Every step
-    of the schedule is therefore evaluated exactly once, at the highest
-    resolution reached at that point.
+    The first stage starts at the composition-lock release in closed form
+    from the planner predictions, exactly like the single-stage path. Every
+    later stage re-noises the finished image of the stage below, resized to
+    its own size, to the same release noise level with its own patch-coupled
+    noise, and runs the remaining steps. Each stage therefore repeats the
+    planner-to-2x handoff at a bounded scale ratio, starting from a sharp
+    image rather than from mid-noise predictions, whose posterior-mean blur
+    a late, low-noise start cannot remove.
     """
     if config.full_lock_sigma is None:
         raise ValueError("resolution stages require the composition lock")
@@ -851,29 +851,24 @@ def _run_resolution_ladder(
     target = highres_latent["samples"]
     sigma_values = [float(v) for v in sigmas.detach().cpu().tolist()]
     total_steps = len(sigma_values) - 1
-    first_release = full_lock_prefix_length(sigma_values, config.full_lock_sigma)
+    release = full_lock_prefix_length(sigma_values, config.full_lock_sigma)
+    if release >= total_steps:
+        raise ValueError("resolution stages need at least one step after the composition lock")
     sizes = [tuple(map(int, hw)) for hw in stage_hw] + [tuple(map(int, target.shape[-2:]))]
     previous = tuple(map(int, lowres_latent["samples"].shape[-2:]))
     for hw in sizes:
         if hw[0] < previous[0] or hw[1] < previous[1] or hw == previous or hw[0] % 2 or hw[1] % 2:
             raise ValueError("resolution stages must grow monotonically in both dimensions on the 16-pixel grid")
         previous = hw
-    counts = split_free_steps(total_steps - first_release, len(sizes))
-    bounds = [first_release]
-    for count in counts:
-        bounds.append(bounds[-1] + count)
 
-    references = list(anchors_x0[:first_release])
     stage_noise = lowres_noise
     sampler = comfy.samplers.sampler_object(sampler_name)
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
-    store_dtype = _store_dtype_for(target)
     x0_output: dict = {}
-    samples = None
+    finished = None
 
     for index, hw in enumerate(sizes):
         final = index == len(sizes) - 1
-        start, end = bounds[index], bounds[index + 1]
         stage_latent = highres_latent if final else resize_latent_dict(highres_latent, hw)
         stage_samples = stage_latent["samples"]
         seed = detail_seed if final else _stage_seed(detail_seed, index)
@@ -885,19 +880,26 @@ def _run_resolution_ladder(
             mode=noise_mode,
         )
 
-        start_latent = stage_samples
-        if start > 0:
-            initial = stage_samples
-            if torch.count_nonzero(initial) > 0:
-                initial = model.model.process_latent_in(initial)
-            predictions = (
-                resize_4d_tensor(
-                    references[k].to(device=stage_samples.device, dtype=torch.float32, non_blocking=True), hw
+        if finished is None:
+            start_latent = stage_samples
+            if release > 0:
+                initial = stage_samples
+                if torch.count_nonzero(initial) > 0:
+                    initial = model.model.process_latent_in(initial)
+                predictions = (
+                    resize_4d_tensor(
+                        anchors_x0[k].to(device=stage_samples.device, dtype=torch.float32, non_blocking=True), hw
+                    )
+                    for k in range(release)
                 )
-                for k in range(start)
-            )
-            clean = flow_euler_locked_clean_state(initial, predictions, sigma_values[: start + 1])
-            start_latent = model.model.process_latent_out(clean).to(dtype=stage_samples.dtype)
+                clean = flow_euler_locked_clean_state(initial, predictions, sigma_values[: release + 1])
+                start_latent = model.model.process_latent_out(clean).to(dtype=stage_samples.dtype)
+        else:
+            # Output-space latent: CFGGuider.inner_sample applies process_latent_in
+            # and the flow noise scaling re-noises it to the release sigma.
+            start_latent = resize_4d_tensor(
+                finished.to(device=stage_samples.device, dtype=torch.float32), hw
+            ).to(dtype=stage_samples.dtype)
 
         stage_runtime = ScaleLockedRuntimeContext(
             model=model,
@@ -912,20 +914,14 @@ def _run_resolution_ladder(
         )
         guider = create_cfg_guider(model, positive, negative, cfg)
         apply_scale_lock_to_guider(guider, stage_runtime, config)
-        recorder = TrajectoryRecorder(store_dtype=store_dtype, capture_noisy_xt=False, pin_memory=False)
         stage_x0: dict = {}
-        preview = make_preview_callback(model, end - start, stage_x0)
-
-        def callback(step, x0, x, total, _recorder=recorder, _preview=preview):
-            _recorder.callback(step, x0, x, total)
-            _preview(step, x0, x, total)
-
+        callback = make_preview_callback(model, total_steps - release, stage_x0)
         try:
-            samples = guider.sample(
+            finished = guider.sample(
                 stage_noise,
                 start_latent,
                 sampler,
-                sigmas[start : end + 1],
+                sigmas[release:],
                 denoise_mask=None,
                 callback=callback,
                 disable_pbar=disable_pbar,
@@ -933,17 +929,10 @@ def _run_resolution_ladder(
             )
         finally:
             restore_original_predict_noise(guider)
-        if len(recorder.x0_steps) != end - start:
-            raise RuntimeError("resolution stage recorded an unexpected number of predictions")
         if final:
             x0_output = stage_x0
-        else:
-            # The returned latent of a partial schedule is not an image; only
-            # the predictions carry over to the next stage.
-            references.extend(recorder.x0_steps)
-            samples = None
 
-    samples = samples.to(comfy.model_management.intermediate_device())
+    samples = finished.to(comfy.model_management.intermediate_device())
     out = clean_latent(highres_latent)
     out["samples"] = samples
     if "x0" in x0_output:

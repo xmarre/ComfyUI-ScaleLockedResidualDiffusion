@@ -270,11 +270,3 @@ def test_stage_megapixels_parsing():
         core.parse_stage_megapixels("4, big")
     with pytest.raises(ValueError, match="positive"):
         core.parse_stage_megapixels("4, -1")
-
-
-def test_free_steps_split_favours_later_stages():
-    assert core.split_free_steps(8, 2) == [4, 4]
-    assert core.split_free_steps(8, 3) == [2, 3, 3]
-    assert sum(core.split_free_steps(13, 4)) == 13
-    with pytest.raises(ValueError, match="raise steps"):
-        core.split_free_steps(2, 3)

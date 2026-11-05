@@ -109,7 +109,7 @@ def main():
                           "target_model_calls": target_calls, "output_shapes": shapes, "reports": reports}))
 
     # Resolution ladder: planner 12x14 -> stage 16x20 -> output 24x28 latent cells.
-    ladder_shares = {8: (2, 2), 12: (3, 3)}
+    # Each stage finishes its image and runs every step after the lock.
     for label, selected, steps in [(label,selected,steps) for label,selected in cases for steps in (8,12)]:
         for stage_options in ({"stage_megapixels": "0.02"}, {"max_stage_upscale": 2.0}):
             reports = []
@@ -126,13 +126,12 @@ def main():
                     hook.remove()
                 if reports_context is not None:
                     reports_context.reset(token)
-            shares = ladder_shares[steps]
+            free = steps - locked_by_steps[steps]
             if label == "native":
                 counts = {shape: calls.count(shape) for shape in set(calls)}
-                # Every schedule step is evaluated once, at one resolution.
-                assert counts == {(12, 14): steps, (16, 20): shares[0], (24, 28): shares[1]}, counts
+                assert counts == {(12, 14): steps, (16, 20): free, (24, 28): free}, counts
             else:
-                assert [r["outer_steps"] for r in reports] == [steps, *shares], reports
+                assert [r["outer_steps"] for r in reports] == [steps, free, free], reports
                 assert all(r["fallback"] is None for r in reports)
             shapes = [list(x["samples"].shape) for x in result]
             assert shapes[0] == shapes[2] == [1, 16, 1, 24, 28]
@@ -140,13 +139,13 @@ def main():
             assert all(torch.isfinite(x["samples"]).all() for x in result)
             assert not base.diffusion_model._forward_pre_hooks
             print(json.dumps({"case": label + "_ladder", "options": stage_options, "steps_per_pass": steps,
-                              "stage_steps": shares, "output_shapes": shapes, "reports": reports}))
+                              "stage_steps": free, "output_shapes": shapes, "reports": reports}))
 
     try:
         node.sample(model, positive, negative, {"samples": torch.zeros(1, 4, 24, 28)},
-                    42, .01, 0.0, 0.0, steps=2, stage_megapixels="0.02")
+                    42, .01, 0.0, 0.0, steps=2, composition_lock_sigma=0.0, stage_megapixels="0.02")
     except ValueError as exc:
-        assert "raise steps" in str(exc)
+        assert "at least one step" in str(exc)
     else:
         raise AssertionError("too few steps for the stages must be rejected before sampling")
 

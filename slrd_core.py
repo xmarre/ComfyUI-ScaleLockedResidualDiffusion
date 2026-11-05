@@ -870,19 +870,6 @@ def plan_stage_megapixels(planner_area_px: float, target_area_px: float, max_sta
     return [planner_area_px * ratio ** (i / stages) / 1_000_000.0 for i in range(1, stages)]
 
 
-def split_free_steps(free_steps: int, stages: int) -> list[int]:
-    """Split the steps after the first release over the stages, later stages first for the remainder."""
-    if stages < 1:
-        raise ValueError("at least one stage is required")
-    if free_steps < stages:
-        raise ValueError(
-            f"{stages} resolution stages need at least {stages} steps after the composition lock, "
-            f"but only {free_steps} remain; raise steps or composition_lock_sigma, or use fewer stages"
-        )
-    base, extra = divmod(int(free_steps), stages)
-    return [base + (1 if i >= stages - extra else 0) for i in range(stages)]
-
-
 def flow_euler_locked_clean_state(
     initial_clean: torch.Tensor,
     predictions: Iterable[torch.Tensor],
