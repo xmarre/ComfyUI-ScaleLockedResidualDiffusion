@@ -58,7 +58,7 @@ def main():
         with torch.inference_mode():
             # Small latent canvases keep genuine CPU model execution practical.
             result = node.sample(selected, positive, negative,
-                                 {"samples": torch.zeros(1, 4, 16, 20)}, 42, .01, .75, .2, steps=steps)
+                                 {"samples": torch.zeros(1, 4, 16, 20)}, 42, .01, 0.0, 0.0, steps=steps)
         if reports_context is not None:
             reports_context.reset(token)
         if label == "spectrum":

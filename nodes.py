@@ -227,8 +227,12 @@ class Krea2TurboFlowAlignedRegenerate:
                 "latent_image": ("LATENT",),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
                 "planner_megapixels": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 4.0, "step": 0.05}),
-                "coarse_lock_strength": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "mid_lock_strength": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "coarse_lock_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Low-band pull toward the planner after the composition lock releases. "
+                               "0 lets the high-resolution pass refine freely; nonzero values can double fine contours and soften detail."}),
+                "mid_lock_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Mid-band pull toward the planner after the composition lock releases, relative to the low band. "
+                               "0 is recommended; nonzero values can double fine contours and soften detail."}),
             },
             "optional": {
                 "steps": ("INT", {"default": 8, "min": 1, "max": 10000,

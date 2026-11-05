@@ -35,7 +35,7 @@ runtime and does not load weights independently.
   are not supported by this image node.
 - The node defaults to an eight-step, approximately 1 MP planner pass, then
   eight high-resolution steps: the first ones follow the planner trajectory
-  completely, the remaining ones add detail with structure anchoring.
+  completely, and the remaining ones add detail at the target resolution.
   The optional `steps` input controls both passes (default 8). Connect the same
   step count to a native sampler for matched target-pass comparisons.
 - The Krea 2 Turbo sampling profile is ComfyUI CFG **1.0** (no
@@ -55,11 +55,15 @@ runtime and does not load weights independently.
   keep more of the planner image and leave fewer steps for new detail; 1.0
   disables the full lock. With ComfyUI's Krea 2 schedule (Euler/simple,
   shift 1.15), the default locks four of eight steps (six of twelve).
-- After that, `coarse_lock_strength` and `mid_lock_strength` determine how
-  tightly the high-resolution denoised prediction follows the planner at low
-  and middle spatial frequencies. Fine detail remains available to the
-  high-resolution denoiser. All built-in values are **starting hypotheses**,
-  not calibrated Krea-2-specific optima.
+- After the release, the high-resolution pass refines freely by default.
+  `coarse_lock_strength` and `mid_lock_strength` (default 0) optionally keep
+  blending the low and middle spatial frequencies of each denoised prediction
+  toward the planner. Their bands are defined relative to the target canvas,
+  so at large sizes they include fine structures such as fingers, jewelry and
+  seams. The planner version of those structures is upscaled and blurred.
+  Nonzero values were observed to double fine contours and soften texture,
+  and are kept only for experiments. `composition_lock_sigma` is a starting
+  value, not a calibrated optimum.
 - The `output` is the high-resolution LATENT, `lowres_planner` is the planner
   LATENT, and `denoised_output` is the available final x0 preview LATENT.
 
@@ -74,9 +78,9 @@ A meaningful A/B must compare the same high-resolution model, eight steps,
 seed, prompt and conditioning both **with and without** the two-pass method.
 Connect one step-count input to both nodes when comparing other step budgets.
 Judge composition/subject preservation, duplicated objects, typography,
-fine-texture detail and wall time/VRAM. The algorithm has **not** yet been
-validated against real Krea 2 GPU outputs; there is no claimed quality or
-speed improvement. It generally costs an additional eight low-resolution
+fine-texture detail and wall time/VRAM. Real Krea 2 checks so far are
+limited to individual visual comparisons, not a systematic evaluation;
+there is no claimed quality or speed improvement. It generally costs an additional eight low-resolution
 DiT evaluations and is intended to improve structural consistency, not
 throughput. For RAW, custom samplers and advanced research controls, use
 the generic Scale-Locked Residual KSampler instead.
