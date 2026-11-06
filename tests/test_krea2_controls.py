@@ -16,6 +16,7 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SAMPLERS = ("euler", "dpmpp_2m", "res_multistep", "deis", "ipndm", "ipndm_v", "gradient_estimation")
 
 
 def _node():
@@ -54,6 +55,7 @@ def _node():
         "math": math, "torch": torch,
         "comfy": SimpleNamespace(model_base=SimpleNamespace(Krea2=Krea2)),
         "compat_scheduler_names": lambda: ["simple", "normal", "sgm_uniform"],
+        "krea2_sampler_names": lambda: list(SAMPLERS),
         "fix_latent_channels": lambda model, latent: latent,
         "latent_target_hw_from_megapixels": target_hw,
         "parse_stage_megapixels": lambda text: (
@@ -83,7 +85,7 @@ def test_existing_widget_slots_and_explicit_defaults():
         "stage_megapixels", "cfg", "sampler_name", "scheduler",
     ]
     assert schema["optional"]["cfg"][1]["default"] == 1.0
-    assert schema["optional"]["sampler_name"][0] == ["euler", "dpmpp_2m"]
+    assert schema["optional"]["sampler_name"][0] == list(SAMPLERS)
     assert schema["optional"]["sampler_name"][1]["default"] == "euler"
     assert schema["optional"]["scheduler"][1]["default"] == "simple"
     assert node.sample(*args) == ("target", "planner", "denoised")
@@ -103,16 +105,24 @@ def test_configured_cfg_sampler_scheduler_route_to_both_passes():
     assert calls[-1]["cfg"] == 0.0
 
 
+@pytest.mark.parametrize("sampler_name", SAMPLERS)
+def test_every_offered_solver_routes_single_stage_and_resolution_ladders(sampler_name):
+    node, calls, args = _node()
+    node.sample(*args, sampler_name=sampler_name, max_stage_upscale=0.0)
+    assert calls[-1]["sampler_name"] == sampler_name and calls[-1]["stage_hw"] == ()
+    node.sample(*args, sampler_name=sampler_name, stage_megapixels="2")
+    assert calls[-1]["sampler_name"] == sampler_name and calls[-1]["stage_hw"]
+
+
 @pytest.mark.parametrize("extra, message", [
     ({"cfg": float("nan")}, "CFG must be finite"),
     ({"cfg": float("inf")}, "CFG must be finite"),
     ({"cfg": -1.0}, "CFG must be finite"),
     ({"cfg": 101.0}, "CFG must be finite"),
-    ({"sampler_name": "heun"}, "supports Euler or DPM"),
+    ({"sampler_name": "heun"}, "Unsupported Krea 2 sampler"),
+    ({"sampler_name": "dpmpp_2m_cfg_pp"}, "Unsupported Krea 2 sampler"),
     ({"scheduler": "not_a_scheduler"}, "Unsupported Krea 2 scheduler"),
     ({"scheduler": "sgm_uniform"}, "strictly decreasing"),
-    ({"sampler_name": "dpmpp_2m", "stage_megapixels": "2"},
-     "resolution ladders require Euler"),
 ])
 def test_invalid_selection_rejected_before_any_sampling(extra, message):
     node, calls, args = _node()

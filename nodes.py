@@ -26,6 +26,7 @@ from .slrd_runtime import (
     create_cfg_guider,
     fix_latent_channels,
     guard_sampler_alignment,
+    krea2_sampler_names,
     make_lowres_latent,
     prepare_noise,
     run_scale_locked_ksampler,
@@ -252,8 +253,10 @@ class Krea2TurboFlowAlignedRegenerate:
                                "planner and the output, e.g. '4, 8'. Empty uses max_stage_upscale."}),
                 "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01,
                     "tooltip": "ComfyUI CFG. Krea 2 Turbo normally uses 1.0 (no classifier-free guidance). Higher values alter conditioning and require visual validation."}),
-                "sampler_name": (["euler", "dpmpp_2m"], {"default": "euler",
-                    "tooltip": "Euler preserves the exact fast flow-matching composition-lock handoff and supports resolution ladders. DPM++ 2M is experimental: single-stage only, evaluates all high-resolution steps and cannot use Euler's closed-form skip."}),
+                "sampler_name": (krea2_sampler_names(), {"default": "euler",
+                    "tooltip": "Solver for planner and target passes. Every option skips the target model during composition-locked steps and supports resolution stages. "
+                               "Euler reaches the lock release in closed form; the others run their native multistep update through the locked steps using the planner predictions. "
+                               "Non-Euler solvers are experimental and need visual validation."}),
                 "scheduler": (compat_scheduler_names(), {"default": "simple",
                     "tooltip": "ComfyUI sigma schedule applied consistently to planner and target. Changes locked-step count and denoising trajectory. Experimental alternatives need visual validation."}),
             },
@@ -279,8 +282,10 @@ class Krea2TurboFlowAlignedRegenerate:
     ):
         if not isinstance(cfg, (int, float)) or not math.isfinite(cfg) or not 0.0 <= cfg <= 100.0:
             raise ValueError("Krea 2 CFG must be finite and within [0, 100]")
-        if sampler_name not in ("euler", "dpmpp_2m"):
-            raise ValueError("Krea 2 supports Euler or DPM++ 2M; other solvers have not been validated for the composition lock")
+        if sampler_name not in krea2_sampler_names():
+            raise ValueError(
+                f"Unsupported Krea 2 sampler {sampler_name!r}; supported: {', '.join(krea2_sampler_names())}"
+            )
         if scheduler not in compat_scheduler_names():
             raise ValueError(f"Unsupported Krea 2 scheduler: {scheduler!r}")
         composition_lock_sigma = float(composition_lock_sigma)
@@ -325,11 +330,6 @@ class Krea2TurboFlowAlignedRegenerate:
             if explicit_stages:
                 raise ValueError("stage_megapixels must stay below the output LATENT size")
             stage_hw.pop()
-        # An Euler flow lock can be transferred in closed form without running
-        # the target DiT. DPM++ 2M has solver history across its steps, so
-        # a truncated high-resolution stage cannot reproduce that trajectory.
-        if stage_hw and sampler_name != "euler":
-            raise ValueError("Krea 2 resolution ladders require Euler; DPM++ 2M is supported only for single-stage target regeneration")
         schedule = [float(v) for v in calculate_sigmas(model, scheduler=scheduler, steps=steps, denoise=1.0).tolist()]
         if (len(schedule) != steps + 1 or any(not math.isfinite(v) or not 0.0 <= v <= 1.0 for v in schedule)
                 or any(a <= b for a, b in zip(schedule, schedule[1:])) or schedule[-1] != 0.0):

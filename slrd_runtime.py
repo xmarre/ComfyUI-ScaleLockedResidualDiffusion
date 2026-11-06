@@ -57,7 +57,38 @@ _CONSERVATIVE_SAFE_SAMPLERS = {
     "lcm",
     "dpmpp_2m",
     "dpmpp_2m_cfg_pp",
+    # Deterministic, one denoiser evaluation per step, history built only
+    # from (x, denoised) pairs: planner anchors map one-to-one onto steps.
+    "deis",
+    "gradient_estimation",
+    "ipndm",
+    "ipndm_v",
+    "res_multistep",
 }
+
+# Native ComfyUI samplers offered by the Krea 2 node. Each is deterministic,
+# calls the denoiser exactly once per step through the guider, and derives
+# its solver history only from the denoised predictions it receives. A fully
+# locked step can therefore be answered with the planner prediction without
+# evaluating the target model, while the genuine solver still integrates every
+# step. CFG++ variants are excluded: they read the unconditional prediction
+# from a post-CFG hook that a skipped evaluation would not run. Euler
+# additionally uses the closed-form flow handoff.
+KREA2_SAMPLERS = (
+    "euler",
+    "dpmpp_2m",
+    "res_multistep",
+    "deis",
+    "ipndm",
+    "ipndm_v",
+    "gradient_estimation",
+)
+
+
+def krea2_sampler_names() -> list[str]:
+    """Krea 2 node solvers that the installed ComfyUI provides, Euler first."""
+    available = set(compat_sampler_names())
+    return [name for name in KREA2_SAMPLERS if name in available]
 
 LOCK_SCHEDULE_OPTIONS = [
     "linear",
@@ -358,6 +389,25 @@ def apply_scale_lock_to_noise_prediction(guider, base_noise: torch.Tensor, x, ti
     return corrected
 
 
+def locked_planner_prediction(guider, x: torch.Tensor, timestep) -> Optional[torch.Tensor]:
+    """Planner prediction for a fully locked step, or None if the model must run.
+
+    ``apply_scale_lock_to_noise_prediction`` discards the target prediction
+    entirely during an unmasked full lock, so returning this directly yields
+    the same denoised value without the target model evaluation. Masked locks
+    blend the target prediction and return None.
+    """
+    if not getattr(guider, "_slrd_anchors_x0_cpu", None):
+        return None
+    if not scale_lock_full_lock_active(guider, timestep):
+        return None
+    if scale_lock_mask_for(guider, x) is not None:
+        return None
+    idx = resolve_scale_lock_step_index(guider, timestep)
+    # The anchor may alias stored planner state; never hand it out.
+    return scale_lock_anchor_for(guider, idx, x).clone()
+
+
 def create_cfg_guider(model, positive, negative, cfg):
     guider = comfy.samplers.CFGGuider(model)
     guider.set_conds(positive, negative)
@@ -384,7 +434,12 @@ def clone_guider_for_scale_lock(guider):
     return cloned
 
 
-def apply_scale_lock_to_guider(guider, runtime: ScaleLockedRuntimeContext, config: ScaleLockConfig):
+def apply_scale_lock_to_guider(
+    guider,
+    runtime: ScaleLockedRuntimeContext,
+    config: ScaleLockConfig,
+    skip_locked_model_calls: bool = False,
+):
     spatial_mask = prepare_spatial_lock_mask(config.spatial_mask, runtime.highres_latent["samples"])
     manifold_spatial_mask = prepare_spatial_lock_mask(
         config.manifold_spatial_mask if config.manifold_spatial_mask is not None else config.spatial_mask,
@@ -434,10 +489,15 @@ def apply_scale_lock_to_guider(guider, runtime: ScaleLockedRuntimeContext, confi
 
     original_predict_noise = getattr(guider, "_slrd_original_predict_noise", guider.predict_noise)
     guider._slrd_original_predict_noise = original_predict_noise
+    guider._slrd_skip_locked_model_calls = bool(skip_locked_model_calls)
 
     def _wrapped_predict_noise(self, x, timestep, model_options=None, seed=None):
         if model_options is None:
             model_options = {}
+        if getattr(self, "_slrd_skip_locked_model_calls", False):
+            locked = locked_planner_prediction(self, x, timestep)
+            if locked is not None:
+                return locked
         base_noise = self._slrd_original_predict_noise(x, timestep, model_options=model_options, seed=seed)
         return apply_scale_lock_to_noise_prediction(self, base_noise, x, timestep)
 
@@ -744,6 +804,7 @@ def sample_with_runtime(
     config: ScaleLockConfig,
     restore_after: bool = True,
     analytic_full_lock: bool = False,
+    skip_locked_model_calls: bool = False,
 ) -> ScaleLockedSampleResult:
     if runtime.sigmas.numel() == 0:
         out = clean_latent(runtime.highres_latent)
@@ -768,7 +829,7 @@ def sample_with_runtime(
         sigmas = sigmas[locked_steps:]
         latent_samples = runtime.model.model.process_latent_out(clean).to(dtype=latent_samples.dtype)
 
-    apply_scale_lock_to_guider(guider, runtime, config)
+    apply_scale_lock_to_guider(guider, runtime, config, skip_locked_model_calls=skip_locked_model_calls)
 
     x0_output = {}
     callback = make_preview_callback(runtime.model, len(sigmas) - 1, x0_output)
@@ -837,21 +898,23 @@ def _run_resolution_ladder(
 ) -> ScaleLockedSampleResult:
     """Refine through increasing resolutions, each stage finishing its image.
 
-    The first stage starts at the composition-lock release in closed form
-    from the planner predictions, exactly like the single-stage path. Every
-    later stage re-noises the finished image of the stage below, resized to
+    The first stage reaches the composition-lock release exactly like the
+    single-stage path: in closed form for Euler, and for other solvers by
+    integrating the locked prefix natively with the planner predictions in
+    place of target model calls, which preserves their multistep history.
+    Every later stage re-noises the finished image of the stage below, resized to
     its own size, to the same release noise level with its own patch-coupled
     noise, and runs the remaining steps. Each stage therefore repeats the
     planner-to-2x handoff at a bounded scale ratio, starting from a sharp
     image rather than from mid-noise predictions, whose posterior-mean blur
-    a late, low-noise start cannot remove.
+    a late, low-noise start cannot remove. A later stage is a fresh solver
+    start at the release sigma, so multistep solvers begin it at first order.
     """
     if config.full_lock_sigma is None:
         raise ValueError("resolution stages require the composition lock")
-    if _normalize_sampler_name(sampler_name) != "euler" or not isinstance(
-        _model_sampling_obj(model), comfy.model_sampling.CONST
-    ):
-        raise ValueError("resolution stages require Euler with flow model sampling")
+    if not isinstance(_model_sampling_obj(model), comfy.model_sampling.CONST):
+        raise ValueError("resolution stages require flow model sampling")
+    euler = _normalize_sampler_name(sampler_name) == "euler"
     if (
         isinstance(highres_latent.get("noise_mask"), torch.Tensor)
         or config.spatial_mask is not None
@@ -891,9 +954,14 @@ def _run_resolution_ladder(
             mode=noise_mode,
         )
 
+        stage_sigmas = sigmas[release:]
         if finished is None:
             start_latent = stage_samples
-            if release > 0:
+            if not euler:
+                # Native solver over the full schedule; locked steps take the
+                # planner prediction and cost no model evaluation.
+                stage_sigmas = sigmas
+            elif release > 0:
                 initial = stage_samples
                 if torch.count_nonzero(initial) > 0:
                     initial = model.model.process_latent_in(initial)
@@ -924,15 +992,15 @@ def _run_resolution_ladder(
             noise_seed=seed,
         )
         guider = create_cfg_guider(model, positive, negative, cfg)
-        apply_scale_lock_to_guider(guider, stage_runtime, config)
+        apply_scale_lock_to_guider(guider, stage_runtime, config, skip_locked_model_calls=True)
         stage_x0: dict = {}
-        callback = make_preview_callback(model, total_steps - release, stage_x0)
+        callback = make_preview_callback(model, len(stage_sigmas) - 1, stage_x0)
         try:
             finished = guider.sample(
                 stage_noise,
                 start_latent,
                 sampler,
-                sigmas[release:],
+                stage_sigmas,
                 denoise_mask=None,
                 callback=callback,
                 disable_pbar=disable_pbar,
@@ -1048,8 +1116,12 @@ def run_scale_locked_ksampler(
         and _normalize_sampler_name(sampler_name) == "euler"
         and isinstance(_model_sampling_obj(model), comfy.model_sampling.CONST)
     )
+    # Other solvers integrate the locked prefix natively; answering those steps
+    # with the planner prediction skips only target evaluations whose output the
+    # full lock would discard, so solver history and the result are unchanged.
     return sample_with_runtime(
         guider=guider, sampler=sampler, runtime=runtime, config=config,
         analytic_full_lock=analytic_full_lock,
+        skip_locked_model_calls=config.full_lock_sigma is not None,
     )
 

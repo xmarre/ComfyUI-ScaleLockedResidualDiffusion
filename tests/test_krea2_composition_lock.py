@@ -76,7 +76,8 @@ class _Guider:
         return self._model_prediction(x, timestep)
 
 
-def _locked_guider(model_prediction, anchors, planner_sigmas, highres, full_lock_sigma, spatial_mask=None):
+def _locked_guider(model_prediction, anchors, planner_sigmas, highres, full_lock_sigma, spatial_mask=None,
+                   skip_locked_model_calls=False):
     guider = _Guider(model_prediction)
     config = _config(full_lock_sigma)
     config.spatial_mask = spatial_mask
@@ -85,7 +86,8 @@ def _locked_guider(model_prediction, anchors, planner_sigmas, highres, full_lock
         lowres_out=None, sigmas=None, anchors_x0=anchors,
         planner_sigmas=planner_sigmas, highres_noise=None, noise_seed=0,
     )
-    return runtime.apply_scale_lock_to_guider(guider, context, config)
+    return runtime.apply_scale_lock_to_guider(guider, context, config,
+                                              skip_locked_model_calls=skip_locked_model_calls)
 
 
 def _planner(low_shape, sigmas, seed=5):
@@ -234,6 +236,102 @@ def test_locked_prediction_does_not_alias_stored_anchor_and_respects_mask():
     out = masked.predict_noise(x, sigmas[0])
     assert torch.allclose(out[..., :5], anchors[0][..., :5], atol=1e-12, rtol=0.0)
     assert torch.allclose(out[..., 5:], torch.full_like(out[..., 5:], 3.0), atol=1e-12, rtol=0.0)
+
+
+def _dpmpp_2m(x, sigmas, predict):
+    # ComfyUI k_diffusion.sampling.sample_dpmpp_2m update, verbatim.
+    sigma_fn = lambda t: t.neg().exp()
+    t_fn = lambda sigma: sigma.log().neg()
+    old_denoised = None
+    for i in range(len(sigmas) - 1):
+        denoised = predict(x, sigmas[i])
+        t, t_next = t_fn(sigmas[i]), t_fn(sigmas[i + 1])
+        h = t_next - t
+        if old_denoised is None or sigmas[i + 1] == 0:
+            x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised
+        else:
+            h_last = t - t_fn(sigmas[i - 1])
+            r = h_last / h
+            denoised_d = (1 + 1 / (2 * r)) * denoised - (1 / (2 * r)) * old_denoised
+            x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised_d
+        old_denoised = denoised
+    return x
+
+
+def _ipndm(x, sigmas, predict, max_order=4):
+    # ComfyUI k_diffusion.sampling.sample_ipndm update, verbatim.
+    buffer_model = []
+    for i in range(len(sigmas) - 1):
+        t_cur, t_next = sigmas[i], sigmas[i + 1]
+        denoised = predict(x, t_cur)
+        d_cur = (x - denoised) / t_cur
+        order = min(max_order, i + 1)
+        if t_next == 0:
+            x_next = denoised
+        elif order == 1:
+            x_next = x + (t_next - t_cur) * d_cur
+        elif order == 2:
+            x_next = x + (t_next - t_cur) * (3 * d_cur - buffer_model[-1]) / 2
+        elif order == 3:
+            x_next = x + (t_next - t_cur) * (23 * d_cur - 16 * buffer_model[-1] + 5 * buffer_model[-2]) / 12
+        else:
+            x_next = x + (t_next - t_cur) * (55 * d_cur - 59 * buffer_model[-1] + 37 * buffer_model[-2] - 9 * buffer_model[-3]) / 24
+        if len(buffer_model) == max_order - 1:
+            buffer_model = buffer_model[1:] + [d_cur]
+        else:
+            buffer_model.append(d_cur)
+        x = x_next
+    return x
+
+
+@pytest.mark.parametrize("solver", [_euler, _dpmpp_2m, _ipndm])
+@pytest.mark.parametrize("steps, release", [(8, 0.8), (12, 0.8), (18, 0.8), (6, 0.0), (8, 1.0)])
+def test_skipped_locked_evaluations_preserve_native_multistep_trajectory(solver, steps, release):
+    """Answering locked steps from the planner equals evaluating and discarding.
+
+    The solver runs every step either way, so its multistep history across the
+    lock release is identical; only the discarded target evaluations vanish.
+    """
+    sigmas = _flow_sigmas(steps)
+    low_shape, high_shape = (1, 16, 8, 10), (1, 16, 14, 18)
+    _, anchors, _ = _planner(low_shape, sigmas)
+    planner_sigmas = [float(s) for s in sigmas[:-1]]
+    locked = core.full_lock_prefix_length([float(s) for s in sigmas], release)
+
+    def target_model(x, sigma):
+        return torch.roll(x, shifts=2, dims=-1) * 0.4 + torch.sin(x) * float(sigma)
+
+    noise = torch.randn(high_shape, generator=torch.Generator().manual_seed(11), dtype=torch.float64)
+    reference = _locked_guider(target_model, anchors, planner_sigmas, noise, release)
+    fast = _locked_guider(target_model, anchors, planner_sigmas, noise, release, skip_locked_model_calls=True)
+    expected = solver(noise.clone(), sigmas, reference.predict_noise)
+    actual = solver(noise.clone(), sigmas, fast.predict_noise)
+    assert torch.equal(actual, expected)
+    assert reference.calls == steps
+    assert fast.calls == steps - locked
+
+
+def test_skipped_locked_evaluation_still_runs_model_for_masked_lock():
+    sigmas = _flow_sigmas(4)
+    shape = (1, 16, 8, 10)
+    _, anchors, _ = _planner(shape, sigmas)
+    planner_sigmas = [float(s) for s in sigmas[:-1]]
+    mask = torch.zeros((1, 1, 8, 10), dtype=torch.float64)
+    mask[..., :, :5] = 1.0
+    x = torch.zeros(shape, dtype=torch.float64)
+
+    def model(x, sigma):
+        return torch.full_like(x, 3.0)
+
+    masked = _locked_guider(model, anchors, planner_sigmas, x, 0.5, spatial_mask=mask, skip_locked_model_calls=True)
+    out = masked.predict_noise(x, sigmas[0])
+    assert masked.calls == 1
+    assert torch.allclose(out[..., 5:], torch.full_like(out[..., 5:], 3.0), atol=1e-12, rtol=0.0)
+
+    unmasked = _locked_guider(model, anchors, planner_sigmas, x, 0.5, skip_locked_model_calls=True)
+    out = unmasked.predict_noise(x, sigmas[0])
+    assert unmasked.calls == 0
+    assert torch.equal(out, anchors[0]) and out.data_ptr() != anchors[0].data_ptr()
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.1])
