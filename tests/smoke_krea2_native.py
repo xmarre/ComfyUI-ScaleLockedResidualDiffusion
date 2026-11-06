@@ -159,7 +159,7 @@ def main():
     # guider/sampler execution. Every solver skips the target model on fully
     # locked steps: Euler through the closed-form handoff, the others by
     # integrating the locked prefix natively with the planner predictions.
-    spectrum_forecast = {"euler", "dpmpp_2m"}
+    spectrum_forecast = {"euler", "dpmpp_2m", "res_multistep", "gradient_estimation"}
     solver_cases = [
         ("euler", "normal", 1.0),
         ("euler", "sgm_uniform", 2.0),
@@ -235,6 +235,33 @@ def main():
                 "case": label + "_controls", "sampler": sampler_name,
                 "scheduler": scheduler, "cfg": cfg, "locked_target_steps": locked,
                 "model_calls": {f"{h}x{w}": n for (h, w), n in counts.items()}, "reports": reports,
+            }))
+
+    # The user's 20-step, 0.72-lock case has 12 fully locked and 8
+    # unlocked target steps. RES and gradient estimation are both now
+    # forecast-enabled, independently of the lock's zero-DiT shortcut.
+    if reports_context is not None:
+        from comfyui_spectrum_krea2.nodes import SpectrumApplyKrea2
+        aligned = SpectrumApplyKrea2().apply(
+            model, preset="turbo", warmup=2, tail=1, bootstrap=False,
+            extrapolation_guard_enabled=False,
+        )[0]
+        for sampler_name in ("res_multistep", "gradient_estimation"):
+            outputs, reports, _ = controls(
+                aligned, sampler_name, "simple", 1.0, 20, False,
+                max_stage_upscale=0.0, composition_lock_sigma=0.72,
+            )
+            assert len(reports) == 2, (sampler_name, reports)
+            assert reports[0]["actual"] == 11 and reports[0]["forecast"] == 9, reports
+            assert reports[1]["outer_steps"] == 20, reports
+            assert reports[1]["denoiser_calls"] == 8, reports
+            assert reports[1]["actual"] == 5 and reports[1]["forecast"] == 3, reports
+            assert all(r["fallback"] is None for r in reports), reports
+            print(json.dumps({
+                "case": "spectrum_20_step_lock",
+                "sampler": sampler_name,
+                "locked_target_steps": 12,
+                "reports": reports,
             }))
 
     # Resolution ladders with every solver: planner 12x14 -> stage 16x20 ->
