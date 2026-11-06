@@ -37,6 +37,14 @@ def main():
         for param in base.diffusion_model.parameters():
             param.copy_(torch.randn_like(param) * .02)
     model = comfy.model_patcher.ModelPatcher(base, torch.device("cpu"), torch.device("cpu"))
+    # The separate resolution-selector tests cover the full UI integration.
+    # Loading ComfyUI's top-level nodes.py here would pull in unrelated
+    # optional video/frontend dependencies. Only its canvas cap is needed
+    # by the scale-locked package's resolution selector during import.
+    import types
+    core_nodes = types.ModuleType("nodes")
+    core_nodes.MAX_RESOLUTION = 16384
+    sys.modules.setdefault("nodes", core_nodes)
     spec = importlib.util.spec_from_file_location("slrd_native_smoke", root / "__init__.py", submodule_search_locations=[str(root)])
     package = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = package
@@ -140,6 +148,76 @@ def main():
             assert not base.diffusion_model._forward_pre_hooks
             print(json.dumps({"case": label + "_ladder", "options": stage_options, "steps_per_pass": steps,
                               "stage_steps": free, "output_shapes": shapes, "reports": reports}))
+
+
+    # The compact Krea sampler's new controls must reach genuine ComfyUI
+    # guider/sampler execution. In the non-Euler path the full locked target
+    # prefix is evaluated, because the Euler closed-form skip does not preserve
+    # DPM++ 2M multistep state.
+    for label, selected in cases:
+        for sampler_name, scheduler, cfg in (
+            ("euler", "normal", 1.0),
+            ("euler", "sgm_uniform", 2.0),
+            ("dpmpp_2m", "simple", 1.0),
+            ("dpmpp_2m", "normal", 2.0),
+        ):
+            steps = 8
+            reports = []
+            token = reports_context.set(reports) if reports_context is not None else None
+            calls.clear()
+            count_calls = label == "native" and cfg == 1.0
+            hook = base.diffusion_model.register_forward_pre_hook(
+                lambda module, args: calls.append(tuple(args[0].shape[-2:]))
+            ) if count_calls else None
+            try:
+                with torch.inference_mode():
+                    result = node.sample(
+                        selected, positive, negative,
+                        {"samples": torch.zeros(1, 4, 16, 20)},
+                        42, .01, 0.0, 0.0,
+                        steps=steps, cfg=cfg, sampler_name=sampler_name,
+                        scheduler=scheduler, max_stage_upscale=0.0,
+                    )
+            finally:
+                if hook is not None:
+                    hook.remove()
+                if reports_context is not None:
+                    reports_context.reset(token)
+            assert all(torch.isfinite(x["samples"]).all() for x in result)
+            assert result[0]["samples"].shape == (1, 16, 1, 16, 20)
+            if count_calls:
+                schedule = runtime.calculate_sigmas(
+                    selected, scheduler=scheduler, steps=steps, denoise=1.0)
+                locked = runtime.full_lock_prefix_length(schedule.tolist(), 0.8)
+                expected_calls = steps - locked if sampler_name == "euler" else steps
+                actual_calls = calls.count((16, 20))
+                assert actual_calls == expected_calls, (
+                    sampler_name, scheduler, expected_calls, actual_calls)
+            if label == "spectrum":
+                assert len(reports) == 2, reports
+                assert reports[0]["outer_steps"] == steps
+                expected_target = steps - runtime.full_lock_prefix_length(
+                    runtime.calculate_sigmas(selected, scheduler=scheduler,
+                                             steps=steps, denoise=1.0).tolist(), 0.8,
+                ) if sampler_name == "euler" else steps
+                assert reports[1]["outer_steps"] == expected_target, reports
+                assert all(report["fallback"] is None for report in reports), reports
+            print(json.dumps({
+                "case": label + "_controls", "sampler": sampler_name,
+                "scheduler": scheduler, "cfg": cfg, "reports": reports,
+            }))
+
+    # Reject unsupported solver/stage combinations before launching the
+    # expensive low-resolution planner, rather than failing mid-generation.
+    try:
+        node.sample(model, positive, negative, {"samples": torch.zeros(1, 4, 24, 28)},
+                    42, .01, 0.0, 0.0, steps=8, sampler_name="dpmpp_2m",
+                    stage_megapixels="0.02")
+    except ValueError as exc:
+        assert "resolution ladders require Euler" in str(exc), exc
+    else:
+        raise AssertionError("DPM++ 2M must reject multi-stage regeneration")
+
 
     try:
         node.sample(model, positive, negative, {"samples": torch.zeros(1, 4, 24, 28)},

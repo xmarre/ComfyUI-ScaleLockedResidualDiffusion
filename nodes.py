@@ -250,6 +250,12 @@ class Krea2TurboFlowAlignedRegenerate:
                 "stage_megapixels": ("STRING", {"default": "", "multiline": False,
                     "tooltip": "Optional explicit intermediate stage sizes in megapixels, ascending and between the "
                                "planner and the output, e.g. '4, 8'. Empty uses max_stage_upscale."}),
+                "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01,
+                    "tooltip": "ComfyUI CFG. Krea 2 Turbo normally uses 1.0 (no classifier-free guidance). Higher values alter conditioning and require visual validation."}),
+                "sampler_name": (["euler", "dpmpp_2m"], {"default": "euler",
+                    "tooltip": "Euler preserves the exact fast flow-matching composition-lock handoff and supports resolution ladders. DPM++ 2M is experimental: single-stage only, evaluates all high-resolution steps and cannot use Euler's closed-form skip."}),
+                "scheduler": (compat_scheduler_names(), {"default": "simple",
+                    "tooltip": "ComfyUI sigma schedule applied consistently to planner and target. Changes locked-step count and denoising trajectory. Experimental alternatives need visual validation."}),
             },
         }
 
@@ -267,7 +273,16 @@ class Krea2TurboFlowAlignedRegenerate:
         composition_lock_sigma=0.80,
         max_stage_upscale=4.0,
         stage_megapixels="",
+        cfg=1.0,
+        sampler_name="euler",
+        scheduler="simple",
     ):
+        if not isinstance(cfg, (int, float)) or not math.isfinite(cfg) or not 0.0 <= cfg <= 100.0:
+            raise ValueError("Krea 2 CFG must be finite and within [0, 100]")
+        if sampler_name not in ("euler", "dpmpp_2m"):
+            raise ValueError("Krea 2 supports Euler or DPM++ 2M; other solvers have not been validated for the composition lock")
+        if scheduler not in compat_scheduler_names():
+            raise ValueError(f"Unsupported Krea 2 scheduler: {scheduler!r}")
         composition_lock_sigma = float(composition_lock_sigma)
         if not math.isfinite(composition_lock_sigma) or not 0.0 <= composition_lock_sigma <= 1.0:
             raise ValueError("composition_lock_sigma must be within [0, 1]")
@@ -310,9 +325,17 @@ class Krea2TurboFlowAlignedRegenerate:
             if explicit_stages:
                 raise ValueError("stage_megapixels must stay below the output LATENT size")
             stage_hw.pop()
+        # An Euler flow lock can be transferred in closed form without running
+        # the target DiT. DPM++ 2M has solver history across its steps, so
+        # a truncated high-resolution stage cannot reproduce that trajectory.
+        if stage_hw and sampler_name != "euler":
+            raise ValueError("Krea 2 resolution ladders require Euler; DPM++ 2M is supported only for single-stage target regeneration")
+        schedule = [float(v) for v in calculate_sigmas(model, scheduler=scheduler, steps=steps, denoise=1.0).tolist()]
+        if (len(schedule) != steps + 1 or any(not math.isfinite(v) or not 0.0 <= v <= 1.0 for v in schedule)
+                or any(a <= b for a, b in zip(schedule, schedule[1:])) or schedule[-1] != 0.0):
+            raise ValueError("Krea 2 requires a strictly decreasing flow sigma schedule in [0, 1] ending at zero")
         if stage_hw:
             # Fail before the planner pass when no step remains after the lock.
-            schedule = [float(v) for v in calculate_sigmas(model, scheduler="simple", steps=steps, denoise=1.0).tolist()]
             if full_lock_prefix_length(schedule, composition_lock_sigma) >= len(schedule) - 1:
                 raise ValueError("resolution stages need at least one step after the composition lock; raise steps or composition_lock_sigma")
             logger.info(
@@ -355,9 +378,9 @@ class Krea2TurboFlowAlignedRegenerate:
             latent_image=prepared_latent,
             seed=seed,
             steps=steps,
-            cfg=1.0,
-            sampler_name="euler",
-            scheduler="simple",
+            cfg=cfg,
+            sampler_name=sampler_name,
+            scheduler=scheduler,
             denoise=1.0,
             target_megapixels=planner_megapixels,
             nested_noise_strength=1.0,
