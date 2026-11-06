@@ -77,12 +77,12 @@ class _Guider:
 
 
 def _locked_guider(model_prediction, anchors, planner_sigmas, highres, full_lock_sigma, spatial_mask=None,
-                   skip_locked_model_calls=False):
+                   skip_locked_model_calls=False, noise_mask=None):
     guider = _Guider(model_prediction)
     config = _config(full_lock_sigma)
     config.spatial_mask = spatial_mask
     context = runtime.ScaleLockedRuntimeContext(
-        model=None, highres_latent={"samples": highres}, lowres_latent=None,
+        model=None, highres_latent={"samples": highres, **({"noise_mask": noise_mask} if noise_mask is not None else {})}, lowres_latent=None,
         lowres_out=None, sigmas=None, anchors_x0=anchors,
         planner_sigmas=planner_sigmas, highres_noise=None, noise_seed=0,
     )
@@ -332,6 +332,32 @@ def test_skipped_locked_evaluation_still_runs_model_for_masked_lock():
     out = unmasked.predict_noise(x, sigmas[0])
     assert unmasked.calls == 0
     assert torch.equal(out, anchors[0]) and out.data_ptr() != anchors[0].data_ptr()
+
+
+def test_sampler_noise_mask_prevents_locked_model_call_shortcut():
+    """A latent noise_mask must use the evaluated path, independent of the
+    scale-lock's separate spatial_mask, as promised by the node interface."""
+    sigmas = _flow_sigmas(4)
+    shape = (1, 16, 8, 10)
+    _, anchors, _ = _planner(shape, sigmas)
+    planner_sigmas = [float(s) for s in sigmas[:-1]]
+    latent = torch.zeros(shape, dtype=torch.float64)
+    denoise_mask = torch.ones((1, 1, 8, 10), dtype=torch.float64)
+    model = lambda x, sigma: torch.full_like(x, 3.0)
+
+    masked = _locked_guider(
+        model, anchors, planner_sigmas, latent, 0.5,
+        skip_locked_model_calls=True, noise_mask=denoise_mask)
+    result = masked.predict_noise(latent, sigmas[0])
+    assert masked.calls == 1
+    assert torch.equal(result, anchors[0])  # The full lock still wins.
+    assert result.data_ptr() != anchors[0].data_ptr()
+
+    plain = _locked_guider(
+        model, anchors, planner_sigmas, latent, 0.5,
+        skip_locked_model_calls=True)
+    assert torch.equal(plain.predict_noise(latent, sigmas[0]), anchors[0])
+    assert plain.calls == 0
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.1])

@@ -92,8 +92,9 @@ runtime and does not load weights independently.
   target state at the release is computed in closed form from the planner
   predictions and the sampler starts there; other solvers step through the
   locked steps natively with the planner predictions. With a target spatial mask or latent noise mask,
-  locked steps are evaluated instead, because the mask blends in the
-  target prediction.
+  locked steps use the evaluated path rather than the no-DiT shortcut.
+  Spatial masks blend in target predictions; latent noise masks require
+  retaining the sampler's masked execution behavior.
 - **Resolution stages.** Large jumps from the planner to the output are split
   into a ladder of intermediate resolutions, so no single handoff upscales by
   more than `max_stage_upscale`. The first stage reaches the

@@ -489,7 +489,13 @@ def apply_scale_lock_to_guider(
 
     original_predict_noise = getattr(guider, "_slrd_original_predict_noise", guider.predict_noise)
     guider._slrd_original_predict_noise = original_predict_noise
-    guider._slrd_skip_locked_model_calls = bool(skip_locked_model_calls)
+    # A sampler-side latent noise mask is distinct from the scale-lock's
+    # spatial mask. Preserve the evaluated path for masked sampling even
+    # when the full lock would otherwise discard the target prediction.
+    guider._slrd_skip_locked_model_calls = (
+        bool(skip_locked_model_calls)
+        and not isinstance(runtime.highres_latent.get("noise_mask"), torch.Tensor)
+    )
 
     def _wrapped_predict_noise(self, x, timestep, model_options=None, seed=None):
         if model_options is None:
