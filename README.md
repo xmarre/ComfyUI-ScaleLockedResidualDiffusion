@@ -70,11 +70,13 @@ runtime and does not load weights independently.
     trajectories from Euler and need visual validation with matched seeds.
     CFG++, ancestral/SDE and multi-evaluation solvers (e.g. Heun) are not
     offered.
-  - With Spectrum Krea 2 acceleration, Euler, DPM++ 2M, RES Multistep
-    and Gradient Estimation are forecast-enabled on their source-audited
-    default native paths; DEIS and iPNDM variants still use native unlocked
-    evaluations. Forecasting may change image quality, especially anatomy,
-    and must be visually tested with the same seed and conditioning. Spectrum's forecast
+  - With Spectrum Krea 2 acceleration, all seven sampler choices (Euler,
+    DPM++ 2M, RES Multistep, Gradient Estimation, DEIS, iPNDM and iPNDM-V)
+    are forecast-enabled on their source-audited default native paths.
+    DEIS coefficient helpers are separately checked. Unsupported solver
+    options and altered native sources fail closed. Forecasting may change
+    image quality, especially anatomy, and must be visually tested with
+    the same seed and conditioning. Spectrum's forecast
     history is built only from unlocked target evaluations, as with Euler.
 - High-resolution noise is drawn from an exact *Gaussian conditional coupling*:
   within every 2x2 transformer-patch phase the normalized grouped projection

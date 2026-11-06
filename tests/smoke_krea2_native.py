@@ -159,7 +159,8 @@ def main():
     # guider/sampler execution. Every solver skips the target model on fully
     # locked steps: Euler through the closed-form handoff, the others by
     # integrating the locked prefix natively with the planner predictions.
-    spectrum_forecast = {"euler", "dpmpp_2m", "res_multistep", "gradient_estimation"}
+    spectrum_forecast = {"euler", "dpmpp_2m", "res_multistep", "gradient_estimation",
+                         "deis", "ipndm", "ipndm_v"}
     solver_cases = [
         ("euler", "normal", 1.0),
         ("euler", "sgm_uniform", 2.0),
@@ -237,16 +238,17 @@ def main():
                 "model_calls": {f"{h}x{w}": n for (h, w), n in counts.items()}, "reports": reports,
             }))
 
-    # The user's 20-step, 0.72-lock case has 12 fully locked and 8
-    # unlocked target steps. RES and gradient estimation are both now
-    # forecast-enabled, independently of the lock's zero-DiT shortcut.
+    # The 20-step/0.72-lock case has 12 fully locked and 8 unlocked
+    # target steps. All seven native solvers are now forecast-enabled,
+    # independently of the lock's zero-DiT shortcut.
     if reports_context is not None:
         from comfyui_spectrum_krea2.nodes import SpectrumApplyKrea2
         aligned = SpectrumApplyKrea2().apply(
             model, preset="turbo", warmup=2, tail=1, bootstrap=False,
             extrapolation_guard_enabled=False,
         )[0]
-        for sampler_name in ("res_multistep", "gradient_estimation"):
+        for sampler_name in ("res_multistep", "gradient_estimation",
+                             "deis", "ipndm", "ipndm_v"):
             outputs, reports, _ = controls(
                 aligned, sampler_name, "simple", 1.0, 20, False,
                 max_stage_upscale=0.0, composition_lock_sigma=0.72,
