@@ -68,8 +68,12 @@ def main():
         reports = []
         token = reports_context.set(reports) if reports_context is not None else None
         original = runtime._full_lock_handoff
+        original_locked = runtime.locked_planner_prediction
         if not analytic:
+            # Reference: step through the lock with Euler, evaluating the target
+            # model on locked steps and discarding its prediction.
             runtime._full_lock_handoff = lambda *args, **kwargs: None
+            runtime.locked_planner_prediction = lambda *args, **kwargs: None
         calls.clear()
         # Spectrum declines hooked models, so only count calls without it.
         hook = (base.diffusion_model.register_forward_pre_hook(
@@ -83,6 +87,7 @@ def main():
             if hook is not None:
                 hook.remove()
             runtime._full_lock_handoff = original
+            runtime.locked_planner_prediction = original_locked
             if reports_context is not None:
                 reports_context.reset(token)
         target_calls = sum(shape == (16, 20) for shape in calls)
@@ -150,74 +155,110 @@ def main():
                               "stage_steps": free, "output_shapes": shapes, "reports": reports}))
 
 
-    # The compact Krea sampler's new controls must reach genuine ComfyUI
-    # guider/sampler execution. In the non-Euler path the full locked target
-    # prefix is evaluated, because the Euler closed-form skip does not preserve
-    # DPM++ 2M multistep state.
+    # The compact Krea sampler's controls must reach genuine ComfyUI
+    # guider/sampler execution. Every solver skips the target model on fully
+    # locked steps: Euler through the closed-form handoff, the others by
+    # integrating the locked prefix natively with the planner predictions.
+    spectrum_forecast = {"euler", "dpmpp_2m"}
+    solver_cases = [
+        ("euler", "normal", 1.0),
+        ("euler", "sgm_uniform", 2.0),
+        ("dpmpp_2m", "simple", 1.0),
+        ("dpmpp_2m", "normal", 2.0),
+    ] + [(name, "simple", 1.0) for name in runtime.krea2_sampler_names()
+         if name not in ("euler", "dpmpp_2m")]
+    assert set(runtime.krea2_sampler_names()) == set(runtime.KREA2_SAMPLERS), runtime.krea2_sampler_names()
+
+    def controls(selected, sampler_name, scheduler, cfg, steps, count_calls, evaluate_locked=False, **extra):
+        reports = []
+        token = reports_context.set(reports) if reports_context is not None else None
+        calls.clear()
+        original = runtime.locked_planner_prediction
+        if evaluate_locked:
+            # Reference: evaluate the target model on locked steps and discard it.
+            runtime.locked_planner_prediction = lambda *args, **kwargs: None
+        hook = base.diffusion_model.register_forward_pre_hook(
+            lambda module, args: calls.append(tuple(args[0].shape[-2:]))
+        ) if count_calls else None
+        try:
+            with torch.inference_mode():
+                latent = extra.pop("latent", torch.zeros(1, 4, 16, 20))
+                result = node.sample(
+                    selected, positive, negative, {"samples": latent},
+                    42, .01, 0.0, 0.0,
+                    steps=steps, cfg=cfg, sampler_name=sampler_name,
+                    scheduler=scheduler, **extra,
+                )
+        finally:
+            runtime.locked_planner_prediction = original
+            if hook is not None:
+                hook.remove()
+            if reports_context is not None:
+                reports_context.reset(token)
+        assert all(torch.isfinite(x["samples"]).all() for x in result), sampler_name
+        return result, reports, {shape: calls.count(shape) for shape in set(calls)}
+
     for label, selected in cases:
-        for sampler_name, scheduler, cfg in (
-            ("euler", "normal", 1.0),
-            ("euler", "sgm_uniform", 2.0),
-            ("dpmpp_2m", "simple", 1.0),
-            ("dpmpp_2m", "normal", 2.0),
-        ):
+        for sampler_name, scheduler, cfg in solver_cases:
             steps = 8
-            reports = []
-            token = reports_context.set(reports) if reports_context is not None else None
-            calls.clear()
-            count_calls = label == "native" and cfg == 1.0
-            hook = base.diffusion_model.register_forward_pre_hook(
-                lambda module, args: calls.append(tuple(args[0].shape[-2:]))
-            ) if count_calls else None
-            try:
-                with torch.inference_mode():
-                    result = node.sample(
-                        selected, positive, negative,
-                        {"samples": torch.zeros(1, 4, 16, 20)},
-                        42, .01, 0.0, 0.0,
-                        steps=steps, cfg=cfg, sampler_name=sampler_name,
-                        scheduler=scheduler, max_stage_upscale=0.0,
-                    )
-            finally:
-                if hook is not None:
-                    hook.remove()
-                if reports_context is not None:
-                    reports_context.reset(token)
-            assert all(torch.isfinite(x["samples"]).all() for x in result)
+            locked = runtime.full_lock_prefix_length(
+                runtime.calculate_sigmas(selected, scheduler=scheduler, steps=steps, denoise=1.0).tolist(), 0.8)
+            assert 0 < locked < steps, (scheduler, locked)
+            count_calls = label == "native"
+            result, reports, counts = controls(selected, sampler_name, scheduler, cfg, steps, count_calls,
+                                               max_stage_upscale=0.0)
             assert result[0]["samples"].shape == (1, 16, 1, 16, 20)
             if count_calls:
-                schedule = runtime.calculate_sigmas(
-                    selected, scheduler=scheduler, steps=steps, denoise=1.0)
-                locked = runtime.full_lock_prefix_length(schedule.tolist(), 0.8)
-                expected_calls = steps - locked if sampler_name == "euler" else steps
-                actual_calls = calls.count((16, 20))
-                assert actual_calls == expected_calls, (
-                    sampler_name, scheduler, expected_calls, actual_calls)
+                planner_hw = tuple(result[1]["samples"].shape[-2:])
+                assert counts == {planner_hw: steps, (16, 20): steps - locked}, (sampler_name, scheduler, counts)
+                if sampler_name != "euler":
+                    reference, _, reference_counts = controls(
+                        selected, sampler_name, scheduler, cfg, steps, True,
+                        evaluate_locked=True, max_stage_upscale=0.0)
+                    assert reference_counts[(16, 20)] == steps, reference_counts
+                    for fast, slow in zip(result, reference):
+                        # Locked steps discard the target prediction, so skipping
+                        # it must not change any output.
+                        assert torch.equal(fast["samples"], slow["samples"]), sampler_name
             if label == "spectrum":
                 assert len(reports) == 2, reports
                 assert reports[0]["outer_steps"] == steps
-                expected_target = steps - runtime.full_lock_prefix_length(
-                    runtime.calculate_sigmas(selected, scheduler=scheduler,
-                                             steps=steps, denoise=1.0).tolist(), 0.8,
-                ) if sampler_name == "euler" else steps
-                assert reports[1]["outer_steps"] == expected_target, reports
-                assert all(report["fallback"] is None for report in reports), reports
+                expected_outer = steps - locked if sampler_name == "euler" else steps
+                assert reports[1]["outer_steps"] == expected_outer, reports
+                if sampler_name in spectrum_forecast:
+                    assert all(report["fallback"] is None for report in reports), reports
+                    # Skipped locked steps never reach the diffusion model.
+                    assert reports[1]["denoiser_calls"] == steps - locked, reports
+                else:
+                    assert all(report["fallback"] for report in reports), reports
             print(json.dumps({
                 "case": label + "_controls", "sampler": sampler_name,
-                "scheduler": scheduler, "cfg": cfg, "reports": reports,
+                "scheduler": scheduler, "cfg": cfg, "locked_target_steps": locked,
+                "model_calls": {f"{h}x{w}": n for (h, w), n in counts.items()}, "reports": reports,
             }))
 
-    # Reject unsupported solver/stage combinations before launching the
-    # expensive low-resolution planner, rather than failing mid-generation.
-    try:
-        node.sample(model, positive, negative, {"samples": torch.zeros(1, 4, 24, 28)},
-                    42, .01, 0.0, 0.0, steps=8, sampler_name="dpmpp_2m",
-                    stage_megapixels="0.02")
-    except ValueError as exc:
-        assert "resolution ladders require Euler" in str(exc), exc
-    else:
-        raise AssertionError("DPM++ 2M must reject multi-stage regeneration")
-
+    # Resolution ladders with every solver: planner 12x14 -> stage 16x20 ->
+    # output 24x28. Locked steps cost no model calls in the first stage, and
+    # each later stage restarts the solver at the composition-lock release.
+    for label, selected in cases:
+        for sampler_name in runtime.krea2_sampler_names():
+            steps = 8
+            free = steps - locked_by_steps[steps]
+            result, reports, counts = controls(
+                selected, sampler_name, "simple", 1.0, steps, label == "native",
+                latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02")
+            assert [list(x["samples"].shape) for x in result] == [
+                [1, 16, 1, 24, 28], [1, 16, 1, 12, 14], [1, 16, 1, 24, 28]]
+            if label == "native":
+                assert counts == {(12, 14): steps, (16, 20): free, (24, 28): free}, (sampler_name, counts)
+            else:
+                first = free if sampler_name == "euler" else steps
+                assert [r["outer_steps"] for r in reports] == [steps, first, free], reports
+                if sampler_name in spectrum_forecast:
+                    assert all(r["fallback"] is None for r in reports), reports
+            print(json.dumps({"case": label + "_ladder_solver", "sampler": sampler_name,
+                              "model_calls": {f"{h}x{w}": n for (h, w), n in counts.items()},
+                              "reports": reports}))
 
     try:
         node.sample(model, positive, negative, {"samples": torch.zeros(1, 4, 24, 28)},

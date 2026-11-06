@@ -46,16 +46,34 @@ runtime and does not load weights independently.
   sigma schedule is validated to be finite, strictly decreasing, within
   the flow domain [0, 1], and ending at zero. Non-default CFG or schedule
   changes the noise trajectory and therefore the composition-lock release.
-- **Sampler choice**: `euler` retains the exact fast flow-matching handoff
-  (locked high-resolution steps cost no DiT calls) and supports automatic
-  and explicit multi-resolution ladders. The alternative `dpmpp_2m`
-  is **single-stage only** and experimental: its multistep solver history
-  cannot be recreated by Euler's closed-form lock, so it runs the entire
-  high-resolution schedule, including locked steps, and is typically slower.
-  A non-Euler selection with intermediate stages fails before sampling;
-  select Euler or remove intermediate stages (`max_stage_upscale=0`
-  and empty `stage_megapixels`). Other samplers are not offered without
-  a validated compatible composition-lock handoff.
+- **Sampler choice**: `euler` (default), `dpmpp_2m`, `res_multistep`,
+  `deis`, `ipndm`, `ipndm_v` and `gradient_estimation`, limited to those the
+  installed ComfyUI provides. Each is a native ComfyUI solver that is
+  deterministic, evaluates the denoiser once per step and builds its
+  multistep history only from the predictions it receives. The selected
+  solver runs both the planner and the target passes.
+  - **Locked steps cost no target-resolution model evaluations with any
+    solver.** Euler reaches the composition-lock release in closed form.
+    The other solvers integrate the locked steps with their own native
+    update, receiving the resized planner prediction in place of a target
+    evaluation. The full lock discards the target prediction on those
+    steps, so the result is identical to evaluating it, and the solver's
+    history across the release is preserved. The progress bar therefore
+    still lists locked steps for non-Euler solvers; they complete without a
+    model call.
+  - **Resolution stages work with every solver.** The first stage reaches
+    the release as described above. Each later stage re-noises the
+    previous stage's image to the release noise level and starts the
+    solver afresh there, so multistep solvers begin that stage at first
+    order.
+  - Non-Euler solvers are experimental: they follow different denoising
+    trajectories from Euler and need visual validation with matched seeds.
+    CFG++, ancestral/SDE and multi-evaluation solvers (e.g. Heun) are not
+    offered.
+  - With Spectrum Krea 2 acceleration, only Euler and DPM++ 2M are
+    forecast-enabled by Spectrum; for the others Spectrum reports a native
+    fallback and every unlocked step is evaluated. Spectrum's forecast
+    history is built only from unlocked target evaluations, as with Euler.
 - High-resolution noise is drawn from an exact *Gaussian conditional coupling*:
   within every 2x2 transformer-patch phase the normalized grouped projection
   matches the source Gaussian field, including noninteger upscaling ratios.
@@ -70,14 +88,15 @@ runtime and does not load weights independently.
   keep more of the planner image and leave fewer steps for new detail; 1.0
   disables the full lock. With ComfyUI's Krea 2 schedule (Euler/simple,
   shift 1.15), the default locks four of eight steps (six of twelve).
-  Locked steps cost no high-resolution model evaluations: the target state at
-  the release is computed in closed form from the planner predictions, and
-  the sampler starts there. With a target spatial mask or latent noise mask,
+  Locked steps cost no high-resolution model evaluations: with Euler the
+  target state at the release is computed in closed form from the planner
+  predictions and the sampler starts there; other solvers step through the
+  locked steps natively with the planner predictions. With a target spatial mask or latent noise mask,
   locked steps are evaluated instead, because the mask blends in the
   target prediction.
 - **Resolution stages.** Large jumps from the planner to the output are split
   into a ladder of intermediate resolutions, so no single handoff upscales by
-  more than `max_stage_upscale`. The first stage starts at the
+  more than `max_stage_upscale`. The first stage reaches the
   composition-lock release from the planner predictions, exactly like a
   single-stage run. Each later stage takes the finished image of the stage
   below, resized to its own size, re-noises it to the same release noise
