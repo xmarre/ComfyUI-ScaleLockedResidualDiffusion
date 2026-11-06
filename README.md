@@ -38,9 +38,24 @@ runtime and does not load weights independently.
   completely, and the remaining ones add detail at the target resolution.
   The optional `steps` input controls both passes (default 8). Connect the same
   step count to a native sampler for matched target-pass comparisons.
-- The Krea 2 Turbo sampling profile is ComfyUI CFG **1.0** (no
-  classifier-free guidance), Euler, `simple` scheduler, shift **1.15**.
-  This is for **Turbo**, not the undistilled RAW checkpoint.
+- **CFG, sampler and scheduler are configurable** on the Krea 2 node.
+  The unchanged defaults are ComfyUI CFG **1.0** (no classifier-free
+  guidance), Euler, `simple` scheduler, shift **1.15**. These defaults are
+  for **Turbo**, not the undistilled RAW checkpoint. `cfg` accepts 0–100,
+  and `scheduler` exposes ComfyUI's available schedules; the generated
+  sigma schedule is validated to be finite, strictly decreasing, within
+  the flow domain [0, 1], and ending at zero. Non-default CFG or schedule
+  changes the noise trajectory and therefore the composition-lock release.
+- **Sampler choice**: `euler` retains the exact fast flow-matching handoff
+  (locked high-resolution steps cost no DiT calls) and supports automatic
+  and explicit multi-resolution ladders. The alternative `dpmpp_2m`
+  is **single-stage only** and experimental: its multistep solver history
+  cannot be recreated by Euler's closed-form lock, so it runs the entire
+  high-resolution schedule, including locked steps, and is typically slower.
+  A non-Euler selection with intermediate stages fails before sampling;
+  select Euler or remove intermediate stages (`max_stage_upscale=0`
+  and empty `stage_megapixels`). Other samplers are not offered without
+  a validated compatible composition-lock handoff.
 - High-resolution noise is drawn from an exact *Gaussian conditional coupling*:
   within every 2x2 transformer-patch phase the normalized grouped projection
   matches the source Gaussian field, including noninteger upscaling ratios.
@@ -107,8 +122,10 @@ limited to individual visual comparisons, not a systematic evaluation;
 there is no claimed quality or speed improvement. Against a native eight-step target-resolution run, the
 default replaces four target-resolution DiT evaluations with eight planner
 evaluations; it is intended to improve structural consistency, not
-throughput. For RAW, custom samplers and advanced research controls, use
-the generic Scale-Locked Residual KSampler instead.
+throughput. For RAW or arbitrary samplers not supported by the Krea-specific
+flow-aligned handoff, use the generic Scale-Locked Residual KSampler.
+That generic path has different noise-coupling and resolution-stage
+semantics; it is not interchangeable with the Krea-specific integration.
 
 ## Resolution Selector (Uncapped)
 
