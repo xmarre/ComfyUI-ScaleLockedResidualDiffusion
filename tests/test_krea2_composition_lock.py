@@ -394,3 +394,101 @@ def test_stage_megapixels_parsing():
         core.parse_stage_megapixels("4, big")
     with pytest.raises(ValueError, match="positive"):
         core.parse_stage_megapixels("4, -1")
+
+
+
+@pytest.mark.parametrize("mode, eta, expected_mode", [
+    ("ER-SDE", 1.0, "ER-SDE"),
+    ("Reverse-time SDE", 0.7, "Reverse-time SDE"),
+    ("ODE", 1.0, "ODE"),
+    ("ER-SDE", 0.0, "ODE"),
+])
+def test_er_sde_modes_match_comfyui_noise_scaling(mode, eta, expected_mode):
+    options = runtime.krea2_er_sde_options(mode, 3, eta, 1.0)
+    assert options["max_stage"] == 3
+    assert options["noise_scaler"].solver_type == expected_mode
+    if expected_mode == "ODE":
+        assert options["s_noise"] == 0.0
+    x = torch.tensor([0.1, 0.5, 0.9], dtype=torch.float64)
+    if expected_mode == "ODE":
+        expected = x
+    elif expected_mode == "Reverse-time SDE":
+        expected = x ** (eta + 1.0)
+    else:
+        expected = x * ((x ** 0.3).exp() + 10.0) ** eta
+    torch.testing.assert_close(options["noise_scaler"](x), expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("params", [
+    ("bad", 3, 1., 1.),
+    ("ER-SDE", True, 1., 1.),
+    ("ER-SDE", 0, 1., 1.),
+    ("ER-SDE", 4, 1., 1.),
+    ("ER-SDE", 3, float("nan"), 1.),
+    ("ER-SDE", 3, -1., 1.),
+    ("ER-SDE", 3, 1., float("inf")),
+    ("ER-SDE", 3, 1., -1.),
+])
+def test_er_sde_controls_fail_before_native_sampling(params):
+    with pytest.raises(ValueError, match="ER-SDE"):
+        runtime.krea2_er_sde_options(*params)
+
+
+def _assert_patch_phase_sum(coarse, fine):
+    """Independent phase groups obey the exact Gaussian refinement contract."""
+    for py in range(2):
+        for px in range(2):
+            parent = coarse[..., py::2, px::2].float()
+            child = fine[..., py::2, px::2].float()
+            sh, sw = parent.shape[-2:]
+            th, tw = child.shape[-2:]
+            ys = torch.arange(th) * sh // th
+            xs = torch.arange(tw) * sw // tw
+            for i in range(sh):
+                for j in range(sw):
+                    group = child[..., ys == i, :][..., xs == j]
+                    normalized = group.sum(dim=(-2, -1)) / math.sqrt(group.shape[-2] * group.shape[-1])
+                    torch.testing.assert_close(normalized, parent[..., i, j], atol=2e-5, rtol=2e-5)
+
+
+def test_er_sde_stochastic_increments_are_reproducible_and_nested_across_stages():
+    # No model or external ComfyUI code is involved; exercise the same callable
+    # that the production Krea 2 node injects into native sample_er_sde.
+    low = (1, 16, 1, 8, 10)
+    middle = (1, 16, 1, 12, 14)
+    high = (1, 16, 1, 16, 20)
+    sigmas = torch.tensor([.9999, .8, .5, .2, 0.])
+    def noise(stage, start=0, schedule=sigmas):
+        return runtime.Krea2PatchCoupledERSDENoise(
+            low, (middle, high), stage, 42, start, schedule,
+            torch.device("cpu"), torch.float32,
+        )
+    planner, intermediate, target = noise(-1), noise(0), noise(1)
+    base = planner(sigmas[0], sigmas[1])
+    coarse_stage = intermediate(sigmas[0], sigmas[1])
+    target_stage = target(sigmas[0], sigmas[1])
+    assert base.shape == low and coarse_stage.shape == middle and target_stage.shape == high
+    _assert_patch_phase_sum(base, coarse_stage)
+    _assert_patch_phase_sum(coarse_stage, target_stage)
+    assert torch.equal(base, noise(-1)(sigmas[0], sigmas[1]))
+    assert torch.equal(target_stage, noise(1)(sigmas[0], sigmas[1]))
+    second = target(sigmas[1], sigmas[2])
+    assert not torch.equal(target_stage, second)
+    with pytest.raises(RuntimeError, match="out of native sigma order"):
+        target(sigmas[0], sigmas[1])
+
+
+def test_er_sde_later_stage_restarts_from_release_step_noise():
+    shape = (1, 16, 1, 8, 10)
+    bigger = (1, 16, 1, 12, 14)
+    sigmas = torch.tensor([.9999, .8, .5, .2, 0.])
+    full = runtime.Krea2PatchCoupledERSDENoise(
+        shape, (bigger,), 0, 71, 0, sigmas, "cpu", torch.float32
+    )
+    full(sigmas[0], sigmas[1])
+    full(sigmas[1], sigmas[2])
+    expected = full(sigmas[2], sigmas[3])
+    restarted = runtime.Krea2PatchCoupledERSDENoise(
+        shape, (bigger,), 0, 71, 2, sigmas[2:], "cpu", torch.float32
+    )
+    assert torch.equal(expected, restarted(sigmas[2], sigmas[3]))

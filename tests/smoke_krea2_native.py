@@ -160,7 +160,7 @@ def main():
     # locked steps: Euler through the closed-form handoff, the others by
     # integrating the locked prefix natively with the planner predictions.
     spectrum_forecast = {"euler", "dpmpp_2m", "res_multistep", "gradient_estimation",
-                         "deis", "ipndm", "ipndm_v"}
+                         "deis", "ipndm", "ipndm_v", "er_sde"}
     solver_cases = [
         ("euler", "normal", 1.0),
         ("euler", "sgm_uniform", 2.0),
@@ -239,7 +239,7 @@ def main():
             }))
 
     # The 20-step/0.72-lock case has 12 fully locked and 8 unlocked
-    # target steps. All seven native solvers are now forecast-enabled,
+    # target steps. All offered native solvers are forecast-enabled,
     # independently of the lock's zero-DiT shortcut.
     if reports_context is not None:
         from comfyui_spectrum_krea2.nodes import SpectrumApplyKrea2
@@ -248,7 +248,7 @@ def main():
             extrapolation_guard_enabled=False,
         )[0]
         for sampler_name in ("res_multistep", "gradient_estimation",
-                             "deis", "ipndm", "ipndm_v"):
+                             "deis", "ipndm", "ipndm_v", "er_sde"):
             outputs, reports, _ = controls(
                 aligned, sampler_name, "simple", 1.0, 20, False,
                 max_stage_upscale=0.0, composition_lock_sigma=0.72,
@@ -288,6 +288,19 @@ def main():
             print(json.dumps({"case": label + "_ladder_solver", "sampler": sampler_name,
                               "model_calls": {f"{h}x{w}": n for (h, w), n in counts.items()},
                               "reports": reports}))
+
+
+    # Native ER-SDE's deterministic ODE mode and stochastic reverse-time mode
+    # use the same wrapper, stage planner and evaluation-skipping contract.
+    for er_mode, eta, noise in (("ODE", 1.0, 1.0), ("Reverse-time SDE", .5, .6)):
+        result, reports, counts = controls(
+            model, "er_sde", "simple", 1.0, 8, True,
+            max_stage_upscale=0.0,
+            er_sde_solver_type=er_mode, er_sde_eta=eta, er_sde_s_noise=noise,
+        )
+        assert counts[tuple(result[1]["samples"].shape[-2:])] == 8, counts
+        assert counts[(16, 20)] == 4, counts
+        assert all(torch.isfinite(part["samples"]).all() for part in result), er_mode
 
     try:
         node.sample(model, positive, negative, {"samples": torch.zeros(1, 4, 24, 28)},

@@ -16,7 +16,7 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SAMPLERS = ("euler", "dpmpp_2m", "res_multistep", "deis", "ipndm", "ipndm_v", "gradient_estimation")
+SAMPLERS = ("euler", "dpmpp_2m", "res_multistep", "deis", "ipndm", "ipndm_v", "gradient_estimation", "er_sde")
 
 
 def _node():
@@ -64,6 +64,10 @@ def _node():
         "plan_stage_megapixels": lambda *args: [],
         "full_lock_prefix_length": prefix,
         "calculate_sigmas": calculate_sigmas,
+        "effective_er_sde_sigmas": lambda sigmas, model: sigmas,
+        "krea2_er_sde_options": lambda mode, order, eta, noise: {
+            "solver_type": mode, "max_stage": order, "eta": eta, "s_noise": noise,
+        },
         "ScaleLockConfig": SimpleNamespace,
         "run_scale_locked_ksampler": run,
         "logger": SimpleNamespace(info=lambda *args: None, warning=lambda *args: None),
@@ -83,11 +87,16 @@ def test_existing_widget_slots_and_explicit_defaults():
     assert optional == [
         "steps", "composition_lock_sigma", "max_stage_upscale",
         "stage_megapixels", "cfg", "sampler_name", "scheduler",
+        "er_sde_solver_type", "er_sde_max_stage", "er_sde_eta", "er_sde_s_noise",
     ]
     assert schema["optional"]["cfg"][1]["default"] == 1.0
     assert schema["optional"]["sampler_name"][0] == list(SAMPLERS)
     assert schema["optional"]["sampler_name"][1]["default"] == "euler"
     assert schema["optional"]["scheduler"][1]["default"] == "simple"
+    assert schema["optional"]["er_sde_solver_type"][1]["default"] == "ER-SDE"
+    assert schema["optional"]["er_sde_max_stage"][1]["default"] == 3
+    assert schema["optional"]["er_sde_eta"][1]["default"] == 1.0
+    assert schema["optional"]["er_sde_s_noise"][1]["default"] == 1.0
     assert node.sample(*args) == ("target", "planner", "denoised")
     assert (calls[-1]["cfg"], calls[-1]["sampler_name"],
             calls[-1]["scheduler"]) == (1.0, "euler", "simple")
@@ -129,3 +138,17 @@ def test_invalid_selection_rejected_before_any_sampling(extra, message):
     with pytest.raises(ValueError, match=message):
         node.sample(*args, **extra)
     assert not calls
+
+
+def test_er_sde_options_are_routed_without_changing_other_solvers():
+    node, calls, args = _node()
+    node.sample(*args, sampler_name="er_sde", er_sde_solver_type="Reverse-time SDE",
+                er_sde_max_stage=2, er_sde_eta=.7, er_sde_s_noise=.8,
+                stage_megapixels="2")
+    assert calls[-1]["sampler_options"] == {
+        "solver_type": "Reverse-time SDE", "max_stage": 2,
+        "eta": .7, "s_noise": .8,
+    }
+    assert calls[-1]["stage_hw"]
+    node.sample(*args, sampler_name="euler")
+    assert calls[-1]["sampler_options"] is None

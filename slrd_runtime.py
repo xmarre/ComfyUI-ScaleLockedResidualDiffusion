@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import types
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -66,14 +67,12 @@ _CONSERVATIVE_SAFE_SAMPLERS = {
     "res_multistep",
 }
 
-# Native ComfyUI samplers offered by the Krea 2 node. Each is deterministic,
-# calls the denoiser exactly once per step through the guider, and derives
-# its solver history only from the denoised predictions it receives. A fully
-# locked step can therefore be answered with the planner prediction without
-# evaluating the target model, while the genuine solver still integrates every
-# step. CFG++ variants are excluded: they read the unconditional prediction
-# from a post-CFG hook that a skipped evaluation would not run. Euler
-# additionally uses the closed-form flow handoff.
+# Native ComfyUI samplers offered by the Krea 2 node. All make exactly one
+# denoiser evaluation per outer step, so native solver state survives the
+# planner-prediction substitution on fully locked steps. ER-SDE is stochastic:
+# its per-step noise is patch-coupled across planner and target canvases.
+# CFG++ variants require side-channel unconditional predictions and are excluded.
+# Euler alone permits the closed-form flow handoff.
 KREA2_SAMPLERS = (
     "euler",
     "dpmpp_2m",
@@ -82,6 +81,7 @@ KREA2_SAMPLERS = (
     "ipndm",
     "ipndm_v",
     "gradient_estimation",
+    "er_sde",
 )
 
 
@@ -89,6 +89,130 @@ def krea2_sampler_names() -> list[str]:
     """Krea 2 node solvers that the installed ComfyUI provides, Euler first."""
     available = set(compat_sampler_names())
     return [name for name in KREA2_SAMPLERS if name in available]
+
+
+_ER_SDE_TYPES = ("ER-SDE", "Reverse-time SDE", "ODE")
+_SEED_MASK = (1 << 64) - 1
+
+
+@dataclass(frozen=True)
+class Krea2ERSDENoiseScaler:
+    """Same three scaler families as ComfyUI's SamplerER_SDE node."""
+
+    solver_type: str
+    eta: float
+
+    def __call__(self, x):
+        if self.solver_type == "ODE" or self.eta == 0.0:
+            return x
+        if self.solver_type == "Reverse-time SDE":
+            return x ** (self.eta + 1.0)
+        return x * ((x ** 0.3).exp() + 10.0) ** self.eta
+
+
+def krea2_er_sde_options(solver_type="ER-SDE", max_stage=3, eta=1.0, s_noise=1.0) -> dict:
+    """Validate parameters before sampling; ODE/eta=0 disables stochasticity."""
+    if solver_type not in _ER_SDE_TYPES:
+        raise ValueError("ER-SDE solver type must be ER-SDE, Reverse-time SDE or ODE")
+    if isinstance(max_stage, bool) or not isinstance(max_stage, int) or not 1 <= max_stage <= 3:
+        raise ValueError("ER-SDE max_stage must be an integer in [1, 3]")
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) or
+           not math.isfinite(v) for v in (eta, s_noise)):
+        raise ValueError("ER-SDE eta and s_noise must be finite numbers")
+    if not (0.0 <= eta <= 10.0 and 0.0 <= s_noise <= 100.0):
+        raise ValueError("ER-SDE eta or s_noise is outside its ComfyUI input range")
+    if solver_type == "ODE" or eta == 0.0:
+        solver_type, s_noise = "ODE", 0.0
+    return {
+        "max_stage": max_stage,
+        "s_noise": float(s_noise),
+        "noise_scaler": Krea2ERSDENoiseScaler(solver_type, float(eta)),
+    }
+
+
+def effective_er_sde_sigmas(sigmas: torch.Tensor, model) -> torch.Tensor:
+    """Use the native flow log-SNR first-sigma correction for step bookkeeping."""
+    from comfy.k_diffusion.sampling import offset_first_sigma_for_snr
+    return offset_first_sigma_for_snr(sigmas, _model_sampling_obj(model))
+
+
+def _er_sde_seed(seed: int, step: int, level: int) -> int:
+    """Independent, reproducible Gaussian fields across steps and patch levels."""
+    x = (int(seed) ^ 0xD1B54A32D192ED03 ^
+         ((int(step) + 1) * 0x9E3779B97F4A7C15) ^
+         ((int(level) + 2) * 0x94D049BB133111EB)) & _SEED_MASK
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _SEED_MASK
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _SEED_MASK
+    return (x ^ (x >> 31)) & _SEED_MASK
+
+
+class Krea2PatchCoupledERSDENoise:
+    """One iid Gaussian increment per native ER-SDE noise step.
+
+    Every pass regenerates the same coarse increment from the absolute outer
+    step index. Target increments are lifted through the same patch-phase
+    hierarchy as the resolution stages, preserving a Gaussian marginal at
+    every scale and coupling their coarse stochastic layout. No state escapes
+    this sampler invocation.
+    """
+
+    def __init__(self, low_shape, stage_shapes, stage_index, seed, start_step, sigmas, device, dtype):
+        self.low_shape = tuple(low_shape)
+        self.stage_shapes = tuple(tuple(shape) for shape in stage_shapes)
+        self.stage_index = int(stage_index)
+        self.seed = int(seed)
+        self.start_step = int(start_step)
+        self.sigmas = tuple(float(s) for s in sigmas.detach().cpu().tolist())
+        self.device = torch.device(device)
+        self.dtype = dtype
+        self.cursor = 0
+        if not (-1 <= self.stage_index < len(self.stage_shapes)):
+            raise ValueError("ER-SDE noise stage index is invalid")
+
+    def __call__(self, sigma, sigma_next):
+        i = self.cursor
+        if i + 1 >= len(self.sigmas):
+            raise RuntimeError("ER-SDE requested extra stochastic noise outside its sigma schedule")
+        # The native solver offsets the first flow sigma to avoid infinite
+        # log-SNR. The expected schedule was corrected before constructing us.
+        if (not math.isclose(float(sigma), self.sigmas[i], rel_tol=1e-5, abs_tol=1e-6)
+                or not math.isclose(float(sigma_next), self.sigmas[i + 1],
+                                    rel_tol=1e-5, abs_tol=1e-6)):
+            raise RuntimeError("ER-SDE noise request is out of native sigma order")
+        self.cursor += 1
+        step = self.start_step + i
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(_er_sde_seed(self.seed, step, -1))
+        field = torch.randn(self.low_shape, generator=generator,
+                            device="cpu", dtype=torch.float32).to(self.device)
+        for level in range(self.stage_index + 1):
+            field = build_patch_coupled_noise(
+                field, self.stage_shapes[level], _er_sde_seed(self.seed, step, level)
+            )
+        return field.to(device=self.device, dtype=self.dtype)
+
+
+def _krea2_sampler_object(
+    sampler_name: str, sampler_options: Optional[dict], *,
+    model, low_shape: tuple, stage_shapes: tuple, stage_index: int,
+    seed: int, start_step: int, sigmas: torch.Tensor, noise_like: torch.Tensor,
+):
+    # The generic SLRD node preserves its caller-selected native sampler.
+    # Only the Krea 2 node passes validated options and enables patch coupling.
+    if sampler_name != "er_sde" or sampler_options is None:
+        return comfy.samplers.sampler_object(sampler_name)
+    options = dict(sampler_options)
+    if options.get("s_noise", 1.0) > 0.0:
+        options["noise_sampler"] = Krea2PatchCoupledERSDENoise(
+            low_shape=low_shape, stage_shapes=stage_shapes, stage_index=stage_index,
+            seed=seed, start_step=start_step,
+            sigmas=effective_er_sde_sigmas(sigmas, model),
+            device=_resolve_sampler_device(model, noise_like.device),
+            dtype=noise_like.dtype,
+        )
+    # Call ComfyUI's genuine native ER-SDE (including its multistep history).
+    return comfy.samplers.ksampler("er_sde", options)
+
 
 LOCK_SCHEDULE_OPTIONS = [
     "linear",
@@ -597,8 +721,9 @@ def _run_lowres_planner(
     seed: int,
     disable_noise: bool,
     pin_anchors: bool,
+    sampler_options: Optional[dict] = None,
 ) -> tuple[dict, list[torch.Tensor], list[float], torch.Tensor]:
-    sampler_obj = comfy.samplers.sampler_object(sampler_name)
+    sampler_obj = None
     guider = comfy.samplers.CFGGuider(model)
     guider.set_conds(positive, negative)
     guider.set_cfg(cfg)
@@ -629,6 +754,11 @@ def _run_lowres_planner(
     if isinstance(noise_mask, torch.Tensor):
         noise_mask = noise_mask.to(device=target_device, non_blocking=True)
     sigmas = sigmas.to(device=target_device, non_blocking=True)
+    sampler_obj = _krea2_sampler_object(
+        sampler_name, sampler_options, model=model, low_shape=tuple(planner_noise.shape),
+        stage_shapes=(), stage_index=-1, seed=seed, start_step=0,
+        sigmas=sigmas, noise_like=planner_noise,
+    )
     recorder = TrajectoryRecorder(
         store_dtype=_store_dtype_for(latent_samples),
         capture_noisy_xt=False,
@@ -651,7 +781,8 @@ def _run_lowres_planner(
     out.pop("downscale_ratio_spacial", None)
     out["samples"] = samples
 
-    planner_sigmas = _planner_sigmas_for_recorded_steps(sigmas, len(recorder.x0_steps))
+    recorded_sigmas = effective_er_sde_sigmas(sigmas, model) if sampler_name == "er_sde" else sigmas
+    planner_sigmas = _planner_sigmas_for_recorded_steps(recorded_sigmas, len(recorder.x0_steps))
     recorder.step_sigmas = planner_sigmas
     return out, recorder.x0_steps, planner_sigmas, planner_noise
 
@@ -897,10 +1028,12 @@ def _run_resolution_ladder(
     planner_sigmas: list,
     lowres_noise: torch.Tensor,
     detail_seed: int,
+    stochastic_seed: int,
     nested_noise_strength: float,
     noise_mode: str,
     config: ScaleLockConfig,
     stage_hw: tuple,
+    sampler_options: Optional[dict] = None,
 ) -> ScaleLockedSampleResult:
     """Refine through increasing resolutions, each stage finishing its image.
 
@@ -929,7 +1062,8 @@ def _run_resolution_ladder(
         raise ValueError("resolution stages do not support latent noise masks, spatial lock masks or manifold correction")
 
     target = highres_latent["samples"]
-    sigma_values = [float(v) for v in sigmas.detach().cpu().tolist()]
+    effective_sigmas = effective_er_sde_sigmas(sigmas, model) if sampler_name == "er_sde" else sigmas
+    sigma_values = [float(v) for v in effective_sigmas.detach().cpu().tolist()]
     total_steps = len(sigma_values) - 1
     release = full_lock_prefix_length(sigma_values, config.full_lock_sigma)
     if release >= total_steps:
@@ -942,7 +1076,8 @@ def _run_resolution_ladder(
         previous = hw
 
     stage_noise = lowres_noise
-    sampler = comfy.samplers.sampler_object(sampler_name)
+    shapes = tuple(tuple(lowres_noise.shape[:-2]) + tuple(hw) for hw in sizes)
+    sampler = comfy.samplers.sampler_object(sampler_name) if sampler_name != "er_sde" else None
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
     x0_output: dict = {}
     finished = None
@@ -985,6 +1120,14 @@ def _run_resolution_ladder(
             start_latent = resize_4d_tensor(
                 finished.to(device=stage_samples.device, dtype=torch.float32), hw
             ).to(dtype=stage_samples.dtype)
+
+        if sampler_name == "er_sde":
+            sampler = _krea2_sampler_object(
+                sampler_name, sampler_options, model=model, low_shape=tuple(lowres_noise.shape),
+                stage_shapes=shapes, stage_index=index, seed=stochastic_seed,
+                start_step=0 if finished is None else release,
+                sigmas=stage_sigmas, noise_like=stage_noise,
+            )
 
         stage_runtime = ScaleLockedRuntimeContext(
             model=model,
@@ -1052,6 +1195,7 @@ def run_scale_locked_ksampler(
     config: ScaleLockConfig,
     noise_mode: str = "legacy",
     stage_hw: tuple = (),
+    sampler_options: Optional[dict] = None,
 ) -> ScaleLockedSampleResult:
     if steps < 1:
         raise ValueError("steps must be >= 1")
@@ -1083,6 +1227,7 @@ def run_scale_locked_ksampler(
         seed=planner_seed,
         disable_noise=disable_noise,
         pin_anchors=pin_anchors,
+        sampler_options=sampler_options,
     )
     if len(anchors_x0) == 0:
         raise RuntimeError("ScaleLockedResidualKSampler: planner pass did not record any x0 anchors.")
@@ -1093,8 +1238,8 @@ def run_scale_locked_ksampler(
             sampler_name=sampler_name, sigmas=sigmas, highres_latent=highres_latent,
             lowres_latent=lowres_latent, lowres_out=lowres_out, anchors_x0=anchors_x0,
             planner_sigmas=planner_sigmas, lowres_noise=lowres_noise, detail_seed=detail_seed,
-            nested_noise_strength=nested_noise_strength, noise_mode=noise_mode,
-            config=config, stage_hw=tuple(stage_hw),
+            stochastic_seed=planner_seed, nested_noise_strength=nested_noise_strength, noise_mode=noise_mode,
+            config=config, stage_hw=tuple(stage_hw), sampler_options=sampler_options,
         )
 
     runtime = ScaleLockedRuntimeContext(
@@ -1115,7 +1260,11 @@ def run_scale_locked_ksampler(
         noise_seed=detail_seed,
     )
     guider = create_cfg_guider(model, positive, negative, cfg)
-    sampler = comfy.samplers.sampler_object(sampler_name)
+    sampler = _krea2_sampler_object(
+        sampler_name, sampler_options, model=model, low_shape=tuple(lowres_noise.shape),
+        stage_shapes=(tuple(runtime.highres_noise.shape),), stage_index=0,
+        seed=planner_seed, start_step=0, sigmas=sigmas, noise_like=runtime.highres_noise,
+    )
     # The closed-form lock handoff is exact only for the flow-matching Euler update.
     analytic_full_lock = (
         config.full_lock_sigma is not None

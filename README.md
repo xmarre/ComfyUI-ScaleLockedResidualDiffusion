@@ -47,11 +47,12 @@ runtime and does not load weights independently.
   the flow domain [0, 1], and ending at zero. Non-default CFG or schedule
   changes the noise trajectory and therefore the composition-lock release.
 - **Sampler choice**: `euler` (default), `dpmpp_2m`, `res_multistep`,
-  `deis`, `ipndm`, `ipndm_v` and `gradient_estimation`, limited to those the
-  installed ComfyUI provides. Each is a native ComfyUI solver that is
-  deterministic, evaluates the denoiser once per step and builds its
-  multistep history only from the predictions it receives. The selected
-  solver runs both the planner and the target passes.
+  `deis`, `ipndm`, `ipndm_v`, `gradient_estimation` and `er_sde`, limited to
+  native implementations available in the installed ComfyUI. Every offered
+  solver evaluates the denoiser once per outer step and retains its own native
+  update/history. The first seven are deterministic with their default options;
+  **ER-SDE is stochastic** unless ODE or zero noise strength is selected.
+  The same selected solver runs the planner and target passes.
   - **Locked steps cost no target-resolution model evaluations with any
     solver.** Euler reaches the composition-lock release in closed form.
     The other solvers integrate the locked steps with their own native
@@ -66,15 +67,30 @@ runtime and does not load weights independently.
     previous stage's image to the release noise level and starts the
     solver afresh there, so multistep solvers begin that stage at first
     order.
-  - Non-Euler solvers are experimental: they follow different denoising
-    trajectories from Euler and need visual validation with matched seeds.
-    CFG++, ancestral/SDE and multi-evaluation solvers (e.g. Heun) are not
-    offered.
-  - With Spectrum Krea 2 acceleration, all seven sampler choices (Euler,
-    DPM++ 2M, RES Multistep, Gradient Estimation, DEIS, iPNDM and iPNDM-V)
-    are forecast-enabled on their source-audited default native paths.
-    DEIS coefficient helpers are separately checked. Unsupported solver
-    options and altered native sources fail closed. Forecasting may change
+  - **Native ER-SDE** uses ComfyUI's original VP ER-SDE solver and its first-,
+    second-, or third-order history. The optional **ER-SDE solver type**,
+    **max stage** (1–3), **eta**, and **s_noise** widgets are appended after
+    existing inputs and only apply when `sampler_name=er_sde`. Solver types
+    are `ER-SDE`, `Reverse-time SDE`, and `ODE`; ODE or eta=0 removes
+    stochastic injection. The first flow sigma is adjusted by native ComfyUI
+    for finite log-SNR; the lock's step matching uses that effective sigma.
+    All ER-SDE noise increments are generated deterministically from the run
+    seed and absolute step index. Across resolutions, a patch-phase Gaussian
+    coupling makes the target's coarse stochastic increment match the planner
+    while retaining independent fine-frequency noise. Later stages restart
+    ER-SDE history at the release step; they do not inherit earlier-stage
+    multistep derivatives.
+  - Non-Euler solvers, including ER-SDE, are experimental. Their trajectories
+    differ from Euler and require visual validation with matched seeds. Other
+    ancestral/SDE samplers, CFG++ and multi-evaluation solvers (e.g. Heun)
+    remain unoffered.
+  - With Spectrum Krea 2 PR #2, all eight sampler choices (Euler, DPM++ 2M,
+    RES Multistep, Gradient Estimation, DEIS, iPNDM, iPNDM-V and ER-SDE)
+    are forecast-enabled on their source-audited native paths.
+    DEIS coefficient helpers and ER-SDE sigma/log-SNR conversion helpers
+    are separately checked. ER-SDE accepts the validated native scaler, stage,
+    noise strength and noise sampler options; unreviewed options or altered
+    native solver/helper sources fail closed. Forecasting may change
     image quality, especially anatomy, and must be visually tested with
     the same seed and conditioning. Spectrum's forecast
     history is built only from unlocked target evaluations, as with Euler.
