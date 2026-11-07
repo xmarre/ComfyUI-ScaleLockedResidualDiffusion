@@ -67,7 +67,12 @@ def _node():
         "calculate_sigmas": calculate_sigmas,
         "effective_er_sde_sigmas": lambda sigmas, model: sigmas,
         "krea2_er_sde_options": lambda mode, order, eta, noise: {
-            "solver_type": mode, "max_stage": order, "eta": eta, "s_noise": noise,
+            "max_stage": order,
+            "s_noise": 0.0 if mode == "ODE" or eta == 0 else float(noise),
+            "noise_scaler": SimpleNamespace(
+                solver_type="ODE" if mode == "ODE" or eta == 0 else mode,
+                eta=float(eta),
+            ),
         },
         "krea2_sa_solver_options": lambda model, **kwargs: kwargs,
         "sa_native_only_scope": lambda enabled: nullcontext(),
@@ -160,8 +165,8 @@ def test_er_sde_options_are_routed_without_changing_other_solvers():
                 er_sde_max_stage=2, er_sde_eta=.7, er_sde_s_noise=.8,
                 stage_megapixels="2")
     assert calls[-1]["sampler_options"] == {
-        "solver_type": "Reverse-time SDE", "max_stage": 2,
-        "eta": .7, "s_noise": .8,
+        "max_stage": 2, "s_noise": .8,
+        "noise_scaler": SimpleNamespace(solver_type="Reverse-time SDE", eta=.7),
     }
     assert calls[-1]["stage_hw"]
     node.sample(*args, sampler_name="euler")
