@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import contextvars
 import copy
 from contextlib import contextmanager
 import logging
 import math
+import sys
 import types
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -46,6 +48,27 @@ _LOGGER = logging.getLogger(__name__)
 
 
 
+_SPECTRUM_RUNTIME = "comfyui_spectrum_krea2.runtime"
+
+
+def _spectrum_force_native_vars() -> list:
+    """FORCE_NATIVE of every loaded Spectrum Krea 2 runtime module.
+
+    ComfyUI loads a custom-node directory under a path-derived module name,
+    so the active runtime is ``<custom node path>.comfyui_spectrum_krea2.runtime``
+    rather than the bare package name. A bare import would miss it, or load a
+    second copy whose context variable the active sampler hook never reads.
+    """
+    found = []
+    for name, module in list(sys.modules.items()):
+        if module is None or not (name == _SPECTRUM_RUNTIME or name.endswith("." + _SPECTRUM_RUNTIME)):
+            continue
+        var = getattr(module, "FORCE_NATIVE", None)
+        if isinstance(var, contextvars.ContextVar) and all(var is not v for v in found):
+            found.append(var)
+    return found
+
+
 @contextmanager
 def sa_native_only_scope(enabled: bool):
     """Suppress only Spectrum forecasts for the scoped SA execution.
@@ -57,18 +80,12 @@ def sa_native_only_scope(enabled: bool):
     if not enabled:
         yield
         return
-    try:
-        from comfyui_spectrum_krea2.runtime import FORCE_NATIVE
-    except ModuleNotFoundError as exc:
-        if exc.name not in {"comfyui_spectrum_krea2", "comfyui_spectrum_krea2.runtime"}:
-            raise
-        yield
-        return
-    token = FORCE_NATIVE.set(True)
+    tokens = [(var, var.set(True)) for var in _spectrum_force_native_vars()]
     try:
         yield
     finally:
-        FORCE_NATIVE.reset(token)
+        for var, token in reversed(tokens):
+            var.reset(token)
 
 
 class _NullPreviewCallback:

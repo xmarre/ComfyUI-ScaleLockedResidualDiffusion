@@ -56,9 +56,19 @@ def main():
     cases = [("native", model)]
     reports_context = None
     if args.spectrum_root:
-        sys.path.insert(0, str(args.spectrum_root.resolve()))
-        from comfyui_spectrum_krea2.nodes import SpectrumApplyKrea2
-        from comfyui_spectrum_krea2.runtime import REPORTS
+        # Load Spectrum exactly as ComfyUI loads a custom-node directory: a
+        # path-derived module name, not importable as a top-level package.
+        # Cross-package controls must reach this loaded instance.
+        spectrum_dir = args.spectrum_root.resolve()
+        spectrum_name = str(spectrum_dir).replace(".", "_x_")
+        spectrum_spec = importlib.util.spec_from_file_location(
+            spectrum_name, spectrum_dir / "__init__.py", submodule_search_locations=[str(spectrum_dir)])
+        spectrum_package = importlib.util.module_from_spec(spectrum_spec)
+        sys.modules[spectrum_name] = spectrum_package
+        spectrum_spec.loader.exec_module(spectrum_package)
+        SpectrumApplyKrea2 = sys.modules[spectrum_name + ".comfyui_spectrum_krea2.nodes"].SpectrumApplyKrea2
+        REPORTS = sys.modules[spectrum_name + ".comfyui_spectrum_krea2.runtime"].REPORTS
+        assert "comfyui_spectrum_krea2.runtime" not in sys.modules
         reports_context = REPORTS
         cases.append(("spectrum", SpectrumApplyKrea2().apply(model, preset="turbo")[0]))
     runtime = sys.modules[spec.name + ".slrd_runtime"]
@@ -261,7 +271,6 @@ def main():
     # target steps. All offered native solvers are forecast-enabled,
     # independently of the lock's zero-DiT shortcut.
     if reports_context is not None:
-        from comfyui_spectrum_krea2.nodes import SpectrumApplyKrea2
         aligned = SpectrumApplyKrea2().apply(
             model, preset="turbo", warmup=2, tail=1, bootstrap=False,
             extrapolation_guard_enabled=False,
@@ -353,7 +362,6 @@ def main():
         }))
 
     if reports_context is not None:
-        from comfyui_spectrum_krea2.nodes import SpectrumApplyKrea2
         fast_pece = SpectrumApplyKrea2().apply(
             model, preset="turbo", warmup=2, tail=1,
             bootstrap=False, extrapolation_guard_enabled=False,
