@@ -462,7 +462,7 @@ def main():
             }))
 
     # sa_stage_max_order: the planner keeps the configured SA orders, while
-    # every resolution stage receives the capped predictor order.
+    # every resolution stage receives the capped orders.
     seen_orders = []
     original_sampler_object = runtime._krea2_sampler_object
 
@@ -478,7 +478,7 @@ def main():
                  sa_predictor_order=3, sa_corrector_order=4)
     finally:
         runtime._krea2_sampler_object = original_sampler_object
-    assert seen_orders == [(3, 4), (1, 4), (1, 4)], seen_orders
+    assert seen_orders == [(3, 4), (1, 0), (1, 0)], seen_orders
     print(json.dumps({"case": "sa_stage_order_cap", "orders": seen_orders}))
 
     if reports_context is not None:

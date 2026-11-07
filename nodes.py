@@ -305,10 +305,11 @@ class Krea2TurboFlowAlignedRegenerate:
                                "in the intermediate and final high-resolution stages. This is a quality comparison "
                                "for planner texture loss; the planner uses the same native noise and solver."}),
                 "sa_stage_max_order": ("INT", {"default": 1, "min": 1, "max": 6,
-                    "tooltip": "sa_solver only: caps the predictor order in the high-resolution passes. Each pass "
-                               "restarts on a re-noised image with only a few large steps, where higher-order predictor "
-                               "extrapolation can invent or deform small structures. The corrector order and the "
-                               "planner's orders are unchanged. 6 disables the cap. sa_solver_pece is unaffected."}),
+                    "tooltip": "sa_solver only: caps the solver order in the high-resolution passes (predictor at this "
+                               "value, corrector one lower). Each pass restarts on a re-noised image with only a few "
+                               "large steps, where higher-order extrapolation can invent or deform small structures. "
+                               "The planner keeps sa_predictor_order and sa_corrector_order. The default 1 gives "
+                               "predictor 1 / corrector 0 in those passes; 6 disables the cap. sa_solver_pece is unaffected."}),
             },
         }
 
@@ -389,6 +390,7 @@ class Krea2TurboFlowAlignedRegenerate:
             if sampler_name == "sa_solver" and sa_stage_max_order < 6:
                 target_sampler_options = dict(sampler_options)
                 target_sampler_options["predictor_order"] = min(sa_predictor_order, sa_stage_max_order)
+                target_sampler_options["corrector_order"] = min(sa_corrector_order, sa_stage_max_order - 1)
         if not isinstance(latent_image, dict) or not isinstance(latent_image.get("samples"), torch.Tensor):
             raise TypeError("Krea 2 requires a LATENT dictionary with tensor samples")
         # Native ComfyUI uses four-channel EmptyLatentImage placeholders for Krea 2,
