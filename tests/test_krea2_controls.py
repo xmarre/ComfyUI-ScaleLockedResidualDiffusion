@@ -98,7 +98,7 @@ def test_existing_widget_slots_and_explicit_defaults():
         "er_sde_solver_type", "er_sde_max_stage", "er_sde_eta", "er_sde_s_noise",
         "sa_eta", "sa_sde_start_percent", "sa_sde_end_percent", "sa_s_noise",
         "sa_predictor_order", "sa_corrector_order", "sa_simple_order_2",
-        "sa_spectrum_forecasts", "sa_planner_spectrum_forecasts", "sa_stage_max_order",
+        "sa_spectrum_forecasts", "sa_planner_spectrum_forecasts",
     ]
     assert schema["optional"]["cfg"][1]["default"] == 1.0
     assert schema["optional"]["sampler_name"][0] == list(SAMPLERS)
@@ -116,7 +116,6 @@ def test_existing_widget_slots_and_explicit_defaults():
     assert schema["optional"]["sa_simple_order_2"][1]["default"] is False
     assert schema["optional"]["sa_spectrum_forecasts"][1]["default"] is True
     assert schema["optional"]["sa_planner_spectrum_forecasts"][1]["default"] is True
-    assert schema["optional"]["sa_stage_max_order"][1]["default"] == 1
     assert node.sample(*args) == ("target", "planner", "denoised")
     assert (calls[-1]["cfg"], calls[-1]["sampler_name"],
             calls[-1]["scheduler"]) == (1.0, "euler", "simple")
@@ -240,31 +239,3 @@ def test_sa_invalid_planner_forecast_control_rejected_before_any_sampling():
     with pytest.raises(ValueError, match="sa_planner_spectrum_forecasts must be a boolean"):
         node.sample(*args, sampler_name="sa_solver", sa_planner_spectrum_forecasts=1)
     assert not calls
-
-
-def test_sa_stage_order_cap_applies_only_to_target_passes():
-    node, calls, args = _node()
-    node.sample(*args, sampler_name="sa_solver", sa_predictor_order=3, sa_corrector_order=4)
-    planner, target = calls[-1]["sampler_options"], calls[-1]["target_sampler_options"]
-    assert (planner["predictor_order"], planner["corrector_order"]) == (3, 4)
-    assert (target["predictor_order"], target["corrector_order"]) == (1, 0)
-    assert {k: v for k, v in target.items() if not k.endswith("_order")} == {
-        k: v for k, v in planner.items() if not k.endswith("_order")}
-    node.sample(*args, sampler_name="sa_solver", sa_predictor_order=3, sa_corrector_order=4,
-                sa_stage_max_order=3)
-    target = calls[-1]["target_sampler_options"]
-    assert (target["predictor_order"], target["corrector_order"]) == (3, 2)
-    # 6 leaves the user's orders untouched; PECE and other solvers never cap.
-    node.sample(*args, sampler_name="sa_solver", sa_stage_max_order=6)
-    assert calls[-1]["target_sampler_options"] is None
-    node.sample(*args, sampler_name="sa_solver_pece")
-    assert calls[-1]["target_sampler_options"] is None
-    node.sample(*args, sampler_name="euler")
-    assert calls[-1]["target_sampler_options"] is None
-
-
-@pytest.mark.parametrize("value", [0, 7, 1.0, True])
-def test_sa_stage_order_cap_rejects_invalid_values(value):
-    node, calls, args = _node()
-    with pytest.raises(ValueError, match="sa_stage_max_order"):
-        node.sample(*args, sampler_name="sa_solver", sa_stage_max_order=value)

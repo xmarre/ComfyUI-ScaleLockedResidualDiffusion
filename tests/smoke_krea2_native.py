@@ -461,26 +461,6 @@ def main():
                 "forecast_enabled": [r["forecast"] for r in on_reports],
             }))
 
-    # sa_stage_max_order: the planner keeps the configured SA orders, while
-    # every resolution stage receives the capped orders.
-    seen_orders = []
-    original_sampler_object = runtime._krea2_sampler_object
-
-    def recording_sampler_object(name, options, **kwargs):
-        if options is not None:
-            seen_orders.append((options.get("predictor_order"), options.get("corrector_order")))
-        return original_sampler_object(name, options, **kwargs)
-
-    runtime._krea2_sampler_object = recording_sampler_object
-    try:
-        controls(model, "sa_solver", "simple", 1.0, 12, False,
-                 latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
-                 sa_predictor_order=3, sa_corrector_order=4)
-    finally:
-        runtime._krea2_sampler_object = original_sampler_object
-    assert seen_orders == [(3, 4), (1, 0), (1, 0)], seen_orders
-    print(json.dumps({"case": "sa_stage_order_cap", "orders": seen_orders}))
-
     if reports_context is not None:
         # Planner-native-only A/B: isolate the low-resolution Spectrum quality
         # without giving up accelerated intermediate/final target stages.

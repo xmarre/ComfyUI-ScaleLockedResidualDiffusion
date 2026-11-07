@@ -304,12 +304,6 @@ class Krea2TurboFlowAlignedRegenerate:
                                "Off evaluates every planner step natively while preserving Spectrum acceleration "
                                "in the intermediate and final high-resolution stages. This is a quality comparison "
                                "for planner texture loss; the planner uses the same native noise and solver."}),
-                "sa_stage_max_order": ("INT", {"default": 1, "min": 1, "max": 6,
-                    "tooltip": "sa_solver only: caps the solver order in the high-resolution passes (predictor at this "
-                               "value, corrector one lower). Each pass restarts on a re-noised image with only a few "
-                               "large steps, where higher-order extrapolation can invent or deform small structures. "
-                               "The planner keeps sa_predictor_order and sa_corrector_order. The default 1 gives "
-                               "predictor 1 / corrector 0 in those passes; 6 disables the cap. sa_solver_pece is unaffected."}),
             },
         }
 
@@ -343,7 +337,6 @@ class Krea2TurboFlowAlignedRegenerate:
         sa_simple_order_2=False,
         sa_spectrum_forecasts=True,
         sa_planner_spectrum_forecasts=True,
-        sa_stage_max_order=1,
     ):
         if not isinstance(cfg, (int, float)) or not math.isfinite(cfg) or not 0.0 <= cfg <= 100.0:
             raise ValueError("Krea 2 CFG must be finite and within [0, 100]")
@@ -354,7 +347,6 @@ class Krea2TurboFlowAlignedRegenerate:
         if scheduler not in compat_scheduler_names():
             raise ValueError(f"Unsupported Krea 2 scheduler: {scheduler!r}")
         sampler_options = None
-        target_sampler_options = None
         composition_lock_sigma = float(composition_lock_sigma)
         if not math.isfinite(composition_lock_sigma) or not 0.0 <= composition_lock_sigma <= 1.0:
             raise ValueError("composition_lock_sigma must be within [0, 1]")
@@ -379,18 +371,12 @@ class Krea2TurboFlowAlignedRegenerate:
                 raise ValueError("sa_spectrum_forecasts must be a boolean")
             if type(sa_planner_spectrum_forecasts) is not bool:
                 raise ValueError("sa_planner_spectrum_forecasts must be a boolean")
-            if type(sa_stage_max_order) is not int or not 1 <= sa_stage_max_order <= 6:
-                raise ValueError("sa_stage_max_order must be an integer in [1, 6]")
             sampler_options = krea2_sa_solver_options(
                 model, eta=sa_eta, sde_start_percent=sa_sde_start_percent,
                 sde_end_percent=sa_sde_end_percent, s_noise=sa_s_noise,
                 predictor_order=sa_predictor_order, corrector_order=sa_corrector_order,
                 simple_order_2=sa_simple_order_2,
             )
-            if sampler_name == "sa_solver" and sa_stage_max_order < 6:
-                target_sampler_options = dict(sampler_options)
-                target_sampler_options["predictor_order"] = min(sa_predictor_order, sa_stage_max_order)
-                target_sampler_options["corrector_order"] = min(sa_corrector_order, sa_stage_max_order - 1)
         if not isinstance(latent_image, dict) or not isinstance(latent_image.get("samples"), torch.Tensor):
             raise TypeError("Krea 2 requires a LATENT dictionary with tensor samples")
         # Native ComfyUI uses four-channel EmptyLatentImage placeholders for Krea 2,
@@ -504,7 +490,6 @@ class Krea2TurboFlowAlignedRegenerate:
                     sampler_name in ("sa_solver", "sa_solver_pece")
                     and not sa_planner_spectrum_forecasts
                 ),
-                target_sampler_options=target_sampler_options,
             )
         return (result.output, result.lowres_planner, result.denoised_output)
 
