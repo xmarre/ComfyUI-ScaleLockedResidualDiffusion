@@ -105,11 +105,11 @@ def test_existing_widget_slots_and_explicit_defaults():
     assert schema["optional"]["er_sde_s_noise"][1]["default"] == 1.0
     assert schema["optional"]["sa_eta"][1]["default"] == 1.0
     assert schema["optional"]["sa_sde_start_percent"][1]["default"] == 0.2
-    assert schema["optional"]["sa_sde_end_percent"][1]["default"] == 0.8
+    assert schema["optional"]["sa_sde_end_percent"][1]["default"] == 0.35
     assert schema["optional"]["sa_predictor_order"][1]["default"] == 3
     assert schema["optional"]["sa_corrector_order"][1]["default"] == 4
     assert schema["optional"]["sa_simple_order_2"][1]["default"] is False
-    assert schema["optional"]["sa_spectrum_forecasts"][1]["default"] is False
+    assert schema["optional"]["sa_spectrum_forecasts"][1]["default"] is True
     assert node.sample(*args) == ("target", "planner", "denoised")
     assert (calls[-1]["cfg"], calls[-1]["sampler_name"],
             calls[-1]["scheduler"]) == (1.0, "euler", "simple")

@@ -277,8 +277,11 @@ class Krea2TurboFlowAlignedRegenerate:
                     "tooltip": "SA-Solver only: stochastic strength (0 = ODE)."}),
                 "sa_sde_start_percent": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.001,
                     "tooltip": "SA-Solver only: start of the stochastic model-sigma interval."}),
-                "sa_sde_end_percent": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.001,
-                    "tooltip": "SA-Solver only: end of the stochastic model-sigma interval."}),
+                "sa_sde_end_percent": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.001,
+                    "tooltip": "SA-Solver only: end of the stochastic model-sigma interval. The default 0.35 (model sigma "
+                               "about 0.68 at Krea 2's flow shift) keeps stochastic steps in the planner and makes the "
+                               "high-resolution stages deterministic. ComfyUI's native 0.8 keeps every stage step stochastic; "
+                               "with few steps per stage that produced visible artifacts with plain SA-Solver."}),
                 "sa_s_noise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.01,
                     "tooltip": "SA-Solver only: SDE noise multiplier, patch-coupled across scales."}),
                 "sa_predictor_order": ("INT", {"default": 3, "min": 1, "max": 6,
@@ -287,8 +290,11 @@ class Krea2TurboFlowAlignedRegenerate:
                     "tooltip": "SA-Solver only: native corrector order. PECE reevaluates corrections when greater than 0."}),
                 "sa_simple_order_2": ("BOOLEAN", {"default": False,
                     "tooltip": "SA-Solver only: native simplified second-order coefficients."}),
-                "sa_spectrum_forecasts": ("BOOLEAN", {"default": False,
-                    "tooltip": "SA-Solver only: experimental Spectrum predictor forecasts. Off by default until real-checkpoint image quality is verified. The native SA/PECE solver and composition locking still operate normally."}),
+                "sa_spectrum_forecasts": ("BOOLEAN", {"default": True,
+                    "tooltip": "SA-Solver only: allow Spectrum predictor forecasts when a Spectrum Krea 2 model is connected. "
+                               "Off runs every SA predictor and PECE correction natively (a quality reference). "
+                               "Forecasts on stochastic steps never reuse the forecast's noise estimate; they are most "
+                               "effective on the deterministic high-resolution stages set by sa_sde_end_percent."}),
             },
         }
 
@@ -315,12 +321,12 @@ class Krea2TurboFlowAlignedRegenerate:
         er_sde_s_noise=1.0,
         sa_eta=1.0,
         sa_sde_start_percent=0.2,
-        sa_sde_end_percent=0.8,
+        sa_sde_end_percent=0.35,
         sa_s_noise=1.0,
         sa_predictor_order=3,
         sa_corrector_order=4,
         sa_simple_order_2=False,
-        sa_spectrum_forecasts=False,
+        sa_spectrum_forecasts=True,
     ):
         if not isinstance(cfg, (int, float)) or not math.isfinite(cfg) or not 0.0 <= cfg <= 100.0:
             raise ValueError("Krea 2 CFG must be finite and within [0, 100]")
