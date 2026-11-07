@@ -100,12 +100,14 @@ def test_existing_widget_slots_and_explicit_defaults():
         "sa_predictor_order", "sa_corrector_order", "sa_simple_order_2",
         "sa_spectrum_forecasts", "sa_planner_spectrum_forecasts",
         "regeneration_mode", "img2img_start_sigma", "handoff_diagnostics",
+        "planner_fidelity_strength",
     ]
     assert schema["optional"]["regeneration_mode"][0] == ["trajectory", "planner_final_img2img"]
     assert schema["optional"]["regeneration_mode"][1]["default"] == "trajectory"
     assert schema["optional"]["img2img_start_sigma"][1]["default"] == 0.65
     assert schema["optional"]["handoff_diagnostics"][0] == ["off", "log", "log_and_save_latents"]
     assert schema["optional"]["handoff_diagnostics"][1]["default"] == "off"
+    assert schema["optional"]["planner_fidelity_strength"][1]["default"] == 0.0
     assert schema["optional"]["cfg"][1]["default"] == 1.0
     assert schema["optional"]["sampler_name"][0] == list(SAMPLERS)
     assert schema["optional"]["sampler_name"][1]["default"] == "euler"
@@ -129,6 +131,7 @@ def test_existing_widget_slots_and_explicit_defaults():
     assert calls[-1]["regeneration_mode"] == "trajectory"
     assert calls[-1]["img2img_start_sigma"] is None
     assert calls[-1]["handoff_diagnostics"] == "off"
+    assert calls[-1]["planner_fidelity_strength"] == 0.0
 
 
 def test_configured_cfg_sampler_scheduler_route_to_both_passes():
@@ -302,3 +305,27 @@ def test_img2img_rejects_nonzero_trajectory_lock_strengths(index):
     assert not calls
     node.sample(*args)  # trajectory mode keeps its existing lock-strength behavior
     assert calls[-1]["regeneration_mode"] == "trajectory"
+
+
+@pytest.mark.parametrize("strength", [0.25, 0.6, 1.0])
+def test_planner_fidelity_strength_routes_only_img2img(strength):
+    node, calls, args = _node()
+    node.sample(*args, regeneration_mode="planner_final_img2img",
+                planner_fidelity_strength=strength)
+    assert calls[-1]["planner_fidelity_strength"] == strength
+
+
+@pytest.mark.parametrize("strength", [-1.0, 1.1, float("nan"), True])
+def test_planner_fidelity_invalid_rejected_before_sampling(strength):
+    node, calls, args = _node()
+    with pytest.raises(ValueError, match="planner_fidelity_strength"):
+        node.sample(*args, regeneration_mode="planner_final_img2img",
+                    planner_fidelity_strength=strength)
+    assert not calls
+
+
+def test_planner_fidelity_nonzero_rejected_in_trajectory():
+    node, calls, args = _node()
+    with pytest.raises(ValueError, match="requires planner_final_img2img"):
+        node.sample(*args, planner_fidelity_strength=0.5)
+    assert not calls

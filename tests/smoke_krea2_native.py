@@ -860,6 +860,26 @@ def main():
         high_first = next(x for x, _ in high_inputs if tuple(x.shape[-2:]) == target_hw)
         assert not torch.equal(low_first, high_first), sampler_name
 
+    # A native-model regression: enforce the planner low-frequency measurement
+    # at each stage, with no change to the planner, native solver, or number
+    # of denoiser evaluations. Both direct and multi-stage paths are checked.
+    for solver in ("euler", "sa_solver"):
+        for stage_options, shape in (({"max_stage_upscale": 0.0}, (16, 20)),
+                                     ({"stage_megapixels": "0.02"}, (24, 28))):
+            plain, _, _, _ = img2img(model, solver, 8, latent_hw=shape, **stage_options)
+            guided, _, stages, _ = img2img(
+                model, solver, 8, latent_hw=shape,
+                planner_fidelity_strength=1.0, **stage_options)
+            assert torch.equal(plain[1]["samples"], guided[1]["samples"])
+            assert torch.equal(guided[0]["samples"], guided[2]["samples"])
+            downsampled = torch.nn.functional.interpolate(
+                guided[0]["samples"].float(),
+                size=tuple(guided[1]["samples"].shape[-2:]), mode="area")
+            torch.testing.assert_close(downsampled, guided[1]["samples"].float(),
+                                       rtol=8e-4, atol=8e-4)
+            assert len(stages) == (2 if "stage_megapixels" in stage_options else 1)
+            assert all(torch.isfinite(v["samples"]).all() for v in guided)
+
     # Explicit trajectory mode ignores the img2img sigma and equals the default.
     for sampler_name in ("euler", "sa_solver"):
         explicit = img2img(model, sampler_name, 8, mode="trajectory", stage_megapixels="0.02",

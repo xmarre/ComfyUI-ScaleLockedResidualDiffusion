@@ -9,6 +9,10 @@ workflows keep their widget values and the existing behavior.
 - `img2img_start_sigma`: start noise level for `planner_final_img2img`
   (default 0.65).
 - `handoff_diagnostics`: `off` (default), `log` or `log_and_save_latents`.
+- `planner_fidelity_strength`: 0 (disabled, default) to 1,
+  opt-in in `planner_final_img2img` only, constraining target
+  predictions and completed stages to preserve the finished planner's
+  downsampled latent image.
 
 ## The two regeneration modes
 
@@ -48,6 +52,24 @@ preserve more of the finished image, leave less room for structural change and
 also leave fewer high-resolution steps. Raise `steps` for more. Each stage
 costs one model evaluation per remaining step (SA-Solver PECE also evaluates
 its corrections).
+
+## Experimental planner consistency projection
+
+The high-resolution model can change a completed planner's geometry even
+when it begins from correctly re-noised clean latent data. A
+`planner_fidelity_strength` above zero constrains its denoised predictions
+to preserve the finished planner under the latent area-downsampling operator.
+The constraint uses the minimum-L2 pseudoinverse of the separable adaptive
+area downsampler. Strength 1 enforces agreement to floating-point precision;
+strength 0 is a complete no-op. The completed stage is projected again to
+avoid multistep solvers passing residual planner drift to the next stage.
+
+This is a measurable *latent-space* constraint; it does not prove the
+decoded image will preserve every anatomical feature or that Krea 2 will
+avoid inventing fine detail in the operator's nullspace. Ghost contours,
+texture softening, or other visual regressions remain possible. Only
+small CPU-model execution and mathematical invariants have been verified;
+real-checkpoint A/B comparisons must precede enabling it by default.
 
 ## Handoff diagnostics
 

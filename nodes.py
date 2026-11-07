@@ -326,6 +326,13 @@ class Krea2TurboFlowAlignedRegenerate:
                                "are from the finished planner. log_and_save_latents also writes each stage's starting "
                                "state and every denoised prediction as .latent files under "
                                "output/scale_locked_diagnostics for LoadLatent + VAE Decode. Sampling is unchanged."}),
+                "planner_fidelity_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Experimental, planner_final_img2img only. 0 preserves existing sampling. "
+                               "Nonzero values project high-resolution denoised predictions and completed stages "
+                               "toward the finished planner under the latent area-downsampling operator. "
+                               "1 enforces near-exact low-resolution latent consistency while leaving finer "
+                               "nullspace details free. Does not guarantee anatomy; validate texture and ghosting "
+                               "on your real checkpoint."}),
             },
         }
 
@@ -362,12 +369,20 @@ class Krea2TurboFlowAlignedRegenerate:
         regeneration_mode="trajectory",
         img2img_start_sigma=0.65,
         handoff_diagnostics="off",
+        planner_fidelity_strength=0.0,
     ):
         if regeneration_mode not in ("trajectory", "planner_final_img2img"):
             raise ValueError("regeneration_mode must be trajectory or planner_final_img2img")
         if handoff_diagnostics not in ("off", "log", "log_and_save_latents"):
             raise ValueError("handoff_diagnostics must be off, log or log_and_save_latents")
         img2img = regeneration_mode == "planner_final_img2img"
+        if (isinstance(planner_fidelity_strength, bool)
+                or not isinstance(planner_fidelity_strength, (int, float))
+                or not math.isfinite(planner_fidelity_strength)
+                or not 0.0 <= planner_fidelity_strength <= 1.0):
+            raise ValueError("planner_fidelity_strength must be finite and within [0, 1]")
+        if not img2img and planner_fidelity_strength != 0.0:
+            raise ValueError("planner_fidelity_strength requires planner_final_img2img")
         if img2img:
             if (isinstance(img2img_start_sigma, bool) or not isinstance(img2img_start_sigma, (int, float))
                     or not math.isfinite(img2img_start_sigma) or not 0.0 < img2img_start_sigma < 1.0):
@@ -550,6 +565,7 @@ class Krea2TurboFlowAlignedRegenerate:
                 regeneration_mode=regeneration_mode,
                 img2img_start_sigma=float(img2img_start_sigma) if img2img else None,
                 handoff_diagnostics=handoff_diagnostics,
+                planner_fidelity_strength=float(planner_fidelity_strength),
             )
         return (result.output, result.lowres_planner, result.denoised_output)
 

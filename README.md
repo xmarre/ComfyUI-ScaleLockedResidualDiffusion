@@ -246,6 +246,21 @@ runtime and does not load weights independently.
     Each stage evaluates the model once per remaining step (SA-Solver PECE
     also evaluates its corrections), the same per-stage cost as the trajectory
     mode at an equal release sigma.
+  - **Experimental planner consistency** (`planner_fidelity_strength`,
+    optional appended widget, default **0**) applies only in
+    `planner_final_img2img`. At nonzero strength, every target x0 prediction
+    and completed resolution stage is projected toward the finished planner
+    under the same **area-downsampling measurement** used to compare images.
+    At strength 1, the output downscales to the planner latent to numerical
+    precision; 0 leaves the original regeneration unchanged.
+    The correction is the minimum-L2 right-pseudoinverse of the area
+    measurement operator, retaining high-resolution nullspace detail.
+    Unlike the older coarse/mid lock, it does not impose arbitrary frequency
+    cutoffs or reuse incomplete planner trajectory predictions.
+    This is **latent-space consistency, not a visual anatomy guarantee**.
+    Incorrect high-frequency features, ghost edges, or texture loss remain
+    possible; compare against strength 0 with your actual checkpoint.
+    It adds tensor projection work per model prediction, not DiT evaluations.
   - The mode has been checked only on a small random CPU model for execution
     and initialization correctness. Whether it preserves a real planner image
     better than the trajectory mode is not yet established: compare both

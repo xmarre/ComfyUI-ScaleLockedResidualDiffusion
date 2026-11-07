@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
+import torch.nn.functional as F
 
 import comfy.model_management
 import comfy.model_sampling
@@ -1532,6 +1533,72 @@ class Krea2HandoffDiagnostics:
         return observe
 
 
+
+class PlannerLatentConsistency:
+    """Minimum-L2 projection of denoised latents onto the finished planner.
+
+    The area downsampler is separable and linear: D(X) = W_h X W_w.T.
+    For the row-full-rank matrices W_h and W_w, their right pseudoinverses
+    P = W.T (W W.T)^(-1) give the minimum-L2 correction
+    P_h (planner - D(X)) P_w.T. At strength 1, D(project(X)) = planner
+    up to floating-point error; high-resolution nullspace detail is retained.
+    This is a latent consistency invariant, not pixel-level anatomy validation.
+    """
+
+    @staticmethod
+    def _right_inverse(low: int, high: int, device: torch.device) -> torch.Tensor:
+        if low <= 0 or high < low:
+            raise ValueError("planner consistency target must not be smaller than the planner")
+        weights = torch.zeros((low, high), device=device, dtype=torch.float32)
+        for row in range(low):
+            begin = row * high // low
+            end = ((row + 1) * high + low - 1) // low
+            weights[row, begin:end] = 1.0 / (end - begin)
+        return torch.linalg.solve(weights @ weights.T, weights).T.contiguous()
+
+    def __init__(self, planner_internal: torch.Tensor, target_hw: tuple[int, int], device: torch.device):
+        reference = planner_internal.detach().to(device=device, dtype=torch.float32)
+        if reference.ndim == 5 and reference.shape[2] == 1:
+            reference = reference.squeeze(2)
+        if reference.ndim != 4:
+            raise ValueError("planner consistency expects BCHW or BC1HW")
+        self.reference = reference
+        self.low_hw = tuple(reference.shape[-2:])
+        self.target_hw = tuple(map(int, target_hw))
+        self.p_h = self._right_inverse(self.low_hw[0], self.target_hw[0], device)
+        self.p_w = self._right_inverse(self.low_hw[1], self.target_hw[1], device)
+
+    def relative_error(self, target: torch.Tensor) -> float:
+        x = target.squeeze(2) if target.ndim == 5 and target.shape[2] == 1 else target
+        observed = F.interpolate(x.float(), size=self.low_hw, mode="area")
+        return float((observed - self.reference).norm() / self.reference.norm().clamp_min(1e-12))
+
+    def apply(self, target: torch.Tensor, strength: float) -> torch.Tensor:
+        if strength == 0.0:
+            return target
+        temporal = target.ndim == 5 and target.shape[2] == 1
+        x = target.squeeze(2) if temporal else target
+        if x.ndim != 4 or tuple(x.shape[-2:]) != self.target_hw:
+            raise ValueError("planner consistency target layout or resolution mismatch")
+        x32 = x.float()
+        mismatch = self.reference - F.interpolate(x32, size=self.low_hw, mode="area")
+        correction = torch.matmul(torch.matmul(self.p_h, mismatch), self.p_w.T)
+        projected = (x32 + float(strength) * correction).to(dtype=x.dtype)
+        return projected.unsqueeze(2) if temporal else projected
+
+
+def guide_planner_fidelity(guider, projection: PlannerLatentConsistency, strength: float):
+    """Constrain native denoised predictions without replacing the sampler."""
+    original = guider.predict_noise
+
+    def predict(self, x, timestep, model_options=None, seed=None):
+        denoised = original(x, timestep, model_options=model_options, seed=seed)
+        return projection.apply(denoised, strength)
+
+    guider.predict_noise = types.MethodType(predict, guider)
+    return original
+
+
 def _run_planner_final_img2img(
     *,
     model,
@@ -1550,6 +1617,7 @@ def _run_planner_final_img2img(
     noise_mode: str,
     stage_hw: tuple,
     start_sigma: float,
+    planner_fidelity_strength: float = 0.0,
     sampler_options: Optional[dict] = None,
     diagnostics: Optional[Krea2HandoffDiagnostics] = None,
 ) -> ScaleLockedSampleResult:
@@ -1568,6 +1636,8 @@ def _run_planner_final_img2img(
     """
     if not isinstance(_model_sampling_obj(model), comfy.model_sampling.CONST):
         raise ValueError("planner_final_img2img requires flow model sampling")
+    if not 0.0 <= planner_fidelity_strength <= 1.0 or not math.isfinite(planner_fidelity_strength):
+        raise ValueError("planner_fidelity_strength must be finite and within [0, 1]")
     if isinstance(highres_latent.get("noise_mask"), torch.Tensor):
         raise ValueError("planner_final_img2img does not support latent noise masks")
     if torch.count_nonzero(lowres_noise).item() == 0:
@@ -1592,6 +1662,8 @@ def _run_planner_final_img2img(
     shapes = tuple(tuple(lowres_noise.shape[:-2]) + tuple(hw) for hw in sizes)
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
     source = lowres_out["samples"]  # finished planner, output latent space
+    planner_internal = (model.model.process_latent_in(source.detach().float())
+                        if planner_fidelity_strength > 0 else None)
     x0_output: dict = {}
     if diagnostics is not None:
         diagnostics.set_planner(source)
@@ -1632,6 +1704,11 @@ def _run_planner_final_img2img(
         else:
             sampler = comfy.samplers.sampler_object(sampler_name)
         guider = create_cfg_guider(model, positive, negative, cfg)
+        projection = (PlannerLatentConsistency(planner_internal, hw, stage_samples.device)
+                      if planner_fidelity_strength > 0 else None)
+        original_predict = (guide_planner_fidelity(
+            guider, projection, planner_fidelity_strength
+        ) if projection is not None else None)
         stage_x0: dict = {}
         callback = make_preview_callback(model, len(stage_sigmas) - 1, stage_x0)
         if diagnostics is not None:
@@ -1639,23 +1716,44 @@ def _run_planner_final_img2img(
                 callback, stage=index, stage_hw=hw, sigmas=stage_sigmas, noise=stage_noise,
                 source=source, lock_sigma=None,
             )
-        source = guider.sample(
-            stage_noise,
-            start_latent,
-            sampler,
-            stage_sigmas,
-            denoise_mask=None,
-            callback=callback,
-            disable_pbar=disable_pbar,
-            seed=seed,
-        )
+        try:
+            source = guider.sample(
+                stage_noise,
+                start_latent,
+                sampler,
+                stage_sigmas,
+                denoise_mask=None,
+                callback=callback,
+                disable_pbar=disable_pbar,
+                seed=seed,
+            )
+        finally:
+            if original_predict is not None:
+                guider.predict_noise = original_predict
+        if projection is not None:
+            # Some native multistep solvers return a state different from the
+            # last denoised prediction. Constrain that state before the next
+            # resolution stage so planner drift does not accumulate.
+            internal = model.model.process_latent_in(source.float())
+            before = projection.relative_error(internal)
+            internal = projection.apply(internal, planner_fidelity_strength)
+            after = projection.relative_error(internal)
+            _LOGGER.info(
+                "Krea 2 planner fidelity: stage=%d strength=%.3f "
+                "planner_lowband_relative_error_before=%.6f after=%.6f",
+                index, planner_fidelity_strength, before, after,
+            )
+            source = model.model.process_latent_out(internal).to(dtype=source.dtype)
         if final:
             x0_output = stage_x0
 
     samples = source.to(comfy.model_management.intermediate_device())
     out = clean_latent(highres_latent)
     out["samples"] = samples
-    if "x0" in x0_output:
+    if planner_fidelity_strength > 0:
+        # Expose the actual projected final image, not the last raw preview.
+        denoised = out
+    elif "x0" in x0_output:
         try:
             x0_out = model.model.process_latent_out(x0_output["x0"].cpu())
         except Exception:
@@ -1692,6 +1790,7 @@ def run_scale_locked_ksampler(
     regeneration_mode: str = "trajectory",
     img2img_start_sigma: Optional[float] = None,
     handoff_diagnostics: str = "off",
+    planner_fidelity_strength: float = 0.0,
 ) -> ScaleLockedSampleResult:
     if steps < 1:
         raise ValueError("steps must be >= 1")
@@ -1700,6 +1799,13 @@ def run_scale_locked_ksampler(
     if handoff_diagnostics not in HANDOFF_DIAGNOSTIC_MODES:
         raise ValueError(f"handoff_diagnostics must be one of {', '.join(HANDOFF_DIAGNOSTIC_MODES)}")
     img2img = regeneration_mode == "planner_final_img2img"
+    if (isinstance(planner_fidelity_strength, bool)
+            or not isinstance(planner_fidelity_strength, (int, float))
+            or not math.isfinite(planner_fidelity_strength)
+            or not 0.0 <= planner_fidelity_strength <= 1.0):
+        raise ValueError("planner_fidelity_strength must be finite and within [0, 1]")
+    if not img2img and planner_fidelity_strength != 0.0:
+        raise ValueError("planner_fidelity_strength requires planner_final_img2img")
     if img2img:
         if (config.lock_strength != 0.0 or config.mid_strength != 0.0 or config.spatial_mask is not None
                 or config.manifold_enabled):
@@ -1768,6 +1874,7 @@ def run_scale_locked_ksampler(
             detail_seed=detail_seed, stochastic_seed=planner_seed,
             nested_noise_strength=nested_noise_strength, noise_mode=noise_mode,
             stage_hw=tuple(stage_hw), start_sigma=img2img_start_sigma,
+            planner_fidelity_strength=planner_fidelity_strength,
             sampler_options=sampler_options, diagnostics=diagnostics,
         )
 

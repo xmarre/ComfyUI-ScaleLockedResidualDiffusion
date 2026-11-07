@@ -594,3 +594,34 @@ def test_img2img_continuous_start_obeys_original_exact_points():
 def test_img2img_start_index_rejects_start_at_first_sigma():
     with pytest.raises(ValueError, match="first schedule sigma"):
         runtime.img2img_start_index([0.9, 0.5, 0.0], 0.95)
+
+
+@pytest.mark.parametrize("low_hw,high_hw", [
+    ((8, 8), (13, 13)), ((8, 6), (15, 12)), ((8, 8), (20, 20)),
+])
+@pytest.mark.parametrize("layout", ["bchw", "bc1hw"])
+def test_planner_latent_consistency_exact_lowband_and_nullspace(low_hw, high_hw, layout):
+    import torch.nn.functional as F
+    gen = torch.Generator().manual_seed(123)
+    planner = torch.randn((2, 4, *low_hw), generator=gen)
+    target = torch.randn((2, 4, *high_hw), generator=gen)
+    if layout == "bc1hw":
+        planner, target = planner.unsqueeze(2), target.unsqueeze(2)
+    saved = target.clone()
+    constraint = runtime.PlannerLatentConsistency(planner, high_hw, target.device)
+    assert torch.equal(constraint.apply(target, 0.0), target)
+    complete = constraint.apply(target, 1.0)
+    halfway = constraint.apply(target, 0.5)
+    assert complete.shape == target.shape
+    assert torch.equal(target, saved)
+    if layout == "bc1hw":
+        planner, target, complete, halfway = (
+            x.squeeze(2) for x in (planner, target, complete, halfway)
+        )
+    full_low = F.interpolate(complete, size=low_hw, mode="area")
+    half_low = F.interpolate(halfway, size=low_hw, mode="area")
+    raw_low = F.interpolate(target, size=low_hw, mode="area")
+    torch.testing.assert_close(full_low, planner, atol=3e-5, rtol=3e-5)
+    torch.testing.assert_close(
+        half_low - planner, 0.5 * (raw_low - planner), atol=3e-5, rtol=3e-5
+    )
