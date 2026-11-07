@@ -63,7 +63,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: xmarre/ComfyUI-Spectrum-Krea2
-          ref: d3eef896ce83b62dbbcb4fa020d12ffb33651845
+          ref: 7c6ec5860473bc6b2f89c4af3c783ebc33ba13da
           path: _spectrum
       - name: Check out audited KJNodes preview wrapper
         uses: actions/checkout@v4

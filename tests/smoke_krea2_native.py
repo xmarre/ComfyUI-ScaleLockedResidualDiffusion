@@ -396,6 +396,36 @@ def main():
         assert all(r["sa_pece_skipped_predictions"] > 0 for r in accelerated[1:]), accelerated
         print(json.dumps({"case": "sa_pece_balanced_ladder", "reports": accelerated}))
 
+        # The optional detail probe must retain the exact same native
+        # predictor/corrector call budget and stochastic-noise routing while
+        # avoiding the hard secant-to-hold discontinuity at late log-SNR steps.
+        detail = SpectrumApplyKrea2().apply(
+            model, preset="turbo", warmup=2, tail=1, bootstrap=False,
+            extrapolation_guard_enabled=False,
+            sa_pece_forecast_policy="balanced_detail",
+        )[0]
+        _, detail_reports, _ = controls(
+            detail, "sa_solver_pece", "simple", 1.0, 12, False,
+            latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
+        )
+        assert len(detail_reports) == 3, detail_reports
+        for prior, changed in zip(accelerated, detail_reports):
+            assert changed["fallback"] is None
+            assert changed["actual"] == prior["actual"]
+            assert changed["forecast"] == prior["forecast"]
+            assert changed["pece_corrector_evaluations"] == prior["pece_corrector_evaluations"]
+            assert changed["sa_pece_skipped_predictions"] == prior["sa_pece_skipped_predictions"]
+            assert changed["sa_pece_forecast_policy"] == "balanced_detail"
+            assert changed["sa_dense_modes"]["soft_extrapolation"] > 0, changed
+        # Every previously held final-stage predictor has a bounded, continuous
+        # corrected-endpoint surrogate; none comes from a raw stochastic forecast.
+        assert accelerated[-1]["sa_dense_modes"]["guard_hold"] == 4, accelerated
+        assert detail_reports[-1]["sa_dense_modes"]["guard_hold"] == 0, detail_reports
+        assert detail_reports[-1]["sa_dense_modes"]["soft_extrapolation"] == 4, detail_reports
+        print(json.dumps({"case": "sa_pece_balanced_detail_ladder",
+                          "reports": detail_reports}))
+
+
     if reports_context is not None:
         # This is the exact quality-isolation path used by the new widget:
         # native SA/PECE plus the same Scale-Locked stages, but 0 forecasts.
