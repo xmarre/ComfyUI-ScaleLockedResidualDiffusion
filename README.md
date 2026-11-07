@@ -214,8 +214,10 @@ runtime and does not load weights independently.
     the finished latent of the stage below (the planner for the first stage),
     and native ComfyUI sampling re-noises it to the start sigma `s`:
     `x = s * noise + (1 - s) * clean`, with `clean` the resized latent in the
-    model's internal space (`process_latent_in`) and `noise` the same
-    patch-coupled Gaussian field the trajectory mode uses at that seed. The
+    model's internal space (`process_latent_in`) and `noise` a fresh,
+    seed-deterministic Gaussian field for each stage, independent of the
+    Gaussian field that generated its clean source. The same patch-coupled
+    *algorithm* lifts that fresh field to the stage resolution. The
     selected native solver then runs from `s` to zero from a fresh start: no
     multistep history, PECE correction, planner trajectory prediction or
     composition lock is carried into it. `composition_lock_sigma` is not used

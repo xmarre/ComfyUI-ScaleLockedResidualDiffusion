@@ -28,8 +28,10 @@ high-resolution stage then starts from a finished image:
    solver history are not used.
 2. The source is resized to the stage size in latent output space. Native
    ComfyUI sampling applies `process_latent_in` and the model's flow noise
-   scaling, `x = s * noise + (1 - s) * clean`. `noise` is the patch-coupled
-   Gaussian field the trajectory mode uses for that stage and seed.
+   scaling, `x = s * noise + (1 - s) * clean`. Each stage uses a fresh,
+   seed-deterministic Gaussian field independent of the noise that generated
+   its finished source. The field is lifted with the existing patch-coupled
+   algorithm; it is not the same realization as trajectory-mode noise.
 3. `s` is the first sigma of the node's normal schedule at or below
    `img2img_start_sigma`. This is the KSamplerAdvanced `start_at_step` rule.
    The schedule is not rescaled, and the effective sigma and the number of

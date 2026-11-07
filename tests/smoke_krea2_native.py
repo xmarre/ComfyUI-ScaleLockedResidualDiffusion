@@ -794,15 +794,22 @@ def main():
             trajectory = controls(model, sampler_name, "simple", 1.0, steps, False,
                                   latent=torch.zeros(1, 4, *latent_hw), **stage_options)[0]
             assert torch.equal(trajectory[1]["samples"], planner), sampler_name
-            lowres_noise = runtime.prepare_noise(torch.zeros(planner.shape), 42)
-            noise = lowres_noise
+            planner_noise = runtime.prepare_noise(torch.zeros(planner.shape), 42)
+            roots = []
             assert len(stages) == len(sizes), (sampler_name, len(stages))
             for index, (stage, hw) in enumerate(zip(stages, sizes)):
                 final = index == len(sizes) - 1
                 seed = detail_seed if final else runtime._stage_seed(detail_seed, index)
+                root = runtime.prepare_noise(
+                    torch.zeros(planner.shape), runtime._img2img_root_seed(42, index))
+                # A finished source depends on its generating noise. Reusing
+                # that noise violates the independent forward corruption
+                # required for img2img; distinct stages need distinct roots.
+                assert not torch.equal(root, planner_noise)
+                assert all(not torch.equal(root, previous) for previous in roots)
+                roots.append(root)
                 noise = runtime._build_highres_noise(
-                    {"samples": torch.zeros(planner.shape[:-2] + hw)}, noise, seed, 1.0, "patch_coupled")
-                # Patch-coupled noise chain and seeds match the trajectory ladder's.
+                    {"samples": torch.zeros(planner.shape[:-2] + hw)}, root, seed, 1.0, "patch_coupled")
                 assert torch.equal(stage["noise"].cpu(), noise), (sampler_name, index)
                 assert torch.equal(stage["sigmas"], schedule[start:].to(stage["sigmas"].dtype)), sampler_name
                 # Source: the finished planner, then each finished stage below.

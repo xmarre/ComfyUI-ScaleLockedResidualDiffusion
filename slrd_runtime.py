@@ -1363,6 +1363,11 @@ REGENERATION_MODES = ("trajectory", "planner_final_img2img")
 HANDOFF_DIAGNOSTIC_MODES = ("off", "log", "log_and_save_latents")
 
 
+def _img2img_root_seed(seed: int, stage_index: int) -> int:
+    """Separate each img2img stage's fresh noise from planner and other stages."""
+    return _stage_seed(int(seed) ^ 0xA24BAED4963EE407, stage_index)
+
+
 def img2img_start_index(sigma_values, start_sigma: float) -> int:
     """Schedule index where planner-final img2img refinement starts.
 
@@ -1535,7 +1540,8 @@ def _run_planner_final_img2img(
     """Img2img refinement of the finished planner image at each stage.
 
     Every stage resizes the finished latent of the stage below (the planner
-    for the first one), and the native sampler re-noises it to the exact
+    for the first one), and the native sampler adds fresh stage-specific noise
+    independent of the source image, at the exact
     schedule sigma ``sigmas[k]`` through ``CFGGuider.inner_sample`` and the
     model's ``noise_scaling``: ``x = sigma_k * s * noise + (1 - sigma_k) * clean``
     with ``clean = process_latent_in(resized)`` and the patch-coupled noise
@@ -1569,7 +1575,6 @@ def _run_planner_final_img2img(
     shapes = tuple(tuple(lowres_noise.shape[:-2]) + tuple(hw) for hw in sizes)
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
     source = lowres_out["samples"]  # finished planner, output latent space
-    stage_noise = lowres_noise
     x0_output: dict = {}
     if diagnostics is not None:
         diagnostics.set_planner(source)
@@ -1579,9 +1584,20 @@ def _run_planner_final_img2img(
         stage_latent = highres_latent if final else resize_latent_dict(highres_latent, hw)
         stage_samples = stage_latent["samples"]
         seed = detail_seed if final else _stage_seed(detail_seed, index)
+        # Img2img forward noise must not be the Gaussian field that generated
+        # the clean source. The planner and preceding stage outputs depend on
+        # their earlier noise, so reusing it would not sample independent
+        # q(x_sigma | clean) noise. Give every stage a fresh deterministic
+        # low-resolution root while retaining the patch-coupled spatial lift.
+        fresh_root = prepare_noise(
+            lowres_latent["samples"],
+            seed=_img2img_root_seed(stochastic_seed, index),
+            batch_inds=lowres_latent.get("batch_index"),
+            disable_noise=False,
+        ).to(device=stage_samples.device, dtype=stage_samples.dtype, non_blocking=True)
         stage_noise = _build_highres_noise(
             highres_latent=stage_latent,
-            lowres_noise=stage_noise,
+            lowres_noise=fresh_root,
             seed=seed,
             hf_strength=nested_noise_strength,
             mode=noise_mode,
