@@ -247,13 +247,13 @@ def test_sa_stage_order_cap_applies_only_to_target_passes():
     node.sample(*args, sampler_name="sa_solver", sa_predictor_order=3, sa_corrector_order=4)
     planner, target = calls[-1]["sampler_options"], calls[-1]["target_sampler_options"]
     assert (planner["predictor_order"], planner["corrector_order"]) == (3, 4)
-    assert (target["predictor_order"], target["corrector_order"]) == (1, 0)
+    assert (target["predictor_order"], target["corrector_order"]) == (1, 4)
     assert {k: v for k, v in target.items() if not k.endswith("_order")} == {
         k: v for k, v in planner.items() if not k.endswith("_order")}
-    node.sample(*args, sampler_name="sa_solver", sa_predictor_order=3, sa_corrector_order=4,
+    node.sample(*args, sampler_name="sa_solver", sa_predictor_order=5, sa_corrector_order=4,
                 sa_stage_max_order=3)
     target = calls[-1]["target_sampler_options"]
-    assert (target["predictor_order"], target["corrector_order"]) == (3, 2)
+    assert (target["predictor_order"], target["corrector_order"]) == (3, 4)
     # 6 leaves the user's orders untouched; PECE and other solvers never cap.
     node.sample(*args, sampler_name="sa_solver", sa_stage_max_order=6)
     assert calls[-1]["target_sampler_options"] is None
