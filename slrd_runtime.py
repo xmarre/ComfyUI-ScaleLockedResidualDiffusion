@@ -1439,8 +1439,10 @@ class Krea2HandoffDiagnostics:
         if self.directory is None:
             import os
             import time
+            import uuid
             import folder_paths
-            name = f"krea2_handoff_{time.strftime('%Y%m%d-%H%M%S')}_seed{self.seed}_{self.regeneration_mode}"
+            name = (f"krea2_handoff_{time.strftime('%Y%m%d-%H%M%S')}_seed{self.seed}_"
+                    f"{self.regeneration_mode}_{uuid.uuid4().hex[:8]}")
             self.directory = os.path.join(folder_paths.get_output_directory(), "scale_locked_diagnostics", name)
             os.makedirs(self.directory, exist_ok=True)
         return self.directory
@@ -1692,8 +1694,10 @@ def run_scale_locked_ksampler(
         return ScaleLockedSampleResult(output=out, lowres_planner=clean_latent(lowres_latent), denoised_output=out)
 
     if img2img:
-        # Reject an unusable start sigma before spending the planner pass.
+        # Reject unusable configurations before spending the planner pass.
         img2img_start_index(sigmas.tolist(), img2img_start_sigma)
+        if isinstance(highres_latent.get("noise_mask"), torch.Tensor):
+            raise ValueError("planner_final_img2img does not support latent noise masks")
     disable_noise = not bool(add_noise)
     planner_seed = int(seed)
     detail_seed = int(seed) ^ 0x9E3779B97F4A7C15

@@ -904,6 +904,19 @@ def main():
         finally:
             hook.remove()
         assert not calls
+    calls.clear()
+    hook = base.diffusion_model.register_forward_pre_hook(lambda module, args: calls.append(1))
+    try:
+        node.sample(model, positive, negative,
+                    {"samples": torch.zeros(1, 4, 16, 20), "noise_mask": torch.ones(1, 16, 20)},
+                    42, .01, 0.0, 0.0, steps=8, regeneration_mode="planner_final_img2img")
+    except ValueError as exc:
+        assert "noise masks" in str(exc), exc
+    else:
+        raise AssertionError("latent noise masks must be rejected in img2img mode")
+    finally:
+        hook.remove()
+    assert not calls, "the planner must not run for a rejected img2img configuration"
     try:
         node.sample(model, positive, negative, {"samples": torch.zeros(1, 4, 16, 20)}, 42, .01, 0.2, 0.0,
                     steps=8, regeneration_mode="planner_final_img2img")

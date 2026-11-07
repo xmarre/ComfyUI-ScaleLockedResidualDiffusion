@@ -203,6 +203,65 @@ runtime and does not load weights independently.
   Nonzero values were observed to double fine contours and soften texture,
   and are kept only for experiments. `composition_lock_sigma` is a starting
   value, not a calibrated optimum.
+- **Regeneration mode** (`regeneration_mode`, optional, default
+  `trajectory`) selects how the first high-resolution stage starts.
+  - `trajectory` is the behavior described above: above
+    `composition_lock_sigma` the first high-resolution stage follows the
+    planner's denoising trajectory (its intermediate denoised predictions),
+    then refines freely.
+  - `planner_final_img2img` runs the planner to completion and treats its
+    finished latent as an image to refine. Each high-resolution stage resizes
+    the finished latent of the stage below (the planner for the first stage),
+    and native ComfyUI sampling re-noises it to the start sigma `s`:
+    `x = s * noise + (1 - s) * clean`, with `clean` the resized latent in the
+    model's internal space (`process_latent_in`) and `noise` the same
+    patch-coupled Gaussian field the trajectory mode uses at that seed. The
+    selected native solver then runs from `s` to zero from a fresh start: no
+    multistep history, PECE correction, planner trajectory prediction or
+    composition lock is carried into it. `composition_lock_sigma` is not used
+    in this mode, and `coarse_lock_strength` and `mid_lock_strength` must be 0
+    (nonzero values are rejected). All ten samplers and Spectrum forecasting
+    are supported; latent noise masks are rejected.
+  - `img2img_start_sigma` (default 0.65, planner-final mode only) chooses `s`.
+    Refinement resumes at the first sigma of the node's normal schedule at or
+    below this value, the same rule as KSamplerAdvanced's `start_at_step`; the
+    schedule is never rescaled, and the effective sigma and step count are
+    logged. Lower values keep more of the finished image and leave less room
+    for structural change, but also leave fewer high-resolution steps; raise
+    `steps` for more. Higher values regenerate more. Neither setting
+    guarantees correct anatomy. With Krea 2's schedule (simple scheduler):
+
+    | `steps` | start 0.45 | start 0.65 | start 0.75 |
+    |---|---|---|---|
+    | 14 | sigma 0.345, 2 steps | sigma 0.637, 5 steps | sigma 0.703, 6 steps |
+    | 20 | sigma 0.441, 4 steps | sigma 0.630, 7 steps | sigma 0.721, 9 steps |
+
+    Each stage evaluates the model once per remaining step (SA-Solver PECE
+    also evaluates its corrections), the same per-stage cost as the trajectory
+    mode at an equal release sigma.
+  - The mode has been checked only on a small random CPU model for execution
+    and initialization correctness. Whether it preserves a real planner image
+    better than the trajectory mode is not yet established: compare both
+    modes at the same seed, prompt, sizes, sampler and steps, with the
+    `lowres_planner` output as the reference.
+- **Handoff diagnostics** (`handoff_diagnostics`, optional, default `off`)
+  work in both modes and never change the sampled result. `log` reports, for
+  every high-resolution step: the sigma, whether the step was
+  composition-locked, how far the denoised prediction is from the finished
+  planner on the planner grid (`x0_vs_planner_lowband`), how far the state's
+  clean component `(x - sigma * noise) / (1 - sigma)` is from the finished
+  planner (`state_clean_vs_planner_lowband`) and from the stage's resized
+  source (`state_clean_vs_stage_source`, about 0 at the start of a
+  planner-final stage by construction), and the prediction's distance from
+  the resized source (`x0_vs_stage_source`). Relative errors are L2-norm
+  ratios. The clean-component metrics are exact at the start of each stage
+  and for deterministic solvers; steps after stochastic noise injection
+  include that noise. `log_and_save_latents` also writes the finished
+  planner, each stage's starting state (and, in trajectory mode, the state at
+  the lock release), and every denoised prediction as `.latent` files under
+  `output/scale_locked_diagnostics/`. Load them with LoadLatent and VAE Decode
+  to see the actual tensors that the live preview approximates. Nothing is
+  decoded inside the sampler.
 - The `output` is the high-resolution LATENT, `lowres_planner` is the planner
   LATENT, and `denoised_output` is the available final x0 preview LATENT.
 
