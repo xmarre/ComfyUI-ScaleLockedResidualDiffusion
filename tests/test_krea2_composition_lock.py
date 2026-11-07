@@ -638,3 +638,13 @@ def test_planner_consistency_follows_target_device():
         assert projected.device.type == "meta" and tuple(projected.shape) == layout
     cpu = torch.randn(1, 16, 10, 14)
     assert projection.relative_error(projection.apply(cpu, 1.0)) < 1e-5
+
+
+def test_planner_consistency_cache_keys_follow_actual_projection_device():
+    # Construction may copy a CPU planner to the target load device. The
+    # initial cache key must identify the moved tensors, not its CPU source.
+    # The meta device tests this mismatch without requiring a GPU runner.
+    projector = runtime.PlannerLatentConsistency(
+        torch.randn(1, 16, 6, 8), (10, 14), torch.device("meta"))
+    assert set(projector._by_device) == {torch.device("meta")}
+    assert all(t.device.type == "meta" for t in projector._by_device[torch.device("meta")])

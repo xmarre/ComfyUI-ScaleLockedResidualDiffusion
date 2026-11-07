@@ -1567,7 +1567,7 @@ class PlannerLatentConsistency:
         self.target_hw = tuple(map(int, target_hw))
         self.p_h = self._right_inverse(self.low_hw[0], self.target_hw[0], device)
         self.p_w = self._right_inverse(self.low_hw[1], self.target_hw[1], device)
-        self._by_device = {reference.device: (self.reference, self.p_h, self.p_w)}
+        self._by_device = {self.reference.device: (self.reference, self.p_h, self.p_w)}
 
     def _operands(self, device: torch.device):
         # The stage latent may live on the intermediate (CPU) device while the
