@@ -246,31 +246,24 @@ runtime and does not load weights independently.
     Each stage evaluates the model once per remaining step (SA-Solver PECE
     also evaluates its corrections), the same per-stage cost as the trajectory
     mode at an equal release sigma.
-  - **Experimental planner consistency** (`planner_fidelity_strength`,
-    optional appended widget, default **0**) applies only in
-    `planner_final_img2img`. At nonzero strength, every target x0 prediction
-    and completed resolution stage is projected toward the finished planner's
-    **area-downsampled latent measurements**. At strength 1 the result
-    downscales to the planner latent to numerical precision. Strength 0 leaves
-    original regeneration unchanged.
-  - **Planner detail strength** (`planner_detail_strength`, appended optional
-    widget, default **0.20**) controls the portion of target-generated
-    high-resolution detail retained relative to the *finished preceding
-    stage*. It is active only with nonzero `planner_fidelity_strength` in
-    `planner_final_img2img`. The previous lowband-only projection preserved
-    all of the model's unconstrained high-resolution residual, which could
-    create ghosted faces and duplicated contours despite perfect planner
-    measurement agreement. The revised projection removes a fraction
-    `1 - planner_detail_strength` of this **source-relative nullspace
-    residual**, leaving the separate planner measurement strength unchanged.
-    `0` preserves the source's latent detail (often softer), `0.20`
-    cautiously allows some new detail, and `1` restores the previous
-    unconstrained-detail experimental behavior. The completed stage is treated
-    the same way as each denoised prediction, so multistage regeneration cannot
-    bypass the bound. The constraint is mathematical, not semantic: correct
-    anatomy or absence of hallucinations is not guaranteed. It adds latent
-    tensor operations but no extra DiT evaluations; large-image visual testing
-    is still required.
+  - **Retired planner-fidelity experiment**: the optional
+    `planner_fidelity_strength` and `planner_detail_strength` widgets are
+    retained at their existing positions to avoid remapping older saved
+    workflows. `planner_fidelity_strength` **must remain 0**: nonzero values
+    fail before sampling. Real Krea 2 images exposed severe ghosting at
+    full planner measurement fidelity, including when the added detail
+    strength was zero. `planner_detail_strength` is inactive at fidelity 0.
+    A correct latent downsampling measurement does **not** guarantee a
+    correctly decoded or anatomically faithful image. No projection is
+    performed in the active modes.
+  - To distinguish latent-resize damage from model-generated damage, enable
+    `handoff_diagnostics=log_and_save_latents`: besides the finished planner,
+    noisy handoff states and denoised steps, each resolution stage now saves
+    `stageN_source_resized.latent` in the same diagnostics directory.
+    Decode the resized clean source with the **same VAE** as the final result.
+    If it already contains duplicated geometry, that occurs before the
+    high-resolution diffusion pass; the latent interpolation itself is
+    unsuitable for a fidelity-preserving handoff.
   - The mode has been checked only on a small random CPU model for execution
     and initialization correctness. Whether it preserves a real planner image
     better than the trajectory mode is not yet established: compare both

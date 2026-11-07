@@ -860,60 +860,17 @@ def main():
         high_first = next(x for x, _ in high_inputs if tuple(x.shape[-2:]) == target_hw)
         assert not torch.equal(low_first, high_first), sampler_name
 
-    # A native-model regression: enforce the planner low-frequency measurement
-    # at each stage, with no change to the planner, native solver, or number
-    # of denoiser evaluations. Both direct and multi-stage paths are checked.
-    for solver in ("euler", "sa_solver"):
-        for stage_options, shape in (({"max_stage_upscale": 0.0}, (16, 20)),
-                                     ({"stage_megapixels": "0.02"}, (24, 28))):
-            plain, _, _, _ = img2img(model, solver, 8, latent_hw=shape, **stage_options)
-            guided, _, stages, _ = img2img(
-                model, solver, 8, latent_hw=shape,
-                planner_fidelity_strength=1.0, **stage_options)
-            assert torch.equal(plain[1]["samples"], guided[1]["samples"])
-            assert torch.equal(guided[0]["samples"], guided[2]["samples"])
-            downsampled = runtime.resize_4d_tensor(
-                guided[0]["samples"].float(),
-                tuple(guided[1]["samples"].shape[-2:]))
-            torch.testing.assert_close(downsampled, guided[1]["samples"].float(),
-                                       rtol=8e-4, atol=8e-4)
-            assert len(stages) == (2 if "stage_megapixels" in stage_options else 1)
-            assert all(torch.isfinite(v["samples"]).all() for v in guided)
-
-    # High-resolution nullspace is unbounded with fidelity alone. The new
-    # detail control must deterministically limit source-relative innovations
-    # without changing native solver-call budgets or the finished planner.
-    for solver in ("euler", "sa_solver"):
-        full, _, full_stages, full_inputs = img2img(
-            model, solver, 8, planner_fidelity_strength=1.0,
-            planner_detail_strength=1.0, capture_inputs=True)
-        bounded, _, bounded_stages, bounded_inputs = img2img(
-            model, solver, 8, planner_fidelity_strength=1.0,
-            planner_detail_strength=0.2, capture_inputs=True)
-        source_only, _, _, _ = img2img(
-            model, solver, 8, planner_fidelity_strength=1.0,
-            planner_detail_strength=0.0)
-        assert torch.equal(full[1]["samples"], bounded[1]["samples"])
-        assert torch.equal(full[1]["samples"], source_only[1]["samples"])
-        assert torch.equal(full_stages[0]["noise"], bounded_stages[0]["noise"])
-        assert len(full_inputs) == len(bounded_inputs)
-        assert not torch.equal(full[0]["samples"], bounded[0]["samples"])
-        assert not torch.equal(bounded[0]["samples"], source_only[0]["samples"])
-        for result in (full, bounded, source_only):
-            planner = result[1]["samples"]
-            down = runtime.resize_4d_tensor(
-                result[0]["samples"].float(), tuple(planner.shape[-2:]))
-            torch.testing.assert_close(down, planner.float(), atol=8e-4, rtol=8e-4)
-
-    # A zero fidelity value must completely ignore the detail control.
-    for detail in (0.0, 1.0):
-        zero_fidelity, _, _, _ = img2img(
+    # Retired fidelity projection must reject all nonzero settings before
+    # planner execution; legacy detail widget values remain a no-op at
+    # fidelity=0 for saved workflows.
+    for detail in (0.0, 0.2, 1.0):
+        result, _, _, _ = img2img(
             model, "euler", 8, planner_fidelity_strength=0.0,
             planner_detail_strength=detail)
         if detail == 0.0:
-            baseline_zero_fidelity = zero_fidelity
+            baseline_zero_fidelity = result
         else:
-            for a, b in zip(baseline_zero_fidelity, zero_fidelity):
+            for a, b in zip(baseline_zero_fidelity, result):
                 assert torch.equal(a["samples"], b["samples"])
 
     # Explicit trajectory mode ignores the img2img sigma and equals the default.
@@ -960,6 +917,16 @@ def main():
                         state = safetensors.torch.load_file(
                             next(p for p in diag.saved if p.endswith("stage0_step000_state.latent")))
                         assert "latent_format_version_0" in state
+                        source_path = next(p for p in diag.saved
+                                           if p.endswith("stage0_source_resized.latent"))
+                        source_saved = safetensors.torch.load_file(source_path)["latent_tensor"]
+                        source_expected = runtime.resize_4d_tensor(
+                            observed[1]["samples"].float(),
+                            tuple(stages[0]["latent"].shape[-2:]),
+                        )
+                        torch.testing.assert_close(source_saved, source_expected)
+                        assert any(p.endswith("stage1_source_resized.latent")
+                                   for p in diag.saved)
                         expected_state = base.process_latent_out(
                             stages[0]["sigmas"][0] * stages[0]["noise"]
                             + (1 - stages[0]["sigmas"][0]) * base.process_latent_in(stages[0]["latent"].float()))
@@ -973,6 +940,24 @@ def main():
     finally:
         folder_paths.set_output_directory(previous_output)
         runtime.Krea2HandoffDiagnostics = original_diagnostics
+
+    # Disable the mathematically degenerate fidelity projection before
+    # running the planner, regardless of retained saved-workflow controls.
+    calls.clear()
+    hook = base.diffusion_model.register_forward_pre_hook(
+        lambda module, args: calls.append(1))
+    try:
+        node.sample(model, positive, negative,
+                    {"samples": torch.zeros(1, 4, 16, 20)}, 42, .01, 0.0, 0.0,
+                    steps=8, regeneration_mode="planner_final_img2img",
+                    planner_fidelity_strength=1.0)
+    except ValueError as exc:
+        assert "disabled after real Krea 2 checkpoint" in str(exc), exc
+    else:
+        raise AssertionError("visually broken planner-fidelity projection must be disabled")
+    finally:
+        hook.remove()
+    assert not calls
 
     # Invalid img2img configurations fail before any model evaluation.
     for extra, message in (({"img2img_start_sigma": .01}, "no usable refinement"),

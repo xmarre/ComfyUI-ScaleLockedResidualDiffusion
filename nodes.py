@@ -327,16 +327,13 @@ class Krea2TurboFlowAlignedRegenerate:
                                "state and every denoised prediction as .latent files under "
                                "output/scale_locked_diagnostics for LoadLatent + VAE Decode. Sampling is unchanged."}),
                 "planner_fidelity_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Experimental, planner_final_img2img only. 0 leaves sampling unchanged. "
-                               "At 1, enforces the completed planner's low-resolution latent measurements. "
-                               "This alone does not preserve fine anatomy; planner_detail_strength also bounds "
-                               "the high-resolution residual that previously caused severe ghosting."}),
+                    "tooltip": "DISABLED: real-checkpoint testing showed severe duplicated anatomy even when "
+                               "latent lowband errors were zero. Retained only to preserve previously saved "
+                               "workflow widget ordering. Must remain 0; nonzero is rejected before sampling."}),
                 "planner_detail_strength": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Experimental, active when planner_fidelity_strength > 0 in planner_final_img2img. "
-                               "Fraction of newly generated high-resolution detail permitted relative to the "
-                               "preceding finished stage. 0 preserves its finer latent structure (can be soft); "
-                               "1 reproduces the earlier unconstrained-detail projection, which can ghost or "
-                               "duplicate faces. Start at 0.20, increase only if the structure remains stable."}),
+                    "tooltip": "INACTIVE compatibility widget from the disabled planner-fidelity experiment. "
+                               "Retained only for saved workflow ordering. It has no effect while fidelity is 0. "
+                               "Original trajectory and planner-final img2img modes remain available."}),
             },
         }
 
@@ -386,8 +383,11 @@ class Krea2TurboFlowAlignedRegenerate:
                 or not math.isfinite(planner_fidelity_strength)
                 or not 0.0 <= planner_fidelity_strength <= 1.0):
             raise ValueError("planner_fidelity_strength must be finite and within [0, 1]")
-        if not img2img and planner_fidelity_strength != 0.0:
-            raise ValueError("planner_fidelity_strength requires planner_final_img2img")
+        if planner_fidelity_strength != 0.0:
+            raise ValueError(
+                "planner_fidelity_strength was disabled after real Krea 2 checkpoint "
+                "tests showed severe duplicated anatomy. Set it to 0."
+            )
         if (isinstance(planner_detail_strength, bool)
                 or not isinstance(planner_detail_strength, (int, float))
                 or not math.isfinite(planner_detail_strength)

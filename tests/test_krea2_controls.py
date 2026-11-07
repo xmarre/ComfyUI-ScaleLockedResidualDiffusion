@@ -310,11 +310,12 @@ def test_img2img_rejects_nonzero_trajectory_lock_strengths(index):
 
 
 @pytest.mark.parametrize("strength", [0.25, 0.6, 1.0])
-def test_planner_fidelity_strength_routes_only_img2img(strength):
+def test_disabled_planner_fidelity_rejected_before_sampling(strength):
     node, calls, args = _node()
-    node.sample(*args, regeneration_mode="planner_final_img2img",
-                planner_fidelity_strength=strength)
-    assert calls[-1]["planner_fidelity_strength"] == strength
+    with pytest.raises(ValueError, match="disabled after real Krea 2 checkpoint"):
+        node.sample(*args, regeneration_mode="planner_final_img2img",
+                    planner_fidelity_strength=strength)
+    assert not calls
 
 
 @pytest.mark.parametrize("strength", [-1.0, 1.1, float("nan"), True])
@@ -328,7 +329,7 @@ def test_planner_fidelity_invalid_rejected_before_sampling(strength):
 
 def test_planner_fidelity_nonzero_rejected_in_trajectory():
     node, calls, args = _node()
-    with pytest.raises(ValueError, match="requires planner_final_img2img"):
+    with pytest.raises(ValueError, match="disabled after real Krea 2 checkpoint"):
         node.sample(*args, planner_fidelity_strength=0.5)
     assert not calls
 
@@ -337,9 +338,9 @@ def test_planner_fidelity_nonzero_rejected_in_trajectory():
 def test_planner_detail_strength_routes_without_modifying_other_controls(detail):
     node, calls, args = _node()
     node.sample(*args, regeneration_mode="planner_final_img2img",
-                planner_fidelity_strength=1.0, planner_detail_strength=detail)
+                planner_fidelity_strength=0.0, planner_detail_strength=detail)
     assert calls[-1]["planner_detail_strength"] == detail
-    assert calls[-1]["planner_fidelity_strength"] == 1.0
+    assert calls[-1]["planner_fidelity_strength"] == 0.0
 
 
 @pytest.mark.parametrize("detail", [-0.1, 1.1, float("nan"), True])
@@ -347,5 +348,5 @@ def test_invalid_planner_detail_rejected_before_sampling(detail):
     node, calls, args = _node()
     with pytest.raises(ValueError, match="planner_detail_strength"):
         node.sample(*args, regeneration_mode="planner_final_img2img",
-                    planner_fidelity_strength=1.0, planner_detail_strength=detail)
+                    planner_fidelity_strength=0.0, planner_detail_strength=detail)
     assert not calls

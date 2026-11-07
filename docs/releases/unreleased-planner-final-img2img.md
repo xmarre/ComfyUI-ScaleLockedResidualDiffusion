@@ -58,37 +58,31 @@ also leave fewer high-resolution steps. Raise `steps` for more. Each stage
 costs one model evaluation per remaining step (SA-Solver PECE also evaluates
 its corrections).
 
-## Experimental planner consistency projection
+## Retired fidelity projection after real-checkpoint image-quality failure
 
-The high-resolution model can change a completed planner's geometry even
-when it begins from correctly re-noised clean latent data. A
-`planner_fidelity_strength` above zero constrains its denoised predictions
-to preserve the finished planner under the latent area-downsampling operator.
-The constraint uses the minimum-L2 pseudoinverse of the separable adaptive
-area downsampler. Strength 1 enforces agreement to floating-point precision;
-strength 0 is a complete no-op. The completed stage is projected again to
-avoid multistep solvers passing residual planner drift to the next stage.
+The previously introduced `planner_fidelity_strength` /
+`planner_detail_strength` measurement projection is **disabled**. Real
+Krea 2 renders produced severe duplicated anatomy even when their
+planner-lowband measurement errors approached zero. At fidelity=1 and
+detail=0, the method algebraically cancelled every target model prediction:
+the result was simply a lowband-corrected interpolation of the finished
+planner latent. In this configuration no high-resolution detail generation
+could be retained.
 
-Crucially, exact agreement at the planner resolution leaves an unlimited
-high-resolution nullspace. This permitted severe ghosting in real-checkpoint
-output. The separate `planner_detail_strength` control now constrains the
-**new nullspace innovation relative to the finished preceding stage**,
-without changing planner measurement strength. The operator applied to a
-prediction X relative to the stage source S is:
+Both widgets remain appended for saved-workflow compatibility, but nonzero
+`planner_fidelity_strength` is rejected **before** running the planner.
+`planner_detail_strength` is inactive at fidelity zero. Neither active
+regeneration mode performs the discarded projection.
 
-`X + fidelity * P(planner-D(X)) - (1-detail) * [X-S-P(D(X-S))]`.
-
-At full fidelity, its downsampled result matches the finished planner;
-detail=0 preserves the stage source's existing nullspace, detail=1 restores
-the former unbounded experimental projection. The same operation applies to
-the completed stage before passing it to the next resolution. It adds no
-denoiser evaluations.
-
-This establishes measurable latent-space fidelity and bounded introduction
-of new high-resolution latent features. It cannot guarantee the decoded
-image preserves every anatomical feature; blur, residual ghosting and other
-visual regressions are possible. Real-checkpoint A/B comparisons must
-precede release as a nonzero default for fidelity.
+The correct next experiment is an *independent* VAE decode of the
+interpolated pre-denoising latent. `log_and_save_latents` now saves
+`stageN_source_resized.latent` for every stage alongside the planner,
+noisy starts, and x0 estimates. This is purely observational and adds
+no model calls. It separates a latent-space resize/manifold defect from
+subsequent denoiser hallucinations; it does not itself improve image quality.
+A reliable alternative may require a trained latent-space upsampler,
+an RGB/VAE re-encode handoff, or a reference-trained refinement model.
+None of these alternatives has been verified for this Krea 2 checkpoint.
 
 ## Handoff diagnostics
 
