@@ -555,6 +555,31 @@ def main():
         assert not torch.equal(outcomes[0][0], outcomes[1][0]), label
         assert not torch.equal(outcomes[0][0], outcomes[2][0]), label
         assert not torch.equal(outcomes[1][0], outcomes[2][0]), label
+
+        # ER-SDE controls are intentionally inert when a different solver is
+        # selected. A user switching only er_sde_solver_type during plain SA
+        # will see no output change; pin that behavior to avoid diagnosing it
+        # as leaked numerical settings.
+        plain_sa, plain_reports, _ = controls(
+            selected, "sa_solver", "simple", 1.0, 12, False,
+            latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
+            er_sde_solver_type="ER-SDE",
+        )
+        inert_sa, inert_reports, _ = controls(
+            selected, "sa_solver", "simple", 1.0, 12, False,
+            latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
+            er_sde_solver_type="ODE", er_sde_eta=0.0,
+            er_sde_max_stage=1, er_sde_s_noise=0.0,
+        )
+        for baseline, changed in zip(plain_sa, inert_sa):
+            torch.testing.assert_close(
+                baseline["samples"], changed["samples"], atol=0, rtol=0
+            )
+        if label == "spectrum":
+            assert [(r["actual"], r["forecast"], r["fallback"])
+                    for r in plain_reports] == [
+                    (r["actual"], r["forecast"], r["fallback"])
+                    for r in inert_reports]
         assert not base.diffusion_model._forward_pre_hooks
         assert not base.diffusion_model.last._forward_pre_hooks
         print(json.dumps({
