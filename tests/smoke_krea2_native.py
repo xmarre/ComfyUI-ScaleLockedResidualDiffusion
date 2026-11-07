@@ -338,12 +338,32 @@ def main():
             assert len(reports) == 2 and all(r["fallback"] is None for r in reports), reports
             assert reports[0]["pece_corrector_evaluations"] == 13, reports
             assert reports[1]["denoiser_calls"] == 2 * (14 - locked), reports
-            assert reports[0]["forecast"] > 0 and reports[1]["forecast"] > 0, reports
+            # Conservative default warmup/guard may leave no forecast in
+            # the short unlocked target tail. Correct PECE accounting is
+            # mandatory; forecast availability is configuration-dependent.
+            assert reports[0]["forecast"] > 0, reports
         print(json.dumps({
             "case": label + "_pece", "locked": locked,
             "counts": {f"{h}x{w}": n for (h, w), n in counts.items()},
             "reports": reports,
         }))
+
+    if reports_context is not None:
+        from comfyui_spectrum_krea2.nodes import SpectrumApplyKrea2
+        fast_pece = SpectrumApplyKrea2().apply(
+            model, preset="turbo", warmup=2, tail=1,
+            bootstrap=False, extrapolation_guard_enabled=False,
+        )[0]
+        _, pece_reports, _ = controls(
+            fast_pece, "sa_solver_pece", "simple", 1.0, 20, False,
+            max_stage_upscale=0.0, composition_lock_sigma=0.72,
+        )
+        assert len(pece_reports) == 2, pece_reports
+        assert all(r["fallback"] is None for r in pece_reports), pece_reports
+        assert pece_reports[0]["pece_corrector_evaluations"] == 19
+        assert pece_reports[0]["forecast"] > 0 and pece_reports[1]["forecast"] > 0, pece_reports
+        assert pece_reports[1]["denoiser_calls"] == 16, pece_reports
+        print(json.dumps({"case": "spectrum_pece_20_step_lock", "reports": pece_reports}))
 
     # Native ER-SDE's deterministic ODE mode and stochastic reverse-time mode
     # use the same wrapper, stage planner and evaluation-skipping contract.
