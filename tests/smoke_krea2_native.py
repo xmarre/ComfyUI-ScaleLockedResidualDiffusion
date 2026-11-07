@@ -14,6 +14,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--comfy-root", type=Path, required=True)
     parser.add_argument("--spectrum-root", type=Path)
+    parser.add_argument("--kj-root", type=Path)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(args.comfy_root.resolve()))
@@ -37,6 +38,14 @@ def main():
         for param in base.diffusion_model.parameters():
             param.copy_(torch.randn_like(param) * .02)
     model = comfy.model_patcher.ModelPatcher(base, torch.device("cpu"), torch.device("cpu"))
+    # The separate resolution-selector tests cover the full UI integration.
+    # Loading ComfyUI's top-level nodes.py here would pull in unrelated
+    # optional video/frontend dependencies. Only its canvas cap is needed
+    # by the scale-locked package's resolution selector during import.
+    import types
+    core_nodes = types.ModuleType("nodes")
+    core_nodes.MAX_RESOLUTION = 16384
+    sys.modules.setdefault("nodes", core_nodes)
     spec = importlib.util.spec_from_file_location("slrd_native_smoke", root / "__init__.py", submodule_search_locations=[str(root)])
     package = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = package
@@ -47,9 +56,19 @@ def main():
     cases = [("native", model)]
     reports_context = None
     if args.spectrum_root:
-        sys.path.insert(0, str(args.spectrum_root.resolve()))
-        from comfyui_spectrum_krea2.nodes import SpectrumApplyKrea2
-        from comfyui_spectrum_krea2.runtime import REPORTS
+        # Load Spectrum exactly as ComfyUI loads a custom-node directory: a
+        # path-derived module name, not importable as a top-level package.
+        # Cross-package controls must reach this loaded instance.
+        spectrum_dir = args.spectrum_root.resolve()
+        spectrum_name = str(spectrum_dir).replace(".", "_x_")
+        spectrum_spec = importlib.util.spec_from_file_location(
+            spectrum_name, spectrum_dir / "__init__.py", submodule_search_locations=[str(spectrum_dir)])
+        spectrum_package = importlib.util.module_from_spec(spectrum_spec)
+        sys.modules[spectrum_name] = spectrum_package
+        spectrum_spec.loader.exec_module(spectrum_package)
+        SpectrumApplyKrea2 = sys.modules[spectrum_name + ".comfyui_spectrum_krea2.nodes"].SpectrumApplyKrea2
+        REPORTS = sys.modules[spectrum_name + ".comfyui_spectrum_krea2.runtime"].REPORTS
+        assert "comfyui_spectrum_krea2.runtime" not in sys.modules
         reports_context = REPORTS
         cases.append(("spectrum", SpectrumApplyKrea2().apply(model, preset="turbo")[0]))
     runtime = sys.modules[spec.name + ".slrd_runtime"]
@@ -60,8 +79,12 @@ def main():
         reports = []
         token = reports_context.set(reports) if reports_context is not None else None
         original = runtime._full_lock_handoff
+        original_locked = runtime.locked_planner_prediction
         if not analytic:
+            # Reference: step through the lock with Euler, evaluating the target
+            # model on locked steps and discarding its prediction.
             runtime._full_lock_handoff = lambda *args, **kwargs: None
+            runtime.locked_planner_prediction = lambda *args, **kwargs: None
         calls.clear()
         # Spectrum declines hooked models, so only count calls without it.
         hook = (base.diffusion_model.register_forward_pre_hook(
@@ -75,6 +98,7 @@ def main():
             if hook is not None:
                 hook.remove()
             runtime._full_lock_handoff = original
+            runtime.locked_planner_prediction = original_locked
             if reports_context is not None:
                 reports_context.reset(token)
         target_calls = sum(shape == (16, 20) for shape in calls)
@@ -140,6 +164,553 @@ def main():
             assert not base.diffusion_model._forward_pre_hooks
             print(json.dumps({"case": label + "_ladder", "options": stage_options, "steps_per_pass": steps,
                               "stage_steps": free, "output_shapes": shapes, "reports": reports}))
+
+
+    # The compact Krea sampler's controls must reach genuine ComfyUI
+    # guider/sampler execution. Every solver skips the target model on fully
+    # locked steps: Euler through the closed-form handoff, the others by
+    # integrating the locked prefix natively with the planner predictions.
+    spectrum_forecast = {"euler", "dpmpp_2m", "res_multistep", "gradient_estimation",
+                         "deis", "ipndm", "ipndm_v", "er_sde",
+                         "sa_solver", "sa_solver_pece"}
+    solver_cases = [
+        ("euler", "normal", 1.0),
+        ("euler", "sgm_uniform", 2.0),
+        ("dpmpp_2m", "simple", 1.0),
+        ("dpmpp_2m", "normal", 2.0),
+    ] + [(name, "simple", 1.0) for name in runtime.krea2_sampler_names()
+         if name not in ("euler", "dpmpp_2m")]
+    assert set(runtime.krea2_sampler_names()) == set(runtime.KREA2_SAMPLERS), runtime.krea2_sampler_names()
+
+    def solver_calls(sampler_name, steps):
+        return steps + max(0, steps - 1) if sampler_name == "sa_solver_pece" else steps
+
+    def target_calls(sampler_name, steps, locked):
+        if sampler_name == "sa_solver_pece":
+            # First PECE step has no correction, and all locked corrections
+            # use the corresponding corrected planner anchor without a DiT.
+            return 2 * (steps - locked) if locked else solver_calls(sampler_name, steps)
+        return steps - locked
+
+    def controls(selected, sampler_name, scheduler, cfg, steps, count_calls, evaluate_locked=False, **extra):
+        if sampler_name in ("sa_solver", "sa_solver_pece"):
+            # The existing forecast regression cases remain opt-in. The new
+            # Krea 2 UI defaults to a native-only SA A/B control.
+            extra.setdefault("sa_spectrum_forecasts", True)
+        reports = []
+        token = reports_context.set(reports) if reports_context is not None else None
+        calls.clear()
+        original = runtime.locked_planner_prediction
+        if evaluate_locked:
+            # Reference: evaluate the target model on locked steps and discard it.
+            runtime.locked_planner_prediction = lambda *args, **kwargs: None
+        hook = base.diffusion_model.register_forward_pre_hook(
+            lambda module, args: calls.append(tuple(args[0].shape[-2:]))
+        ) if count_calls else None
+        try:
+            with torch.inference_mode():
+                latent = extra.pop("latent", torch.zeros(1, 4, 16, 20))
+                result = node.sample(
+                    selected, positive, negative, {"samples": latent},
+                    42, .01, 0.0, 0.0,
+                    steps=steps, cfg=cfg, sampler_name=sampler_name,
+                    scheduler=scheduler, **extra,
+                )
+        finally:
+            runtime.locked_planner_prediction = original
+            if hook is not None:
+                hook.remove()
+            if reports_context is not None:
+                reports_context.reset(token)
+        assert all(torch.isfinite(x["samples"]).all() for x in result), sampler_name
+        return result, reports, {shape: calls.count(shape) for shape in set(calls)}
+
+    for label, selected in cases:
+        for sampler_name, scheduler, cfg in solver_cases:
+            steps = 8
+            locked = runtime.full_lock_prefix_length(
+                runtime.calculate_sigmas(selected, scheduler=scheduler, steps=steps, denoise=1.0).tolist(), 0.8)
+            assert 0 < locked < steps, (scheduler, locked)
+            count_calls = label == "native"
+            result, reports, counts = controls(selected, sampler_name, scheduler, cfg, steps, count_calls,
+                                               max_stage_upscale=0.0)
+            assert result[0]["samples"].shape == (1, 16, 1, 16, 20)
+            if count_calls:
+                planner_hw = tuple(result[1]["samples"].shape[-2:])
+                assert counts == {
+                    planner_hw: solver_calls(sampler_name, steps),
+                    (16, 20): target_calls(sampler_name, steps, locked),
+                }, (sampler_name, scheduler, counts)
+                if sampler_name != "euler":
+                    reference, _, reference_counts = controls(
+                        selected, sampler_name, scheduler, cfg, steps, True,
+                        evaluate_locked=True, max_stage_upscale=0.0)
+                    assert reference_counts[(16, 20)] == solver_calls(sampler_name, steps), reference_counts
+                    for fast, slow in zip(result, reference):
+                        # Locked steps discard the target prediction, so skipping
+                        # it must not change any output.
+                        assert torch.equal(fast["samples"], slow["samples"]), sampler_name
+            if label == "spectrum":
+                assert len(reports) == 2, reports
+                assert reports[0]["outer_steps"] == steps
+                expected_outer = steps - locked if sampler_name == "euler" else steps
+                assert reports[1]["outer_steps"] == expected_outer, reports
+                if sampler_name in spectrum_forecast:
+                    assert all(report["fallback"] is None for report in reports), reports
+                    # Skipped locked steps never reach the diffusion model.
+                    assert reports[1]["denoiser_calls"] == target_calls(sampler_name, steps, locked), reports
+                else:
+                    assert all(report["fallback"] for report in reports), reports
+            print(json.dumps({
+                "case": label + "_controls", "sampler": sampler_name,
+                "scheduler": scheduler, "cfg": cfg, "locked_target_steps": locked,
+                "model_calls": {f"{h}x{w}": n for (h, w), n in counts.items()}, "reports": reports,
+            }))
+
+    # The 20-step/0.72-lock case has 12 fully locked and 8 unlocked
+    # target steps. All offered native solvers are forecast-enabled,
+    # independently of the lock's zero-DiT shortcut.
+    if reports_context is not None:
+        aligned = SpectrumApplyKrea2().apply(
+            model, preset="turbo", warmup=2, tail=1, bootstrap=False,
+            extrapolation_guard_enabled=False,
+        )[0]
+        for sampler_name in ("res_multistep", "gradient_estimation",
+                             "deis", "ipndm", "ipndm_v", "er_sde", "sa_solver"):
+            outputs, reports, _ = controls(
+                aligned, sampler_name, "simple", 1.0, 20, False,
+                max_stage_upscale=0.0, composition_lock_sigma=0.72,
+            )
+            assert len(reports) == 2, (sampler_name, reports)
+            assert reports[0]["actual"] == 11 and reports[0]["forecast"] == 9, reports
+            assert reports[1]["outer_steps"] == 20, reports
+            assert reports[1]["denoiser_calls"] == 8, reports
+            assert reports[1]["actual"] == 5 and reports[1]["forecast"] == 3, reports
+            assert all(r["fallback"] is None for r in reports), reports
+            print(json.dumps({
+                "case": "spectrum_20_step_lock",
+                "sampler": sampler_name,
+                "locked_target_steps": 12,
+                "reports": reports,
+            }))
+
+    # Resolution ladders with every solver: planner 12x14 -> stage 16x20 ->
+    # output 24x28. Locked steps cost no model calls in the first stage, and
+    # each later stage restarts the solver at the composition-lock release.
+    for label, selected in cases:
+        for sampler_name in runtime.krea2_sampler_names():
+            steps = 8
+            free = steps - locked_by_steps[steps]
+            result, reports, counts = controls(
+                selected, sampler_name, "simple", 1.0, steps, label == "native",
+                latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02")
+            assert [list(x["samples"].shape) for x in result] == [
+                [1, 16, 1, 24, 28], [1, 16, 1, 12, 14], [1, 16, 1, 24, 28]]
+            if label == "native":
+                assert counts == {
+                    (12, 14): solver_calls(sampler_name, steps),
+                    (16, 20): target_calls(sampler_name, steps, steps - free),
+                    (24, 28): solver_calls(sampler_name, free),
+                }, (sampler_name, counts)
+            else:
+                first = free if sampler_name == "euler" else steps
+                assert [r["outer_steps"] for r in reports] == [steps, first, free], reports
+                if sampler_name in spectrum_forecast:
+                    assert all(r["fallback"] is None for r in reports), reports
+            print(json.dumps({"case": label + "_ladder_solver", "sampler": sampler_name,
+                              "model_calls": {f"{h}x{w}": n for (h, w), n in counts.items()},
+                              "reports": reports}))
+
+
+
+    # SA-PECE must preserve its second denoiser prediction at each corrected
+    # sigma, while native Scale-Locked skips both corresponding locked target
+    # calls. Spectrum may forecast only predictors and always runs corrections
+    # natively on unlocked steps.
+    for label, selected in cases:
+        result, reports, counts = controls(
+            selected, "sa_solver_pece", "simple", 1.0, 14, label == "native",
+            max_stage_upscale=0.0, composition_lock_sigma=0.72,
+        )
+        sigmas = runtime.calculate_sigmas(selected, scheduler="simple", steps=14, denoise=1.0)
+        effective = runtime.effective_er_sde_sigmas(sigmas, selected)
+        locked = runtime.full_lock_prefix_length(effective.tolist(), .72)
+        if label == "native":
+            planner_hw = tuple(result[1]["samples"].shape[-2:])
+            assert counts[planner_hw] == 27, counts
+            assert counts[(16, 20)] == 2 * (14 - locked), counts
+            reference, _, total = controls(
+                selected, "sa_solver_pece", "simple", 1.0, 14, True,
+                evaluate_locked=True, max_stage_upscale=0.0,
+                composition_lock_sigma=0.72,
+            )
+            assert total[(16, 20)] == 27, total
+            assert all(torch.equal(a["samples"], b["samples"])
+                       for a, b in zip(result, reference))
+        else:
+            assert len(reports) == 2 and all(r["fallback"] is None for r in reports), reports
+            assert reports[0]["pece_corrector_evaluations"] == 13, reports
+            assert reports[1]["denoiser_calls"] == 2 * (14 - locked), reports
+            # Conservative default warmup/guard may leave no forecast in
+            # the short unlocked target tail. Correct PECE accounting is
+            # mandatory; forecast availability is configuration-dependent.
+            assert reports[0]["forecast"] > 0, reports
+        print(json.dumps({
+            "case": label + "_pece", "locked": locked,
+            "counts": {f"{h}x{w}": n for (h, w), n in counts.items()},
+            "reports": reports,
+        }))
+
+    if reports_context is not None:
+        fast_pece = SpectrumApplyKrea2().apply(
+            model, preset="turbo", warmup=2, tail=1,
+            bootstrap=False, extrapolation_guard_enabled=False,
+        )[0]
+        _, pece_reports, _ = controls(
+            fast_pece, "sa_solver_pece", "simple", 1.0, 20, False,
+            max_stage_upscale=0.0, composition_lock_sigma=0.72,
+        )
+        assert len(pece_reports) == 2, pece_reports
+        assert all(r["fallback"] is None for r in pece_reports), pece_reports
+        assert pece_reports[0]["pece_corrector_evaluations"] == 19
+        assert pece_reports[0]["forecast"] > 0 and pece_reports[1]["forecast"] > 0, pece_reports
+        assert pece_reports[1]["denoiser_calls"] == 16, pece_reports
+        print(json.dumps({"case": "spectrum_pece_20_step_lock", "reports": pece_reports}))
+
+    if reports_context is not None:
+        # Opt-in active-PECE acceleration through the resolution ladder: after
+        # two actual predicted phases, predictions are solver-owned skips and
+        # every unlocked correction is an exact model evaluation.
+        balanced = SpectrumApplyKrea2().apply(
+            model, preset="turbo", warmup=2, tail=1, bootstrap=False,
+            extrapolation_guard_enabled=False, sa_pece_forecast_policy="balanced",
+        )[0]
+        _, accelerated, _ = controls(
+            balanced, "sa_solver_pece", "simple", 1.0, 12, False,
+            latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
+        )
+        assert len(accelerated) == 3 and all(r["fallback"] is None for r in accelerated), accelerated
+        assert all(r["sa_pece_forecast_policy"] == "balanced" for r in accelerated)
+        assert accelerated[0]["sa_pece_skipped_predictions"] == 10, accelerated
+        assert accelerated[0]["pece_corrector_evaluations"] == 11, accelerated
+        assert all(r["sa_pece_skipped_predictions"] > 0 for r in accelerated[1:]), accelerated
+        print(json.dumps({"case": "sa_pece_balanced_ladder", "reports": accelerated}))
+
+        # The optional detail probe must retain the exact same native
+        # predictor/corrector call budget and stochastic-noise routing while
+        # avoiding the hard secant-to-hold discontinuity at late log-SNR steps.
+        detail = SpectrumApplyKrea2().apply(
+            model, preset="turbo", warmup=2, tail=1, bootstrap=False,
+            extrapolation_guard_enabled=False,
+            sa_pece_forecast_policy="balanced_detail",
+        )[0]
+        _, detail_reports, _ = controls(
+            detail, "sa_solver_pece", "simple", 1.0, 12, False,
+            latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
+        )
+        assert len(detail_reports) == 3, detail_reports
+        for prior, changed in zip(accelerated, detail_reports):
+            assert changed["fallback"] is None
+            assert changed["actual"] == prior["actual"]
+            assert changed["forecast"] == prior["forecast"]
+            assert changed["pece_corrector_evaluations"] == prior["pece_corrector_evaluations"]
+            assert changed["sa_pece_skipped_predictions"] == prior["sa_pece_skipped_predictions"]
+            assert changed["sa_pece_forecast_policy"] == "balanced_detail"
+            assert changed["sa_dense_modes"]["soft_extrapolation"] > 0, changed
+        # Every previously held final-stage predictor has a bounded, continuous
+        # corrected-endpoint surrogate; none comes from a raw stochastic forecast.
+        assert accelerated[-1]["sa_dense_modes"]["guard_hold"] == 4, accelerated
+        assert detail_reports[-1]["sa_dense_modes"]["guard_hold"] == 0, detail_reports
+        assert detail_reports[-1]["sa_dense_modes"]["soft_extrapolation"] == 4, detail_reports
+        print(json.dumps({"case": "sa_pece_balanced_detail_ladder",
+                          "reports": detail_reports}))
+
+
+    if reports_context is not None:
+        # This is the exact quality-isolation path used by the new widget:
+        # native SA/PECE plus the same Scale-Locked stages, but 0 forecasts.
+        # It must be bitwise equal to running the native model without
+        # installing Spectrum, including the stochastic coupled increments.
+        for sampler_name in ("sa_solver", "sa_solver_pece"):
+            plain, _, _ = controls(
+                model, sampler_name, "simple", 1.0, 12, False,
+                latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
+                sa_spectrum_forecasts=False,
+            )
+            bypass, reports, _ = controls(
+                cases[1][1], sampler_name, "simple", 1.0, 12, False,
+                latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
+                sa_spectrum_forecasts=False,
+            )
+            assert len(reports) == 3 and all(r["fallback"] is None for r in reports), reports
+            assert all(r["native_only"] is True and r["forecast"] == 0 and
+                       r["peak_history_bytes"] == 0 for r in reports), reports
+            for left, right in zip(plain, bypass):
+                torch.testing.assert_close(left["samples"], right["samples"], atol=0, rtol=0)
+            enabled, on_reports, _ = controls(
+                cases[1][1], sampler_name, "simple", 1.0, 12, False,
+                latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
+                sa_spectrum_forecasts=True,
+            )
+            assert len(on_reports) == 3 and all(not r["native_only"] for r in on_reports), on_reports
+            assert on_reports[0]["forecast"] > 0, on_reports
+            assert all(torch.isfinite(t["samples"]).all() for t in enabled)
+            print(json.dumps({
+                "case": "sa_12step_native_bypass",
+                "sampler": sampler_name, "records": reports,
+                "forecast_enabled": [r["forecast"] for r in on_reports],
+            }))
+
+    if reports_context is not None:
+        # Planner-native-only A/B: isolate the low-resolution Spectrum quality
+        # without giving up accelerated intermediate/final target stages.
+        # Same seed, sampler, Gaussian coupling and planner schedule.
+        # The default distance guard rejects every target-stage forecast on
+        # this short CPU schedule; use the relaxed configuration of the other
+        # ladder forecast checks so the stage acceleration is observable.
+        stage_forecasting = SpectrumApplyKrea2().apply(
+            model, preset="turbo", warmup=2, tail=1, bootstrap=False,
+            extrapolation_guard_enabled=False,
+        )[0]
+        for sampler_name in ("sa_solver", "sa_solver_pece"):
+            native_all, native_reports, _ = controls(
+                stage_forecasting, sampler_name, "simple", 1.0, 12, False,
+                latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
+                sa_spectrum_forecasts=False,
+            )
+            planner_native, hybrid_reports, _ = controls(
+                stage_forecasting, sampler_name, "simple", 1.0, 12, False,
+                latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
+                sa_spectrum_forecasts=True, sa_planner_spectrum_forecasts=False,
+            )
+            assert len(native_reports) == len(hybrid_reports) == 3
+            assert all(r["fallback"] is None for r in hybrid_reports), hybrid_reports
+            assert hybrid_reports[0]["native_only"] is True, hybrid_reports
+            assert hybrid_reports[0]["forecast"] == 0, hybrid_reports
+            assert hybrid_reports[0]["peak_history_bytes"] == 0, hybrid_reports
+            assert hybrid_reports[0]["actual"] == native_reports[0]["actual"], hybrid_reports
+            torch.testing.assert_close(
+                planner_native[1]["samples"], native_all[1]["samples"],
+                rtol=0, atol=0,
+            )
+            assert all(r["native_only"] is False for r in hybrid_reports[1:]), hybrid_reports
+            assert any(r["forecast"] > 0 for r in hybrid_reports[1:]), hybrid_reports
+            assert all(torch.isfinite(x["samples"]).all() for x in planner_native)
+
+            # Context lifetime: the next independent call must regain planner
+            # forecasts with no leaked native-only selection.
+            _, restored, _ = controls(
+                stage_forecasting, sampler_name, "simple", 1.0, 12, False,
+                latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
+                sa_spectrum_forecasts=True, sa_planner_spectrum_forecasts=True,
+            )
+            assert all(not r["native_only"] for r in restored), restored
+            assert restored[0]["forecast"] > 0, restored
+            print(json.dumps({
+                "case": "sa_native_planner_only",
+                "sampler": sampler_name,
+                "reports": hybrid_reports,
+                "restored_planner_forecasts": restored[0]["forecast"],
+            }))
+
+    # ER-SDE's three modes must not contaminate later queued invocations,
+    # even when ComfyUI reuses the same node, MODEL patcher, and Spectrum
+    # wrapper instance. Test the *complete* three-resolution sampler, not just
+    # an options constructor or a toy noise-scaler.
+    for label, selected in (
+        ("native", model),
+        *((("spectrum", SpectrumApplyKrea2().apply(
+            model, preset="turbo", warmup=2, tail=1, bootstrap=False,
+            extrapolation_guard_enabled=False,
+        )[0]),) if reports_context is not None else ()),
+    ):
+        a = dict(sampler_name="er_sde", er_sde_solver_type="ER-SDE",
+                 er_sde_max_stage=3, er_sde_eta=1.0, er_sde_s_noise=1.0)
+        ode = dict(sampler_name="er_sde", er_sde_solver_type="ODE",
+                   er_sde_max_stage=1, er_sde_eta=1.0, er_sde_s_noise=1.0)
+        reverse = dict(sampler_name="er_sde", er_sde_solver_type="Reverse-time SDE",
+                       er_sde_max_stage=2, er_sde_eta=0.5, er_sde_s_noise=0.65)
+        profiles = (a, ode, reverse,
+                    dict(sampler_name="sa_solver", sa_sde_end_percent=.30,
+                         sa_s_noise=.5), a)
+        outcomes = []
+        receipts = []
+        for profile in profiles:
+            latent_parts, reports, _ = controls(
+                selected, profile["sampler_name"], "simple", 1.0, 12, False,
+                latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
+                **{k: v for k, v in profile.items() if k != "sampler_name"},
+            )
+            outcomes.append(tuple(part["samples"].clone() for part in latent_parts))
+            receipts.append(reports)
+            if label == "spectrum":
+                assert len(reports) == 3, reports
+                assert all(r["fallback"] is None for r in reports), reports
+                assert all(r["native_only"] is False for r in reports), reports
+        for before, after in zip(outcomes[0], outcomes[-1]):
+            torch.testing.assert_close(before, after, rtol=0, atol=0)
+        # The mode selector materially affects the native numerical output.
+        # A genuine ODE switch must not merely reuse the preceding ER-SDE
+        # option dictionary or stochastic sampler instance.
+        assert not torch.equal(outcomes[0][0], outcomes[1][0]), label
+        assert not torch.equal(outcomes[0][0], outcomes[2][0]), label
+        assert not torch.equal(outcomes[1][0], outcomes[2][0]), label
+
+        # ER-SDE controls are intentionally inert when a different solver is
+        # selected. A user switching only er_sde_solver_type during plain SA
+        # will see no output change; pin that behavior to avoid diagnosing it
+        # as leaked numerical settings.
+        plain_sa, plain_reports, _ = controls(
+            selected, "sa_solver", "simple", 1.0, 12, False,
+            latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
+            er_sde_solver_type="ER-SDE",
+        )
+        inert_sa, inert_reports, _ = controls(
+            selected, "sa_solver", "simple", 1.0, 12, False,
+            latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
+            er_sde_solver_type="ODE", er_sde_eta=0.0,
+            er_sde_max_stage=1, er_sde_s_noise=0.0,
+        )
+        for baseline, changed in zip(plain_sa, inert_sa):
+            torch.testing.assert_close(
+                baseline["samples"], changed["samples"], atol=0, rtol=0
+            )
+        if label == "spectrum":
+            assert [(r["actual"], r["forecast"], r["fallback"])
+                    for r in plain_reports] == [
+                    (r["actual"], r["forecast"], r["fallback"])
+                    for r in inert_reports]
+        assert not base.diffusion_model._forward_pre_hooks
+        assert not base.diffusion_model.last._forward_pre_hooks
+        print(json.dumps({
+            "case": "er_sde_cross_run_state_isolation",
+            "model": label,
+            "modes": [x["er_sde_solver_type"] if x["sampler_name"] == "er_sde"
+                      else x["sampler_name"] for x in profiles],
+            "identical_return_to_first": True,
+            "spectrum_reports": [
+                [{"actual": p["actual"], "forecast": p["forecast"],
+                  "fallback": p["fallback"]} for p in rr]
+                for rr in receipts if rr
+            ],
+        }))
+
+    # Native ER-SDE's deterministic ODE mode and stochastic reverse-time mode
+    # use the same wrapper, stage planner and evaluation-skipping contract.
+    for er_mode, eta, noise in (("ODE", 1.0, 1.0), ("Reverse-time SDE", .5, .6)):
+        result, reports, counts = controls(
+            model, "er_sde", "simple", 1.0, 8, True,
+            max_stage_upscale=0.0,
+            er_sde_solver_type=er_mode, er_sde_eta=eta, er_sde_s_noise=noise,
+        )
+        assert counts[tuple(result[1]["samples"].shape[-2:])] == 8, counts
+        assert counts[(16, 20)] == 4, counts
+        assert all(torch.isfinite(part["samples"]).all() for part in result), er_mode
+
+
+
+    # Native SA-Solver supports ODE/no-noise, stochastic SDE windows,
+    # simplified-order coefficients and PECE. Exercise the unmodified
+    # ComfyUI numerical path with these non-default controls.
+    for solver, eta, s_noise, predictor, corrector, simple in (
+        ("sa_solver", 0.0, 1.0, 3, 4, False),
+        ("sa_solver", 0.7, 0.45, 2, 2, True),
+        ("sa_solver_pece", 0.0, 0.0, 3, 4, False),
+        ("sa_solver_pece", 0.45, 0.6, 2, 2, True),
+    ):
+        result, _, counts = controls(
+            model, solver, "simple", 1.0, 8, True,
+            max_stage_upscale=0.0, sa_eta=eta,
+            sa_sde_start_percent=.1, sa_sde_end_percent=.9,
+            sa_s_noise=s_noise, sa_predictor_order=predictor,
+            sa_corrector_order=corrector, sa_simple_order_2=simple,
+        )
+        planner_hw = tuple(result[1]["samples"].shape[-2:])
+        assert counts[planner_hw] == solver_calls(solver, 8), counts
+        assert counts[(16, 20)] == target_calls(solver, 8, locked_by_steps[8]), counts
+        print(json.dumps({"case": "sa_native_modes", "sampler": solver,
+                          "eta": eta, "s_noise": s_noise, "simple": simple}))
+
+    if args.spectrum_root and args.kj_root:
+        # Exercise the real upstream KJ PreviewOverride __call__ in the
+        # complete Scale-Locked -> Spectrum -> native ER-SDE two-pass route.
+        # Only preview transport/decoder dependencies are stubbed to avoid
+        # external UI side effects in this CPU execution-contract test.
+        import ast
+        import logging
+        import time
+        import comfy.patcher_extension
+        kj_path = args.kj_root.resolve() / "nodes/preview_override_node.py"
+        parsed = ast.parse(kj_path.read_text(), filename=str(kj_path))
+        klass_ast = next(n for n in parsed.body if isinstance(n, ast.ClassDef)
+                         and n.name == "_PreviewOverrideWrapper")
+        mod = types.ModuleType("slrd_kj_fixture.preview_override_node")
+        mod.__file__ = str(kj_path)
+        class NoPreviewEncoder:
+            def submit(self, fn):
+                return True
+            def shutdown(self, drain_timeout=5.0):
+                pass
+        mod.__dict__.update({
+            "torch": torch, "comfy": __import__("comfy"),
+            "logging": logging, "time": time, "PromptServer": None,
+            "load_tiny_vae_decoder": None,
+            "_get_core_previewer": lambda *a: None,
+            "_is_ltx_latent_format": lambda *a: False,
+            "_is_av_model": lambda *a: False,
+            "_normalize_packed_x0": lambda x, *a: x,
+            "_frames_per_token": lambda *a: (1, 1),
+            "_AsyncPreviewEncoder": NoPreviewEncoder,
+            "latent_preview": types.SimpleNamespace(
+                Latent2RGBPreviewer=lambda *a, **kw: None,
+            ),
+        })
+        sys.modules[mod.__name__] = mod
+        exec(compile(ast.Module(body=[klass_ast], type_ignores=[]), str(kj_path), "exec"),
+             mod.__dict__)
+        assert callable(mod._PreviewOverrideWrapper(512, None, 80, False, tiny_vae="none"))
+
+        selected = SpectrumApplyKrea2().apply(
+            model, preset="turbo", warmup=2, tail=1,
+            bootstrap=False, extrapolation_guard_enabled=False,
+        )[0]
+        with_preview = selected.clone()
+        with_preview.add_wrapper_with_key(
+            comfy.patcher_extension.WrappersMP.OUTER_SAMPLE,
+            "kj_preview_override",
+            mod._PreviewOverrideWrapper(512, None, 80, False, tiny_vae="none"),
+        )
+
+        def run_kj(candidate):
+            receipts = []
+            tok = reports_context.set(receipts)
+            try:
+                with torch.inference_mode():
+                    result = node.sample(
+                        candidate, positive, negative,
+                        {"samples": torch.zeros(1, 4, 16, 20)},
+                        42, .01, 0.0, 0.0, steps=14, sampler_name="er_sde",
+                        max_stage_upscale=0.0,
+                    )
+            finally:
+                reports_context.reset(tok)
+            return result, receipts
+
+        baseline, base_reports = run_kj(selected)
+        tested, kj_reports = run_kj(with_preview)
+        assert len(kj_reports) == len(base_reports) == 2
+        for base_report, kj_report in zip(base_reports, kj_reports):
+            assert kj_report["fallback"] is None, kj_report
+            assert kj_report["forecast"] > 0, kj_report
+            assert (kj_report["actual"], kj_report["forecast"]) == (
+                base_report["actual"], base_report["forecast"],
+            )
+        for original, actual in zip(baseline, tested):
+            torch.testing.assert_close(
+                original["samples"], actual["samples"], atol=0, rtol=0,
+            )
+        print(json.dumps({"case": "kj_preview_spectrum_slrd_er_sde",
+                          "reports": kj_reports}))
 
     try:
         node.sample(model, positive, negative, {"samples": torch.zeros(1, 4, 24, 28)},

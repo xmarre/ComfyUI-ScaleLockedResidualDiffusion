@@ -38,9 +38,122 @@ runtime and does not load weights independently.
   completely, and the remaining ones add detail at the target resolution.
   The optional `steps` input controls both passes (default 8). Connect the same
   step count to a native sampler for matched target-pass comparisons.
-- The Krea 2 Turbo sampling profile is ComfyUI CFG **1.0** (no
-  classifier-free guidance), Euler, `simple` scheduler, shift **1.15**.
-  This is for **Turbo**, not the undistilled RAW checkpoint.
+- **CFG, sampler and scheduler are configurable** on the Krea 2 node.
+  The unchanged defaults are ComfyUI CFG **1.0** (no classifier-free
+  guidance), Euler, `simple` scheduler, shift **1.15**. These defaults are
+  for **Turbo**, not the undistilled RAW checkpoint. `cfg` accepts 0–100,
+  and `scheduler` exposes ComfyUI's available schedules; the generated
+  sigma schedule is validated to be finite, strictly decreasing, within
+  the flow domain [0, 1], and ending at zero. Non-default CFG or schedule
+  changes the noise trajectory and therefore the composition-lock release.
+- **Sampler choice**: `euler` (default), `dpmpp_2m`, `res_multistep`,
+  `deis`, `ipndm`, `ipndm_v`, `gradient_estimation`, `er_sde`,
+  `sa_solver` and `sa_solver_pece`, limited to native implementations in
+  the installed ComfyUI. Every offered solver retains its native update and
+  history. SA-Solver and ER-SDE can inject stochastic noise; SA-Solver PECE
+  additionally evaluates the corrected state at the same sigma after the
+  predictor callback (except steps without a native correction).
+  The same selected solver runs the planner and target passes.
+  - **Locked steps cost no target-resolution model evaluations with any
+    solver.** Euler reaches the composition-lock release in closed form.
+    The other solvers integrate the locked steps with their own native
+    update, receiving the resized planner prediction in place of a target
+    evaluation. The full lock discards the target prediction on those
+    steps, so the result is identical to evaluating it, and the solver's
+    history across the release is preserved. The progress bar therefore
+    still lists locked steps for non-Euler solvers; they complete without a
+    model call.
+  - **Resolution stages work with every solver.** The first stage reaches
+    the release as described above. Each later stage re-noises the
+    previous stage's image to the release noise level and starts the
+    solver afresh there, so multistep solvers begin that stage at first
+    order.
+  - **Native ER-SDE** uses ComfyUI's original VP ER-SDE solver and its first-,
+    second-, or third-order history. The optional **ER-SDE solver type**,
+    **max stage** (1–3), **eta**, and **s_noise** widgets are appended after
+    existing inputs and only apply when `sampler_name=er_sde`. Solver types
+    are `ER-SDE`, `Reverse-time SDE`, and `ODE`; ODE or eta=0 removes
+    stochastic injection. The first flow sigma is adjusted by native ComfyUI
+    for finite log-SNR; the lock's step matching uses that effective sigma.
+    All ER-SDE noise increments are generated deterministically from the run
+    seed and absolute step index. Across resolutions, a patch-phase Gaussian
+    coupling makes the target's coarse stochastic increment match the planner
+    while retaining independent fine-frequency noise. Later stages restart
+    ER-SDE history at the release step; they do not inherit earlier-stage
+    multistep derivatives.
+  - **Native SA-Solver and SA-Solver PECE.** The optional `sa_eta`,
+    `sa_sde_start_percent` (0.2), `sa_sde_end_percent` (0.35), `sa_s_noise`,
+    `sa_predictor_order` (3), `sa_corrector_order` (4), and
+    `sa_simple_order_2` settings apply only to the SA-Solver choices.
+    The default `sa_sde_end_percent=0.35` (model sigma about 0.68) keeps
+    stochastic steps in the planner and makes the high-resolution stages
+    deterministic. With ComfyUI's native 0.8, every stage step is stochastic,
+    and plain SA-Solver produced visible artifacts at 5–6 steps per stage.
+    Each stage already starts from fresh release noise.
+    `sa_spectrum_forecasts` (default **true**) lets a connected Spectrum
+    Krea 2 model forecast SA predictor calls. False runs every native SA
+    predictor and PECE correction, reports `native_only=true` and
+    `forecast=0`, and serves as a quality reference. The switch changes no
+    solver options, model weights, diffusion patches, noise fields,
+    resolution-stage configuration or other samplers. Spectrum never consumes
+    a raw forecast on a stochastic step, because a forecast cannot see SA's
+    fresh noise increment. Forecasts are therefore most effective on the
+    deterministic stages. `sa_planner_spectrum_forecasts` (default **true**)
+    independently controls Spectrum only during the low-resolution planner
+    pass. Set it to **false** while keeping `sa_spectrum_forecasts=true` to
+    evaluate all planner denoisers natively, retain the same seeded noise,
+    sigma schedule and planner anchors, then restore Spectrum acceleration
+    for both high-resolution stages. This isolates cases where the planner
+    preview appears over-smoothed despite a detailed final image. It is
+    an optional quality diagnostic, not proof that forecast error causes the
+    blur: the planner also operates at a lower native resolution. The
+    planner and target passes report `native_only` and `forecast` separately,
+    so verify planner `native_only=true, forecast=0`, target
+    `native_only=false` before interpreting results. With a 14-step
+    Spectrum turbo run that previously used 8 actual planner predictions
+    and 6 forecasts, the expected comparison uses 14 actual planner
+    predictions while retaining target forecast opportunities. It increases
+    planner runtime, without changing target-stage numerical code or the
+    underlying solver. Tested on a real Krea 2 Turbo checkpoint
+    (14 steps, 1872→2672→3824 px, one seed): plain `sa_solver` at these
+    defaults looked clean natively and with forecasts. Forecasts cut sampling
+    time from 70 s to 45 s. If upscale stages still invent small details
+    (for example a partly visible object turning into something else), end
+    the window earlier, for example `sa_sde_end_percent=0.30`.
+    Keep `sa_s_noise` and `er_sde_s_noise` at 1.0 on stochastic steps. A
+    stochastic step shrinks the existing noise and re-adds fresh noise of the
+    size the next step expects. Below 1.0 it re-adds too little, so the model
+    sees an image cleaner than its noise level and removes real texture. On a
+    real Krea 2 Turbo checkpoint, 0.5 made both SA-Solver and ER-SDE planners
+    look airbrushed or plastic, and 1.0 restored sharp detail. To reduce
+    stochasticity, narrow the window or lower `sa_eta`/`er_sde_eta` instead.
+    The configured stochastic window uses native Krea 2 percent-to-sigma conversion.
+    `sa_eta=0` gives the native ODE mode. Noise increments use the same
+    Gaussian patch coupling as ER-SDE, but are generated by the absolute
+    sigma transition because SA-Solver samples noise only inside its selected
+    SDE interval. In PECE mode, the planner retains both the predictor and
+    corrected-state predictions. The target uses each corresponding planner
+    anchor for fully locked predictor/corrector calls; native corrected-state
+    evaluations resume outside the lock. Restarted resolution stages use a
+    fresh native predictor/corrector history. This is not an Euler
+    approximation or a one-evaluation PECE shortcut.
+  - Non-Euler solvers, including ER-SDE and both SA-Solvers, are experimental.
+    Their trajectories differ from Euler and require visual validation with
+    matched seeds. Other ancestral/SDE and multi-evaluation solvers (e.g. Heun)
+    remain unoffered.
+  - With Spectrum Krea 2 PR #2, all ten sampler choices (Euler, DPM++ 2M,
+    RES Multistep, Gradient Estimation, DEIS, iPNDM, iPNDM-V, ER-SDE,
+    SA-Solver and SA-Solver PECE) can forecast on audited native paths.
+    SA-Solver PECE forecasts eligible *predictor* opportunities and always
+    evaluates corrected-state calls natively; reports count the latter
+    separately.
+    DEIS coefficient helpers and ER-SDE sigma/log-SNR conversion helpers
+    are separately checked. ER-SDE accepts the validated native scaler, stage,
+    noise strength and noise sampler options; unreviewed options or altered
+    native solver/helper sources fail closed. Forecasting may change
+    image quality, especially anatomy, and must be visually tested with
+    the same seed and conditioning. Spectrum's forecast
+    history is built only from unlocked target evaluations, as with Euler.
 - High-resolution noise is drawn from an exact *Gaussian conditional coupling*:
   within every 2x2 transformer-patch phase the normalized grouped projection
   matches the source Gaussian field, including noninteger upscaling ratios.
@@ -55,14 +168,16 @@ runtime and does not load weights independently.
   keep more of the planner image and leave fewer steps for new detail; 1.0
   disables the full lock. With ComfyUI's Krea 2 schedule (Euler/simple,
   shift 1.15), the default locks four of eight steps (six of twelve).
-  Locked steps cost no high-resolution model evaluations: the target state at
-  the release is computed in closed form from the planner predictions, and
-  the sampler starts there. With a target spatial mask or latent noise mask,
-  locked steps are evaluated instead, because the mask blends in the
-  target prediction.
+  Locked steps cost no high-resolution model evaluations: with Euler the
+  target state at the release is computed in closed form from the planner
+  predictions and the sampler starts there; other solvers step through the
+  locked steps natively with the planner predictions. With a target spatial mask or latent noise mask,
+  locked steps use the evaluated path rather than the no-DiT shortcut.
+  Spatial masks blend in target predictions; latent noise masks require
+  retaining the sampler's masked execution behavior.
 - **Resolution stages.** Large jumps from the planner to the output are split
   into a ladder of intermediate resolutions, so no single handoff upscales by
-  more than `max_stage_upscale`. The first stage starts at the
+  more than `max_stage_upscale`. The first stage reaches the
   composition-lock release from the planner predictions, exactly like a
   single-stage run. Each later stage takes the finished image of the stage
   below, resized to its own size, re-noises it to the same release noise
@@ -107,8 +222,10 @@ limited to individual visual comparisons, not a systematic evaluation;
 there is no claimed quality or speed improvement. Against a native eight-step target-resolution run, the
 default replaces four target-resolution DiT evaluations with eight planner
 evaluations; it is intended to improve structural consistency, not
-throughput. For RAW, custom samplers and advanced research controls, use
-the generic Scale-Locked Residual KSampler instead.
+throughput. For RAW or arbitrary samplers not supported by the Krea-specific
+flow-aligned handoff, use the generic Scale-Locked Residual KSampler.
+That generic path has different noise-coupling and resolution-stage
+semantics; it is not interchangeable with the Krea-specific integration.
 
 ## Resolution Selector (Uncapped)
 

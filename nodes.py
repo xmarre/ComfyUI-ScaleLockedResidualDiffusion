@@ -26,6 +26,11 @@ from .slrd_runtime import (
     create_cfg_guider,
     fix_latent_channels,
     guard_sampler_alignment,
+    krea2_sampler_names,
+    krea2_er_sde_options,
+    krea2_sa_solver_options,
+    sa_native_only_scope,
+    effective_er_sde_sigmas,
     make_lowres_latent,
     prepare_noise,
     run_scale_locked_ksampler,
@@ -250,6 +255,55 @@ class Krea2TurboFlowAlignedRegenerate:
                 "stage_megapixels": ("STRING", {"default": "", "multiline": False,
                     "tooltip": "Optional explicit intermediate stage sizes in megapixels, ascending and between the "
                                "planner and the output, e.g. '4, 8'. Empty uses max_stage_upscale."}),
+                "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01,
+                    "tooltip": "ComfyUI CFG. Krea 2 Turbo normally uses 1.0 (no classifier-free guidance). Higher values alter conditioning and require visual validation."}),
+                "sampler_name": (krea2_sampler_names(), {"default": "euler",
+                    "tooltip": "Solver for planner and target passes. Every option skips the target model during composition-locked steps and supports resolution stages. "
+                               "Euler reaches the lock release in closed form; the others run their native multistep update through the locked steps using the planner predictions. "
+                               "ER-SDE and SA-Solver use native stochastic updates with patch-coupled noise across resolutions. "
+                               "SA-Solver PECE retains separate predictor and correction evaluations. "
+                               "Non-Euler solvers are experimental and need visual validation."}),
+                "scheduler": (compat_scheduler_names(), {"default": "simple",
+                    "tooltip": "ComfyUI sigma schedule applied consistently to planner and target. Changes locked-step count and denoising trajectory. Experimental alternatives need visual validation."}),
+                "er_sde_solver_type": (["ER-SDE", "Reverse-time SDE", "ODE"], {"default": "ER-SDE",
+                    "tooltip": "Only used with er_sde. Same noise-scaling modes as ComfyUI's native SamplerER_SDE; ODE disables stochastic injection."}),
+                "er_sde_max_stage": ("INT", {"default": 3, "min": 1, "max": 3,
+                    "tooltip": "Only used with er_sde. Maximum native solver order (1 to 3); history is restarted at each new resolution stage."}),
+                "er_sde_eta": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01,
+                    "tooltip": "Only used with er_sde. Native stochastic-strength exponent; zero selects ODE with no stochastic noise."}),
+                "er_sde_s_noise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.01,
+                    "tooltip": "Only used with er_sde. Multiplies its patch-coupled per-step stochastic increments; ODE forces zero. "
+                               "Keep 1.0: lower values re-add less noise than each step removes, which gives airbrushed, plastic results."}),
+                "sa_eta": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01,
+                    "tooltip": "SA-Solver only: stochastic strength (0 = ODE)."}),
+                "sa_sde_start_percent": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.001,
+                    "tooltip": "SA-Solver only: start of the stochastic model-sigma interval."}),
+                "sa_sde_end_percent": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.001,
+                    "tooltip": "SA-Solver only: end of the stochastic model-sigma interval. The default 0.35 (model sigma "
+                               "about 0.68 at Krea 2's flow shift) keeps stochastic steps in the planner and makes the "
+                               "high-resolution stages deterministic. ComfyUI's native 0.8 keeps every stage step stochastic; "
+                               "with few steps per stage that produced visible artifacts with plain SA-Solver. If upscale stages invent small "
+                               "details, end the window earlier, for example 0.30."}),
+                "sa_s_noise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.01,
+                    "tooltip": "SA-Solver only: SDE noise multiplier, patch-coupled across scales. Keep 1.0: lower values re-add less "
+                               "noise than each stochastic step removes, which gives airbrushed, plastic results. "
+                               "Narrow the SDE window or lower sa_eta to reduce stochasticity instead."}),
+                "sa_predictor_order": ("INT", {"default": 3, "min": 1, "max": 6,
+                    "tooltip": "SA-Solver only: native Adams predictor order."}),
+                "sa_corrector_order": ("INT", {"default": 4, "min": 0, "max": 6,
+                    "tooltip": "SA-Solver only: native corrector order. PECE reevaluates corrections when greater than 0."}),
+                "sa_simple_order_2": ("BOOLEAN", {"default": False,
+                    "tooltip": "SA-Solver only: native simplified second-order coefficients."}),
+                "sa_spectrum_forecasts": ("BOOLEAN", {"default": True,
+                    "tooltip": "SA-Solver only: allow Spectrum predictor forecasts when a Spectrum Krea 2 model is connected. "
+                               "Off runs every SA predictor and PECE correction natively (a quality reference). "
+                               "Forecasts on stochastic steps never reuse the forecast's noise estimate; they are most "
+                               "effective on the deterministic high-resolution stages set by sa_sde_end_percent."}),
+                "sa_planner_spectrum_forecasts": ("BOOLEAN", {"default": True,
+                    "tooltip": "SA-Solver only: enable Spectrum forecasts in the low-resolution planner. "
+                               "Off evaluates every planner step natively while preserving Spectrum acceleration "
+                               "in the intermediate and final high-resolution stages. This is a quality comparison "
+                               "for planner texture loss; the planner uses the same native noise and solver."}),
             },
         }
 
@@ -267,12 +321,62 @@ class Krea2TurboFlowAlignedRegenerate:
         composition_lock_sigma=0.80,
         max_stage_upscale=4.0,
         stage_megapixels="",
+        cfg=1.0,
+        sampler_name="euler",
+        scheduler="simple",
+        er_sde_solver_type="ER-SDE",
+        er_sde_max_stage=3,
+        er_sde_eta=1.0,
+        er_sde_s_noise=1.0,
+        sa_eta=1.0,
+        sa_sde_start_percent=0.2,
+        sa_sde_end_percent=0.35,
+        sa_s_noise=1.0,
+        sa_predictor_order=3,
+        sa_corrector_order=4,
+        sa_simple_order_2=False,
+        sa_spectrum_forecasts=True,
+        sa_planner_spectrum_forecasts=True,
     ):
+        if not isinstance(cfg, (int, float)) or not math.isfinite(cfg) or not 0.0 <= cfg <= 100.0:
+            raise ValueError("Krea 2 CFG must be finite and within [0, 100]")
+        if sampler_name not in krea2_sampler_names():
+            raise ValueError(
+                f"Unsupported Krea 2 sampler {sampler_name!r}; supported: {', '.join(krea2_sampler_names())}"
+            )
+        if scheduler not in compat_scheduler_names():
+            raise ValueError(f"Unsupported Krea 2 scheduler: {scheduler!r}")
+        sampler_options = None
         composition_lock_sigma = float(composition_lock_sigma)
         if not math.isfinite(composition_lock_sigma) or not 0.0 <= composition_lock_sigma <= 1.0:
             raise ValueError("composition_lock_sigma must be within [0, 1]")
         if not isinstance(getattr(model, "model", None), comfy.model_base.Krea2):
             raise ValueError("Krea 2 Turbo Flow-Aligned Regenerate requires a native ComfyUI Krea2 MODEL")
+        if sampler_name == "er_sde":
+            sampler_options = krea2_er_sde_options(
+                er_sde_solver_type, er_sde_max_stage, er_sde_eta, er_sde_s_noise
+            )
+            # Report the validated, effective backend values for each queued
+            # invocation. ODE/eta=0 force s_noise=0; the UI widgets alone
+            # cannot prove which parameters the sampler actually received.
+            er_scaler = sampler_options["noise_scaler"]
+            logger.info(
+                "Krea 2 ER-SDE invocation: solver_type=%s eta=%.6g "
+                "max_stage=%d s_noise=%.6g seed=%d",
+                er_scaler.solver_type, er_scaler.eta,
+                sampler_options["max_stage"], sampler_options["s_noise"], seed,
+            )
+        elif sampler_name in ("sa_solver", "sa_solver_pece"):
+            if type(sa_spectrum_forecasts) is not bool:
+                raise ValueError("sa_spectrum_forecasts must be a boolean")
+            if type(sa_planner_spectrum_forecasts) is not bool:
+                raise ValueError("sa_planner_spectrum_forecasts must be a boolean")
+            sampler_options = krea2_sa_solver_options(
+                model, eta=sa_eta, sde_start_percent=sa_sde_start_percent,
+                sde_end_percent=sa_sde_end_percent, s_noise=sa_s_noise,
+                predictor_order=sa_predictor_order, corrector_order=sa_corrector_order,
+                simple_order_2=sa_simple_order_2,
+            )
         if not isinstance(latent_image, dict) or not isinstance(latent_image.get("samples"), torch.Tensor):
             raise TypeError("Krea 2 requires a LATENT dictionary with tensor samples")
         # Native ComfyUI uses four-channel EmptyLatentImage placeholders for Krea 2,
@@ -310,10 +414,19 @@ class Krea2TurboFlowAlignedRegenerate:
             if explicit_stages:
                 raise ValueError("stage_megapixels must stay below the output LATENT size")
             stage_hw.pop()
+        schedule = [float(v) for v in calculate_sigmas(model, scheduler=scheduler, steps=steps, denoise=1.0).tolist()]
+        if (len(schedule) != steps + 1 or any(not math.isfinite(v) or not 0.0 <= v <= 1.0 for v in schedule)
+                or any(a <= b for a, b in zip(schedule, schedule[1:])) or schedule[-1] != 0.0):
+            raise ValueError("Krea 2 requires a strictly decreasing flow sigma schedule in [0, 1] ending at zero")
         if stage_hw:
-            # Fail before the planner pass when no step remains after the lock.
-            schedule = [float(v) for v in calculate_sigmas(model, scheduler="simple", steps=steps, denoise=1.0).tolist()]
-            if full_lock_prefix_length(schedule, composition_lock_sigma) >= len(schedule) - 1:
+            # ER-SDE shifts the initial CONST sigma away from 1.0 for finite
+            # log-SNR; lock/release planning must use the sigma actually seen
+            # by the native denoiser, not the nominal outer schedule.
+            lock_schedule = (
+                effective_er_sde_sigmas(torch.tensor(schedule, dtype=torch.float64), model).tolist()
+                if sampler_name in ("er_sde", "sa_solver", "sa_solver_pece") else schedule
+            )
+            if full_lock_prefix_length(lock_schedule, composition_lock_sigma) >= len(schedule) - 1:
                 raise ValueError("resolution stages need at least one step after the composition lock; raise steps or composition_lock_sigma")
             logger.info(
                 "Krea 2 resolution stages: planner %sx%s -> %s -> output %sx%s",
@@ -348,26 +461,36 @@ class Krea2TurboFlowAlignedRegenerate:
             mid_schedule_hold=0.0,
             full_lock_sigma=composition_lock_sigma,
         )
-        result = run_scale_locked_ksampler(
-            model=model,
-            positive=positive,
-            negative=negative,
-            latent_image=prepared_latent,
-            seed=seed,
-            steps=steps,
-            cfg=1.0,
-            sampler_name="euler",
-            scheduler="simple",
-            denoise=1.0,
-            target_megapixels=planner_megapixels,
-            nested_noise_strength=1.0,
-            add_noise=True,
-            pin_anchors=True,
-            sampler_guard="error",
-            config=config,
-            noise_mode="patch_coupled",
-            stage_hw=tuple(stage_hw),
-        )
+        # Keep the opt-in out of ComfyUI sampler.extra_options and scope it to
+        # this invocation. No numerical solver implementation is replaced.
+        with sa_native_only_scope(
+            sampler_name in ("sa_solver", "sa_solver_pece") and not sa_spectrum_forecasts
+        ):
+            result = run_scale_locked_ksampler(
+                model=model,
+                positive=positive,
+                negative=negative,
+                latent_image=prepared_latent,
+                seed=seed,
+                steps=steps,
+                cfg=cfg,
+                sampler_name=sampler_name,
+                scheduler=scheduler,
+                denoise=1.0,
+                target_megapixels=planner_megapixels,
+                nested_noise_strength=1.0,
+                add_noise=True,
+                pin_anchors=True,
+                sampler_guard="error",
+                config=config,
+                noise_mode="patch_coupled",
+                stage_hw=tuple(stage_hw),
+                sampler_options=sampler_options,
+                sa_planner_native_only=(
+                    sampler_name in ("sa_solver", "sa_solver_pece")
+                    and not sa_planner_spectrum_forecasts
+                ),
+            )
         return (result.output, result.lowres_planner, result.denoised_output)
 
 

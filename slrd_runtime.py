@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import contextvars
 import copy
+from contextlib import contextmanager
 import logging
+import math
+import sys
 import types
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -44,6 +48,46 @@ _LOGGER = logging.getLogger(__name__)
 
 
 
+_SPECTRUM_RUNTIME = "comfyui_spectrum_krea2.runtime"
+
+
+def _spectrum_force_native_vars() -> list:
+    """FORCE_NATIVE of every loaded Spectrum Krea 2 runtime module.
+
+    ComfyUI loads a custom-node directory under a path-derived module name,
+    so the active runtime is ``<custom node path>.comfyui_spectrum_krea2.runtime``
+    rather than the bare package name. A bare import would miss it, or load a
+    second copy whose context variable the active sampler hook never reads.
+    """
+    found = []
+    for name, module in list(sys.modules.items()):
+        if module is None or not (name == _SPECTRUM_RUNTIME or name.endswith("." + _SPECTRUM_RUNTIME)):
+            continue
+        var = getattr(module, "FORCE_NATIVE", None)
+        if isinstance(var, contextvars.ContextVar) and all(var is not v for v in found):
+            found.append(var)
+    return found
+
+
+@contextmanager
+def sa_native_only_scope(enabled: bool):
+    """Suppress only Spectrum forecasts for the scoped SA execution.
+
+    No mutation of the patcher, sampler, or process-global wrappers. The
+    contextvar is reset on cancellation, errors, and nested sampling.
+    Standalone Scale-Locked works when Spectrum is not installed.
+    """
+    if not enabled:
+        yield
+        return
+    tokens = [(var, var.set(True)) for var in _spectrum_force_native_vars()]
+    try:
+        yield
+    finally:
+        for var, token in reversed(tokens):
+            var.reset(token)
+
+
 class _NullPreviewCallback:
     def __call__(self, step, x0, x, total_steps):
         del step, x0, x, total_steps
@@ -57,7 +101,218 @@ _CONSERVATIVE_SAFE_SAMPLERS = {
     "lcm",
     "dpmpp_2m",
     "dpmpp_2m_cfg_pp",
+    # Deterministic, one denoiser evaluation per step, history built only
+    # from (x, denoised) pairs: planner anchors map one-to-one onto steps.
+    "deis",
+    "gradient_estimation",
+    "ipndm",
+    "ipndm_v",
+    "res_multistep",
 }
+
+# Native ComfyUI samplers offered by the Krea 2 node. All make exactly one
+# denoiser evaluation per outer step, so native solver state survives the
+# planner-prediction substitution on fully locked steps. ER-SDE is stochastic:
+# its per-step noise is patch-coupled across planner and target canvases.
+# CFG++ variants require side-channel unconditional predictions and are excluded.
+# Euler alone permits the closed-form flow handoff.
+KREA2_SAMPLERS = (
+    "euler",
+    "dpmpp_2m",
+    "res_multistep",
+    "deis",
+    "ipndm",
+    "ipndm_v",
+    "gradient_estimation",
+    "er_sde",
+    "sa_solver",
+    "sa_solver_pece",
+)
+
+
+def krea2_sampler_names() -> list[str]:
+    """Krea 2 node solvers that the installed ComfyUI provides, Euler first."""
+    available = set(compat_sampler_names())
+    return [name for name in KREA2_SAMPLERS if name in available]
+
+
+_ER_SDE_TYPES = ("ER-SDE", "Reverse-time SDE", "ODE")
+_SEED_MASK = (1 << 64) - 1
+
+
+@dataclass(frozen=True)
+class Krea2ERSDENoiseScaler:
+    """Same three scaler families as ComfyUI's SamplerER_SDE node."""
+
+    solver_type: str
+    eta: float
+
+    def __call__(self, x):
+        if self.solver_type == "ODE" or self.eta == 0.0:
+            return x
+        if self.solver_type == "Reverse-time SDE":
+            return x ** (self.eta + 1.0)
+        return x * ((x ** 0.3).exp() + 10.0) ** self.eta
+
+
+def krea2_er_sde_options(solver_type="ER-SDE", max_stage=3, eta=1.0, s_noise=1.0) -> dict:
+    """Validate parameters before sampling; ODE/eta=0 disables stochasticity."""
+    if solver_type not in _ER_SDE_TYPES:
+        raise ValueError("ER-SDE solver type must be ER-SDE, Reverse-time SDE or ODE")
+    if isinstance(max_stage, bool) or not isinstance(max_stage, int) or not 1 <= max_stage <= 3:
+        raise ValueError("ER-SDE max_stage must be an integer in [1, 3]")
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) or
+           not math.isfinite(v) for v in (eta, s_noise)):
+        raise ValueError("ER-SDE eta and s_noise must be finite numbers")
+    if not (0.0 <= eta <= 10.0 and 0.0 <= s_noise <= 100.0):
+        raise ValueError("ER-SDE eta or s_noise is outside its ComfyUI input range")
+    if solver_type == "ODE" or eta == 0.0:
+        solver_type, s_noise = "ODE", 0.0
+    return {
+        "max_stage": max_stage,
+        "s_noise": float(s_noise),
+        "noise_scaler": Krea2ERSDENoiseScaler(solver_type, float(eta)),
+    }
+
+
+def effective_er_sde_sigmas(sigmas: torch.Tensor, model) -> torch.Tensor:
+    """Native SNR solver first-sigma correction shared by ER-SDE and SA-Solver."""
+    from comfy.k_diffusion.sampling import offset_first_sigma_for_snr
+    return offset_first_sigma_for_snr(sigmas, _model_sampling_obj(model))
+
+
+SA_SOLVER_NAMES = frozenset(("sa_solver", "sa_solver_pece"))
+SNR_SOLVER_NAMES = SA_SOLVER_NAMES | {"er_sde"}
+
+
+def krea2_sa_solver_options(
+    model, *, eta=1.0, sde_start_percent=0.2, sde_end_percent=0.8,
+    s_noise=1.0, predictor_order=3, corrector_order=4, simple_order_2=False,
+) -> dict:
+    """ComfyUI SamplerSASolver options, using native model percent->sigma."""
+    values = (eta, sde_start_percent, sde_end_percent, s_noise)
+    if any(type(v) not in (int, float) or not math.isfinite(v) for v in values):
+        raise ValueError("SA-Solver eta, SDE percentages and s_noise must be finite")
+    if not (0 <= eta <= 10 and 0 <= s_noise <= 100 and
+            0 <= sde_start_percent <= sde_end_percent <= 1):
+        raise ValueError("SA-Solver SDE interval and noise values are invalid")
+    if (type(predictor_order) is not int or not 1 <= predictor_order <= 6 or
+            type(corrector_order) is not int or not 0 <= corrector_order <= 6 or
+            type(simple_order_2) is not bool):
+        raise ValueError("SA-Solver predictor/corrector order or simple_order_2 is invalid")
+    from comfy.k_diffusion.sa_solver import get_tau_interval_func
+    model_sampling = _model_sampling_obj(model)
+    start_sigma = model_sampling.percent_to_sigma(sde_start_percent)
+    end_sigma = model_sampling.percent_to_sigma(sde_end_percent)
+    return {
+        "tau_func": get_tau_interval_func(start_sigma, end_sigma, eta=float(eta)),
+        "s_noise": float(s_noise),
+        "predictor_order": predictor_order,
+        "corrector_order": corrector_order,
+        "simple_order_2": simple_order_2,
+    }
+
+
+def _er_sde_seed(seed: int, step: int, level: int) -> int:
+    """Independent, reproducible Gaussian fields across steps and patch levels."""
+    x = (int(seed) ^ 0xD1B54A32D192ED03 ^
+         ((int(step) + 1) * 0x9E3779B97F4A7C15) ^
+         ((int(level) + 2) * 0x94D049BB133111EB)) & _SEED_MASK
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _SEED_MASK
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _SEED_MASK
+    return (x ^ (x >> 31)) & _SEED_MASK
+
+
+class Krea2PatchCoupledERSDENoise:
+    """One iid Gaussian increment per native ER-SDE noise step.
+
+    Every pass regenerates the same coarse increment from the absolute outer
+    step index. Target increments are lifted through the same patch-phase
+    hierarchy as the resolution stages, preserving a Gaussian marginal at
+    every scale and coupling their coarse stochastic layout. No state escapes
+    this sampler invocation.
+    """
+
+    def __init__(self, low_shape, stage_shapes, stage_index, seed, start_step, sigmas, device, dtype):
+        self.low_shape = tuple(low_shape)
+        self.stage_shapes = tuple(tuple(shape) for shape in stage_shapes)
+        self.stage_index = int(stage_index)
+        self.seed = int(seed)
+        self.start_step = int(start_step)
+        self.sigmas = tuple(float(s) for s in sigmas.detach().cpu().tolist())
+        self.device = torch.device(device)
+        self.dtype = dtype
+        self.cursor = 0
+        if not (-1 <= self.stage_index < len(self.stage_shapes)):
+            raise ValueError("ER-SDE noise stage index is invalid")
+
+    def __call__(self, sigma, sigma_next):
+        i = self.cursor
+        if i + 1 >= len(self.sigmas):
+            raise RuntimeError("ER-SDE requested extra stochastic noise outside its sigma schedule")
+        # The native solver offsets the first flow sigma to avoid infinite
+        # log-SNR. The expected schedule was corrected before constructing us.
+        if (not math.isclose(float(sigma), self.sigmas[i], rel_tol=1e-5, abs_tol=1e-6)
+                or not math.isclose(float(sigma_next), self.sigmas[i + 1],
+                                    rel_tol=1e-5, abs_tol=1e-6)):
+            raise RuntimeError("ER-SDE noise request is out of native sigma order")
+        self.cursor += 1
+        step = self.start_step + i
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(_er_sde_seed(self.seed, step, -1))
+        field = torch.randn(self.low_shape, generator=generator,
+                            device="cpu", dtype=torch.float32).to(self.device)
+        for level in range(self.stage_index + 1):
+            field = build_patch_coupled_noise(
+                field, self.stage_shapes[level], _er_sde_seed(self.seed, step, level)
+            )
+        return field.to(device=self.device, dtype=self.dtype)
+
+
+
+class Krea2PatchCoupledSANoise(Krea2PatchCoupledERSDENoise):
+    """Native SA-Solver may request stochastic increments only in its SDE window.
+
+    Locate the actual sigma pair instead of advancing a dense step cursor;
+    this preserves common coarse noise even when stochastic intervals skip
+    steps, restart at release, or disable noise entirely.
+    """
+
+    def __call__(self, sigma, sigma_next):
+        for i in range(self.cursor, len(self.sigmas) - 1):
+            if (math.isclose(float(sigma), self.sigmas[i], rel_tol=1e-5, abs_tol=1e-6)
+                    and math.isclose(float(sigma_next), self.sigmas[i + 1],
+                                     rel_tol=1e-5, abs_tol=1e-6)):
+                self.cursor = i
+                return super().__call__(sigma, sigma_next)
+        raise RuntimeError("SA-Solver stochastic increment was requested out of sigma order")
+
+
+def _krea2_sampler_object(
+    sampler_name: str, sampler_options: Optional[dict], *,
+    model, low_shape: tuple, stage_shapes: tuple, stage_index: int,
+    seed: int, start_step: int, sigmas: torch.Tensor, noise_like: torch.Tensor,
+):
+    # The generic SLRD node preserves its caller-selected native sampler.
+    # Only the Krea 2 node passes validated options and enables patch coupling.
+    if sampler_name not in SNR_SOLVER_NAMES or sampler_options is None:
+        return comfy.samplers.sampler_object(sampler_name)
+    options = dict(sampler_options)
+    if sampler_name in SA_SOLVER_NAMES and sampler_name == "sa_solver":
+        options["use_pece"] = False
+    if options.get("s_noise", 1.0) > 0.0:
+        noise_cls = (Krea2PatchCoupledSANoise if sampler_name in SA_SOLVER_NAMES
+                     else Krea2PatchCoupledERSDENoise)
+        options["noise_sampler"] = noise_cls(
+            low_shape=low_shape, stage_shapes=stage_shapes, stage_index=stage_index,
+            seed=seed, start_step=start_step,
+            sigmas=effective_er_sde_sigmas(sigmas, model),
+            device=_resolve_sampler_device(model, noise_like.device),
+            dtype=noise_like.dtype,
+        )
+    # Keep ComfyUI's native stochastic Adams/ER-SDE integration and history.
+    return comfy.samplers.ksampler(sampler_name, options)
+
 
 LOCK_SCHEDULE_OPTIONS = [
     "linear",
@@ -127,6 +382,7 @@ class ScaleLockedRuntimeContext:
     planner_sigmas: list[float]
     highres_noise: torch.Tensor
     noise_seed: int
+    pece_corrected_anchors: Optional[list[Optional[torch.Tensor]]] = None
 
     def prepared_noise(self) -> "ScaleLockedPreparedNoise":
         return ScaleLockedPreparedNoise(self.highres_noise, self.noise_seed)
@@ -358,6 +614,25 @@ def apply_scale_lock_to_noise_prediction(guider, base_noise: torch.Tensor, x, ti
     return corrected
 
 
+def locked_planner_prediction(guider, x: torch.Tensor, timestep) -> Optional[torch.Tensor]:
+    """Planner prediction for a fully locked step, or None if the model must run.
+
+    ``apply_scale_lock_to_noise_prediction`` discards the target prediction
+    entirely during an unmasked full lock, so returning this directly yields
+    the same denoised value without the target model evaluation. Masked locks
+    blend the target prediction and return None.
+    """
+    if not getattr(guider, "_slrd_anchors_x0_cpu", None):
+        return None
+    if not scale_lock_full_lock_active(guider, timestep):
+        return None
+    if scale_lock_mask_for(guider, x) is not None:
+        return None
+    idx = resolve_scale_lock_step_index(guider, timestep)
+    # The anchor may alias stored planner state; never hand it out.
+    return scale_lock_anchor_for(guider, idx, x).clone()
+
+
 def create_cfg_guider(model, positive, negative, cfg):
     guider = comfy.samplers.CFGGuider(model)
     guider.set_conds(positive, negative)
@@ -384,7 +659,12 @@ def clone_guider_for_scale_lock(guider):
     return cloned
 
 
-def apply_scale_lock_to_guider(guider, runtime: ScaleLockedRuntimeContext, config: ScaleLockConfig):
+def apply_scale_lock_to_guider(
+    guider,
+    runtime: ScaleLockedRuntimeContext,
+    config: ScaleLockConfig,
+    skip_locked_model_calls: bool = False,
+):
     spatial_mask = prepare_spatial_lock_mask(config.spatial_mask, runtime.highres_latent["samples"])
     manifold_spatial_mask = prepare_spatial_lock_mask(
         config.manifold_spatial_mask if config.manifold_spatial_mask is not None else config.spatial_mask,
@@ -434,12 +714,48 @@ def apply_scale_lock_to_guider(guider, runtime: ScaleLockedRuntimeContext, confi
 
     original_predict_noise = getattr(guider, "_slrd_original_predict_noise", guider.predict_noise)
     guider._slrd_original_predict_noise = original_predict_noise
+    corrected = runtime.pece_corrected_anchors
+    guider._slrd_pece_corrected_anchors = corrected
+    guider._slrd_pece_counts = {} if corrected is not None else None
+    # A sampler-side latent noise mask is distinct from the scale-lock's
+    # spatial mask. Preserve the evaluated path for masked sampling even
+    # when the full lock would otherwise discard the target prediction.
+    guider._slrd_skip_locked_model_calls = (
+        bool(skip_locked_model_calls)
+        and not isinstance(runtime.highres_latent.get("noise_mask"), torch.Tensor)
+    )
 
     def _wrapped_predict_noise(self, x, timestep, model_options=None, seed=None):
         if model_options is None:
             model_options = {}
-        base_noise = self._slrd_original_predict_noise(x, timestep, model_options=model_options, seed=seed)
-        return apply_scale_lock_to_noise_prediction(self, base_noise, x, timestep)
+        original_anchors = self._slrd_anchors_x0_cpu
+        corrected = getattr(self, "_slrd_pece_corrected_anchors", None)
+        if corrected is not None:
+            index = resolve_scale_lock_step_index(self, timestep)
+            counts = self._slrd_pece_counts
+            calls = counts.get(index, 0) + 1
+            if calls > 2:
+                raise RuntimeError("SA-PECE target made more than two predictions at one sigma")
+            counts[index] = calls
+            if calls == 2:
+                correction = corrected[index]
+                if correction is None:
+                    raise RuntimeError("SA-PECE corrected planner anchor missing for target")
+                # This invocation sees the corrected planner prediction only
+                # at the matching sigma. Restore the shared predictor anchors
+                # even if CFG/transformer evaluation raises.
+                revised = list(original_anchors)
+                revised[index] = correction
+                self._slrd_anchors_x0_cpu = revised
+        try:
+            if getattr(self, "_slrd_skip_locked_model_calls", False):
+                locked = locked_planner_prediction(self, x, timestep)
+                if locked is not None:
+                    return locked
+            base_noise = self._slrd_original_predict_noise(x, timestep, model_options=model_options, seed=seed)
+            return apply_scale_lock_to_noise_prediction(self, base_noise, x, timestep)
+        finally:
+            self._slrd_anchors_x0_cpu = original_anchors
 
     guider.predict_noise = types.MethodType(_wrapped_predict_noise, guider)
     return guider
@@ -531,8 +847,10 @@ def _run_lowres_planner(
     seed: int,
     disable_noise: bool,
     pin_anchors: bool,
-) -> tuple[dict, list[torch.Tensor], list[float], torch.Tensor]:
-    sampler_obj = comfy.samplers.sampler_object(sampler_name)
+    sampler_options: Optional[dict] = None,
+) -> tuple[dict, list[torch.Tensor], list[float], torch.Tensor,
+           Optional[list[Optional[torch.Tensor]]]]:
+    sampler_obj = None
     guider = comfy.samplers.CFGGuider(model)
     guider.set_conds(positive, negative)
     guider.set_cfg(cfg)
@@ -563,11 +881,46 @@ def _run_lowres_planner(
     if isinstance(noise_mask, torch.Tensor):
         noise_mask = noise_mask.to(device=target_device, non_blocking=True)
     sigmas = sigmas.to(device=target_device, non_blocking=True)
+    sampler_obj = _krea2_sampler_object(
+        sampler_name, sampler_options, model=model, low_shape=tuple(planner_noise.shape),
+        stage_shapes=(), stage_index=-1, seed=seed, start_step=0,
+        sigmas=sigmas, noise_like=planner_noise,
+    )
     recorder = TrajectoryRecorder(
         store_dtype=_store_dtype_for(latent_samples),
         capture_noisy_xt=False,
         pin_memory=pin_anchors,
     )
+
+
+    pece_corrections = None
+    if sampler_name == "sa_solver_pece":
+        # Native SA-Solver emits its callback before the corrected-state
+        # denoiser evaluation. Capture that separate prediction here; the
+        # callback-only trajectory recorder intentionally stores predictors.
+        pece_corrections = [None] * (len(sigmas) - 1)
+        calls_per_step = [0] * len(pece_corrections)
+        effective = effective_er_sde_sigmas(sigmas, model).detach().cpu().tolist()
+        predict_native = guider.predict_noise
+
+        def _capture_pece_predictor_and_corrector(self, x, timestep, model_options=None, seed=None):
+            sigma = float(timestep.flatten()[0]) if torch.is_tensor(timestep) else float(timestep)
+            matches = [i for i, expected in enumerate(effective[:-1])
+                       if math.isclose(sigma, float(expected), rel_tol=1e-5, abs_tol=1e-6)]
+            if len(matches) != 1:
+                raise RuntimeError("SA-PECE planner evaluation did not match its sigma schedule")
+            index = matches[0]
+            calls_per_step[index] += 1
+            if calls_per_step[index] > 2:
+                raise RuntimeError("SA-PECE planner unexpectedly evaluated a step more than twice")
+            result = predict_native(x, timestep, model_options=model_options, seed=seed)
+            if calls_per_step[index] == 2:
+                pece_corrections[index] = result.detach().to(
+                    device="cpu", dtype=_store_dtype_for(latent_samples)
+                ).contiguous().clone()
+            return result
+
+        guider.predict_noise = types.MethodType(_capture_pece_predictor_and_corrector, guider)
 
     samples = guider.sample(
         planner_noise,
@@ -585,9 +938,18 @@ def _run_lowres_planner(
     out.pop("downscale_ratio_spacial", None)
     out["samples"] = samples
 
-    planner_sigmas = _planner_sigmas_for_recorded_steps(sigmas, len(recorder.x0_steps))
+    recorded_sigmas = effective_er_sde_sigmas(sigmas, model) if sampler_name in SNR_SOLVER_NAMES else sigmas
+    planner_sigmas = _planner_sigmas_for_recorded_steps(recorded_sigmas, len(recorder.x0_steps))
     recorder.step_sigmas = planner_sigmas
-    return out, recorder.x0_steps, planner_sigmas, planner_noise
+    if pece_corrections is not None:
+        order = int((sampler_options or {}).get("corrector_order", 4))
+        expected_counts = [1] + [2 if order > 0 else 1] * (len(sigmas) - 2)
+        if calls_per_step != expected_counts:
+            raise RuntimeError("SA-PECE planner correction evaluation count changed")
+        if any((pece_corrections[i] is None) != (expected_counts[i] == 1)
+               for i in range(len(calls_per_step))):
+            raise RuntimeError("SA-PECE corrected planner prediction is missing")
+    return out, recorder.x0_steps, planner_sigmas, planner_noise, pece_corrections
 
 
 def _build_highres_noise(
@@ -744,6 +1106,7 @@ def sample_with_runtime(
     config: ScaleLockConfig,
     restore_after: bool = True,
     analytic_full_lock: bool = False,
+    skip_locked_model_calls: bool = False,
 ) -> ScaleLockedSampleResult:
     if runtime.sigmas.numel() == 0:
         out = clean_latent(runtime.highres_latent)
@@ -768,7 +1131,7 @@ def sample_with_runtime(
         sigmas = sigmas[locked_steps:]
         latent_samples = runtime.model.model.process_latent_out(clean).to(dtype=latent_samples.dtype)
 
-    apply_scale_lock_to_guider(guider, runtime, config)
+    apply_scale_lock_to_guider(guider, runtime, config, skip_locked_model_calls=skip_locked_model_calls)
 
     x0_output = {}
     callback = make_preview_callback(runtime.model, len(sigmas) - 1, x0_output)
@@ -830,28 +1193,33 @@ def _run_resolution_ladder(
     planner_sigmas: list,
     lowres_noise: torch.Tensor,
     detail_seed: int,
+    stochastic_seed: int,
     nested_noise_strength: float,
     noise_mode: str,
     config: ScaleLockConfig,
     stage_hw: tuple,
+    sampler_options: Optional[dict] = None,
+    pece_corrected_anchors: Optional[list] = None,
 ) -> ScaleLockedSampleResult:
     """Refine through increasing resolutions, each stage finishing its image.
 
-    The first stage starts at the composition-lock release in closed form
-    from the planner predictions, exactly like the single-stage path. Every
-    later stage re-noises the finished image of the stage below, resized to
+    The first stage reaches the composition-lock release exactly like the
+    single-stage path: in closed form for Euler, and for other solvers by
+    integrating the locked prefix natively with the planner predictions in
+    place of target model calls, which preserves their multistep history.
+    Every later stage re-noises the finished image of the stage below, resized to
     its own size, to the same release noise level with its own patch-coupled
     noise, and runs the remaining steps. Each stage therefore repeats the
     planner-to-2x handoff at a bounded scale ratio, starting from a sharp
     image rather than from mid-noise predictions, whose posterior-mean blur
-    a late, low-noise start cannot remove.
+    a late, low-noise start cannot remove. A later stage is a fresh solver
+    start at the release sigma, so multistep solvers begin it at first order.
     """
     if config.full_lock_sigma is None:
         raise ValueError("resolution stages require the composition lock")
-    if _normalize_sampler_name(sampler_name) != "euler" or not isinstance(
-        _model_sampling_obj(model), comfy.model_sampling.CONST
-    ):
-        raise ValueError("resolution stages require Euler with flow model sampling")
+    if not isinstance(_model_sampling_obj(model), comfy.model_sampling.CONST):
+        raise ValueError("resolution stages require flow model sampling")
+    euler = _normalize_sampler_name(sampler_name) == "euler"
     if (
         isinstance(highres_latent.get("noise_mask"), torch.Tensor)
         or config.spatial_mask is not None
@@ -860,7 +1228,8 @@ def _run_resolution_ladder(
         raise ValueError("resolution stages do not support latent noise masks, spatial lock masks or manifold correction")
 
     target = highres_latent["samples"]
-    sigma_values = [float(v) for v in sigmas.detach().cpu().tolist()]
+    effective_sigmas = effective_er_sde_sigmas(sigmas, model) if sampler_name in SNR_SOLVER_NAMES else sigmas
+    sigma_values = [float(v) for v in effective_sigmas.detach().cpu().tolist()]
     total_steps = len(sigma_values) - 1
     release = full_lock_prefix_length(sigma_values, config.full_lock_sigma)
     if release >= total_steps:
@@ -873,7 +1242,8 @@ def _run_resolution_ladder(
         previous = hw
 
     stage_noise = lowres_noise
-    sampler = comfy.samplers.sampler_object(sampler_name)
+    shapes = tuple(tuple(lowres_noise.shape[:-2]) + tuple(hw) for hw in sizes)
+    sampler = comfy.samplers.sampler_object(sampler_name) if sampler_name not in SNR_SOLVER_NAMES else None
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
     x0_output: dict = {}
     finished = None
@@ -891,9 +1261,14 @@ def _run_resolution_ladder(
             mode=noise_mode,
         )
 
+        stage_sigmas = sigmas[release:]
         if finished is None:
             start_latent = stage_samples
-            if release > 0:
+            if not euler:
+                # Native solver over the full schedule; locked steps take the
+                # planner prediction and cost no model evaluation.
+                stage_sigmas = sigmas
+            elif release > 0:
                 initial = stage_samples
                 if torch.count_nonzero(initial) > 0:
                     initial = model.model.process_latent_in(initial)
@@ -912,6 +1287,14 @@ def _run_resolution_ladder(
                 finished.to(device=stage_samples.device, dtype=torch.float32), hw
             ).to(dtype=stage_samples.dtype)
 
+        if sampler_name in SNR_SOLVER_NAMES:
+            sampler = _krea2_sampler_object(
+                sampler_name, sampler_options, model=model, low_shape=tuple(lowres_noise.shape),
+                stage_shapes=shapes, stage_index=index, seed=stochastic_seed,
+                start_step=0 if finished is None else release,
+                sigmas=stage_sigmas, noise_like=stage_noise,
+            )
+
         stage_runtime = ScaleLockedRuntimeContext(
             model=model,
             highres_latent=stage_latent,
@@ -922,17 +1305,18 @@ def _run_resolution_ladder(
             planner_sigmas=planner_sigmas,
             highres_noise=stage_noise,
             noise_seed=seed,
+            pece_corrected_anchors=pece_corrected_anchors,
         )
         guider = create_cfg_guider(model, positive, negative, cfg)
-        apply_scale_lock_to_guider(guider, stage_runtime, config)
+        apply_scale_lock_to_guider(guider, stage_runtime, config, skip_locked_model_calls=True)
         stage_x0: dict = {}
-        callback = make_preview_callback(model, total_steps - release, stage_x0)
+        callback = make_preview_callback(model, len(stage_sigmas) - 1, stage_x0)
         try:
             finished = guider.sample(
                 stage_noise,
                 start_latent,
                 sampler,
-                sigmas[release:],
+                stage_sigmas,
                 denoise_mask=None,
                 callback=callback,
                 disable_pbar=disable_pbar,
@@ -978,6 +1362,8 @@ def run_scale_locked_ksampler(
     config: ScaleLockConfig,
     noise_mode: str = "legacy",
     stage_hw: tuple = (),
+    sampler_options: Optional[dict] = None,
+    sa_planner_native_only: bool = False,
 ) -> ScaleLockedSampleResult:
     if steps < 1:
         raise ValueError("steps must be >= 1")
@@ -988,7 +1374,11 @@ def run_scale_locked_ksampler(
         out = clean_latent(highres_latent)
         return ScaleLockedSampleResult(output=out, lowres_planner=clean_latent(lowres_latent), denoised_output=out)
 
-    guard_sampler_alignment(sampler_name, sampler_guard)
+    # The Krea 2 ER-SDE node injects a verified single-prediction native
+    # sampler and patch-coupled stochastic increments. The generic SLRD
+    # alignment guard remains conservative for arbitrary ER-SDE samplers.
+    if not (sampler_name in SNR_SOLVER_NAMES and sampler_options is not None):
+        guard_sampler_alignment(sampler_name, sampler_guard)
     sigmas = calculate_sigmas(model, scheduler=scheduler, steps=steps, denoise=denoise)
     if sigmas.numel() == 0:
         out = clean_latent(highres_latent)
@@ -998,18 +1388,26 @@ def run_scale_locked_ksampler(
     planner_seed = int(seed)
     detail_seed = int(seed) ^ 0x9E3779B97F4A7C15
 
-    lowres_out, anchors_x0, planner_sigmas, lowres_noise = _run_lowres_planner(
-        model=model,
-        positive=positive,
-        negative=negative,
-        cfg=cfg,
-        sampler_name=sampler_name,
-        sigmas=sigmas,
-        lowres_latent=lowres_latent,
-        seed=planner_seed,
-        disable_noise=disable_noise,
-        pin_anchors=pin_anchors,
-    )
+    # A native-only planner is an invocation-scoped quality comparator.
+    # Reset the context before either target stage: target Spectrum forecasts
+    # remain enabled, and no sampler or MODEL wrapper is modified.
+    with sa_native_only_scope(
+        bool(sa_planner_native_only)
+        and sampler_name in ("sa_solver", "sa_solver_pece")
+    ):
+        lowres_out, anchors_x0, planner_sigmas, lowres_noise, pece_corrections = _run_lowres_planner(
+            model=model,
+            positive=positive,
+            negative=negative,
+            cfg=cfg,
+            sampler_name=sampler_name,
+            sigmas=sigmas,
+            lowres_latent=lowres_latent,
+            seed=planner_seed,
+            disable_noise=disable_noise,
+            pin_anchors=pin_anchors,
+            sampler_options=sampler_options,
+        )
     if len(anchors_x0) == 0:
         raise RuntimeError("ScaleLockedResidualKSampler: planner pass did not record any x0 anchors.")
 
@@ -1019,8 +1417,9 @@ def run_scale_locked_ksampler(
             sampler_name=sampler_name, sigmas=sigmas, highres_latent=highres_latent,
             lowres_latent=lowres_latent, lowres_out=lowres_out, anchors_x0=anchors_x0,
             planner_sigmas=planner_sigmas, lowres_noise=lowres_noise, detail_seed=detail_seed,
-            nested_noise_strength=nested_noise_strength, noise_mode=noise_mode,
-            config=config, stage_hw=tuple(stage_hw),
+            stochastic_seed=planner_seed, nested_noise_strength=nested_noise_strength, noise_mode=noise_mode,
+            config=config, stage_hw=tuple(stage_hw), sampler_options=sampler_options,
+            pece_corrected_anchors=pece_corrections,
         )
 
     runtime = ScaleLockedRuntimeContext(
@@ -1039,17 +1438,26 @@ def run_scale_locked_ksampler(
             mode=noise_mode,
         ),
         noise_seed=detail_seed,
+        pece_corrected_anchors=pece_corrections,
     )
     guider = create_cfg_guider(model, positive, negative, cfg)
-    sampler = comfy.samplers.sampler_object(sampler_name)
+    sampler = _krea2_sampler_object(
+        sampler_name, sampler_options, model=model, low_shape=tuple(lowres_noise.shape),
+        stage_shapes=(tuple(runtime.highres_noise.shape),), stage_index=0,
+        seed=planner_seed, start_step=0, sigmas=sigmas, noise_like=runtime.highres_noise,
+    )
     # The closed-form lock handoff is exact only for the flow-matching Euler update.
     analytic_full_lock = (
         config.full_lock_sigma is not None
         and _normalize_sampler_name(sampler_name) == "euler"
         and isinstance(_model_sampling_obj(model), comfy.model_sampling.CONST)
     )
+    # Other solvers integrate the locked prefix natively; answering those steps
+    # with the planner prediction skips only target evaluations whose output the
+    # full lock would discard, so solver history and the result are unchanged.
     return sample_with_runtime(
         guider=guider, sampler=sampler, runtime=runtime, config=config,
         analytic_full_lock=analytic_full_lock,
+        skip_locked_model_calls=config.full_lock_sigma is not None,
     )
 
