@@ -378,6 +378,29 @@ def main():
         assert all(torch.isfinite(part["samples"]).all() for part in result), er_mode
 
 
+
+    # Native SA-Solver supports ODE/no-noise, stochastic SDE windows,
+    # simplified-order coefficients and PECE. Exercise the unmodified
+    # ComfyUI numerical path with these non-default controls.
+    for solver, eta, s_noise, predictor, corrector, simple in (
+        ("sa_solver", 0.0, 1.0, 3, 4, False),
+        ("sa_solver", 0.7, 0.45, 2, 2, True),
+        ("sa_solver_pece", 0.0, 0.0, 3, 4, False),
+        ("sa_solver_pece", 0.45, 0.6, 2, 2, True),
+    ):
+        result, _, counts = controls(
+            model, solver, "simple", 1.0, 8, True,
+            max_stage_upscale=0.0, sa_eta=eta,
+            sa_sde_start_percent=.1, sa_sde_end_percent=.9,
+            sa_s_noise=s_noise, sa_predictor_order=predictor,
+            sa_corrector_order=corrector, sa_simple_order_2=simple,
+        )
+        planner_hw = tuple(result[1]["samples"].shape[-2:])
+        assert counts[planner_hw] == solver_calls(solver, 8), counts
+        assert counts[(16, 20)] == target_calls(solver, 8, locked_by_steps[8]), counts
+        print(json.dumps({"case": "sa_native_modes", "sampler": solver,
+                          "eta": eta, "s_noise": s_noise, "simple": simple}))
+
     if args.spectrum_root and args.kj_root:
         # Exercise the real upstream KJ PreviewOverride __call__ in the
         # complete Scale-Locked -> Spectrum -> native ER-SDE two-pass route.
