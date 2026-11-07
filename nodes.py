@@ -272,7 +272,8 @@ class Krea2TurboFlowAlignedRegenerate:
                 "er_sde_eta": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01,
                     "tooltip": "Only used with er_sde. Native stochastic-strength exponent; zero selects ODE with no stochastic noise."}),
                 "er_sde_s_noise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.01,
-                    "tooltip": "Only used with er_sde. Multiplies its patch-coupled per-step stochastic increments; ODE forces zero."}),
+                    "tooltip": "Only used with er_sde. Multiplies its patch-coupled per-step stochastic increments; ODE forces zero. "
+                               "Keep 1.0: lower values re-add less noise than each step removes, which gives airbrushed, plastic results."}),
                 "sa_eta": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01,
                     "tooltip": "SA-Solver only: stochastic strength (0 = ODE)."}),
                 "sa_sde_start_percent": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.001,
@@ -282,9 +283,11 @@ class Krea2TurboFlowAlignedRegenerate:
                                "about 0.68 at Krea 2's flow shift) keeps stochastic steps in the planner and makes the "
                                "high-resolution stages deterministic. ComfyUI's native 0.8 keeps every stage step stochastic; "
                                "with few steps per stage that produced visible artifacts with plain SA-Solver. If upscale stages invent small "
-                               "details, try 0.30 together with sa_s_noise 0.5."}),
+                               "details, end the window earlier, for example 0.30."}),
                 "sa_s_noise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.01,
-                    "tooltip": "SA-Solver only: SDE noise multiplier, patch-coupled across scales."}),
+                    "tooltip": "SA-Solver only: SDE noise multiplier, patch-coupled across scales. Keep 1.0: lower values re-add less "
+                               "noise than each stochastic step removes, which gives airbrushed, plastic results. "
+                               "Narrow the SDE window or lower sa_eta to reduce stochasticity instead."}),
                 "sa_predictor_order": ("INT", {"default": 3, "min": 1, "max": 6,
                     "tooltip": "SA-Solver only: native Adams predictor order."}),
                 "sa_corrector_order": ("INT", {"default": 4, "min": 0, "max": 6,
