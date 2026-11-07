@@ -1567,11 +1567,22 @@ class PlannerLatentConsistency:
         self.target_hw = tuple(map(int, target_hw))
         self.p_h = self._right_inverse(self.low_hw[0], self.target_hw[0], device)
         self.p_w = self._right_inverse(self.low_hw[1], self.target_hw[1], device)
+        self._by_device = {reference.device: (self.reference, self.p_h, self.p_w)}
+
+    def _operands(self, device: torch.device):
+        # The stage latent may live on the intermediate (CPU) device while the
+        # sampler's denoised predictions and outputs live on the load device.
+        operands = self._by_device.get(device)
+        if operands is None:
+            operands = tuple(t.to(device=device) for t in (self.reference, self.p_h, self.p_w))
+            self._by_device[device] = operands
+        return operands
 
     def relative_error(self, target: torch.Tensor) -> float:
         x = target.squeeze(2) if target.ndim == 5 and target.shape[2] == 1 else target
+        reference, _, _ = self._operands(x.device)
         observed = F.interpolate(x.float(), size=self.low_hw, mode="area")
-        return float((observed - self.reference).norm() / self.reference.norm().clamp_min(1e-12))
+        return float((observed - reference).norm() / reference.norm().clamp_min(1e-12))
 
     def apply(self, target: torch.Tensor, strength: float) -> torch.Tensor:
         if strength == 0.0:
@@ -1581,8 +1592,9 @@ class PlannerLatentConsistency:
         if x.ndim != 4 or tuple(x.shape[-2:]) != self.target_hw:
             raise ValueError("planner consistency target layout or resolution mismatch")
         x32 = x.float()
-        mismatch = self.reference - F.interpolate(x32, size=self.low_hw, mode="area")
-        correction = torch.matmul(torch.matmul(self.p_h, mismatch), self.p_w.T)
+        reference, p_h, p_w = self._operands(x32.device)
+        mismatch = reference - F.interpolate(x32, size=self.low_hw, mode="area")
+        correction = torch.matmul(torch.matmul(p_h, mismatch), p_w.T)
         projected = (x32 + float(strength) * correction).to(dtype=x.dtype)
         return projected.unsqueeze(2) if temporal else projected
 

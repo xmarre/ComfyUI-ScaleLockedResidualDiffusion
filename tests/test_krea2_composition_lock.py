@@ -625,3 +625,16 @@ def test_planner_latent_consistency_exact_lowband_and_nullspace(low_hw, high_hw,
     torch.testing.assert_close(
         half_low - planner, 0.5 * (raw_low - planner), atol=3e-5, rtol=3e-5
     )
+
+
+
+def test_planner_consistency_follows_target_device():
+    # Stage latents can be built on the intermediate CPU device while native
+    # sampling hands denoised predictions on the load device. The meta device
+    # stands in for CUDA on CPU-only runners.
+    projection = runtime.PlannerLatentConsistency(torch.randn(1, 16, 6, 8), (10, 14), torch.device("cpu"))
+    for layout in ((1, 16, 10, 14), (1, 16, 1, 10, 14)):
+        projected = projection.apply(torch.randn(layout, device="meta"), 1.0)
+        assert projected.device.type == "meta" and tuple(projected.shape) == layout
+    cpu = torch.randn(1, 16, 10, 14)
+    assert projection.relative_error(projection.apply(cpu, 1.0)) < 1e-5
