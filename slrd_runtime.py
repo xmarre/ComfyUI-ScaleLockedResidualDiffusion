@@ -1364,7 +1364,11 @@ def run_scale_locked_ksampler(
     stage_hw: tuple = (),
     sampler_options: Optional[dict] = None,
     sa_planner_native_only: bool = False,
+    target_sampler_options: Optional[dict] = None,
 ) -> ScaleLockedSampleResult:
+    # The planner always uses sampler_options. Resolution stages and the
+    # single-stage target may use separate options of the same sampler.
+    target_options = sampler_options if target_sampler_options is None else target_sampler_options
     if steps < 1:
         raise ValueError("steps must be >= 1")
 
@@ -1418,7 +1422,7 @@ def run_scale_locked_ksampler(
             lowres_latent=lowres_latent, lowres_out=lowres_out, anchors_x0=anchors_x0,
             planner_sigmas=planner_sigmas, lowres_noise=lowres_noise, detail_seed=detail_seed,
             stochastic_seed=planner_seed, nested_noise_strength=nested_noise_strength, noise_mode=noise_mode,
-            config=config, stage_hw=tuple(stage_hw), sampler_options=sampler_options,
+            config=config, stage_hw=tuple(stage_hw), sampler_options=target_options,
             pece_corrected_anchors=pece_corrections,
         )
 
@@ -1442,7 +1446,7 @@ def run_scale_locked_ksampler(
     )
     guider = create_cfg_guider(model, positive, negative, cfg)
     sampler = _krea2_sampler_object(
-        sampler_name, sampler_options, model=model, low_shape=tuple(lowres_noise.shape),
+        sampler_name, target_options, model=model, low_shape=tuple(lowres_noise.shape),
         stage_shapes=(tuple(runtime.highres_noise.shape),), stage_index=0,
         seed=planner_seed, start_step=0, sigmas=sigmas, noise_like=runtime.highres_noise,
     )
