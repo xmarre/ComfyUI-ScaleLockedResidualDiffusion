@@ -63,7 +63,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: xmarre/ComfyUI-Spectrum-Krea2
-          ref: 571d5a01516e56a0d8bcdcfaa2f3abc2023f8935
+          ref: b6f91a19fd161dba553ea2c232da6ccbe3139ac7
           path: _spectrum
       - name: Install real ComfyUI CPU test dependencies
         run: |
