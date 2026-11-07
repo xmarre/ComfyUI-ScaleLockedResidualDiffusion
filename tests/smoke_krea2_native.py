@@ -465,14 +465,21 @@ def main():
         # Planner-native-only A/B: isolate the low-resolution Spectrum quality
         # without giving up accelerated intermediate/final target stages.
         # Same seed, sampler, Gaussian coupling and planner schedule.
+        # The default distance guard rejects every target-stage forecast on
+        # this short CPU schedule; use the relaxed configuration of the other
+        # ladder forecast checks so the stage acceleration is observable.
+        stage_forecasting = SpectrumApplyKrea2().apply(
+            model, preset="turbo", warmup=2, tail=1, bootstrap=False,
+            extrapolation_guard_enabled=False,
+        )[0]
         for sampler_name in ("sa_solver", "sa_solver_pece"):
             native_all, native_reports, _ = controls(
-                cases[1][1], sampler_name, "simple", 1.0, 12, False,
+                stage_forecasting, sampler_name, "simple", 1.0, 12, False,
                 latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
                 sa_spectrum_forecasts=False,
             )
             planner_native, hybrid_reports, _ = controls(
-                cases[1][1], sampler_name, "simple", 1.0, 12, False,
+                stage_forecasting, sampler_name, "simple", 1.0, 12, False,
                 latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
                 sa_spectrum_forecasts=True, sa_planner_spectrum_forecasts=False,
             )
@@ -493,7 +500,7 @@ def main():
             # Context lifetime: the next independent call must regain planner
             # forecasts with no leaked native-only selection.
             _, restored, _ = controls(
-                cases[1][1], sampler_name, "simple", 1.0, 12, False,
+                stage_forecasting, sampler_name, "simple", 1.0, 12, False,
                 latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
                 sa_spectrum_forecasts=True, sa_planner_spectrum_forecasts=True,
             )
