@@ -281,7 +281,8 @@ class Krea2TurboFlowAlignedRegenerate:
                     "tooltip": "SA-Solver only: end of the stochastic model-sigma interval. The default 0.35 (model sigma "
                                "about 0.68 at Krea 2's flow shift) keeps stochastic steps in the planner and makes the "
                                "high-resolution stages deterministic. ComfyUI's native 0.8 keeps every stage step stochastic; "
-                               "with few steps per stage that produced visible artifacts with plain SA-Solver."}),
+                               "with few steps per stage that produced visible artifacts with plain SA-Solver. If upscale stages invent small "
+                               "details, try 0.30 together with sa_s_noise 0.5."}),
                 "sa_s_noise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.01,
                     "tooltip": "SA-Solver only: SDE noise multiplier, patch-coupled across scales."}),
                 "sa_predictor_order": ("INT", {"default": 3, "min": 1, "max": 6,
