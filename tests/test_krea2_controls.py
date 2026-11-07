@@ -93,7 +93,7 @@ def test_existing_widget_slots_and_explicit_defaults():
         "er_sde_solver_type", "er_sde_max_stage", "er_sde_eta", "er_sde_s_noise",
         "sa_eta", "sa_sde_start_percent", "sa_sde_end_percent", "sa_s_noise",
         "sa_predictor_order", "sa_corrector_order", "sa_simple_order_2",
-        "sa_spectrum_forecasts",
+        "sa_spectrum_forecasts", "sa_planner_spectrum_forecasts",
     ]
     assert schema["optional"]["cfg"][1]["default"] == 1.0
     assert schema["optional"]["sampler_name"][0] == list(SAMPLERS)
@@ -110,6 +110,7 @@ def test_existing_widget_slots_and_explicit_defaults():
     assert schema["optional"]["sa_corrector_order"][1]["default"] == 4
     assert schema["optional"]["sa_simple_order_2"][1]["default"] is False
     assert schema["optional"]["sa_spectrum_forecasts"][1]["default"] is True
+    assert schema["optional"]["sa_planner_spectrum_forecasts"][1]["default"] is True
     assert node.sample(*args) == ("target", "planner", "denoised")
     assert (calls[-1]["cfg"], calls[-1]["sampler_name"],
             calls[-1]["scheduler"]) == (1.0, "euler", "simple")
@@ -205,4 +206,31 @@ def test_sa_invalid_forecast_control_fails_before_sampling():
     node, calls, args = _node()
     with pytest.raises(ValueError, match="sa_spectrum_forecasts must be a boolean"):
         node.sample(*args, sampler_name="sa_solver", sa_spectrum_forecasts=1)
+    assert not calls
+
+
+
+@pytest.mark.parametrize("sampler_name", ["sa_solver", "sa_solver_pece"])
+@pytest.mark.parametrize("planner_forecasts", [False, True])
+def test_sa_native_planner_control_does_not_change_target_policy(sampler_name, planner_forecasts):
+    node, calls, args = _node()
+    node.sample(*args, sampler_name=sampler_name, sa_spectrum_forecasts=True,
+                sa_planner_spectrum_forecasts=planner_forecasts)
+    assert calls[-1]["sa_planner_native_only"] is not planner_forecasts
+    assert "sa_planner_spectrum_forecasts" not in calls[-1]["sampler_options"]
+    assert "sa_planner_native_only" not in calls[-1]["sampler_options"]
+    # The outer native-only control still applies to every stage. Restoring
+    # the nested planner flag cannot spuriously re-enable target forecasting.
+    node.sample(*args, sampler_name=sampler_name, sa_spectrum_forecasts=False,
+                sa_planner_spectrum_forecasts=True)
+    assert calls[-1]["sa_planner_native_only"] is False
+    # Non-SA sampler behavior must remain independent of the new UI setting.
+    node.sample(*args, sampler_name="er_sde", sa_planner_spectrum_forecasts=False)
+    assert calls[-1]["sa_planner_native_only"] is False
+
+
+def test_sa_invalid_planner_forecast_control_rejected_before_any_sampling():
+    node, calls, args = _node()
+    with pytest.raises(ValueError, match="sa_planner_spectrum_forecasts must be a boolean"):
+        node.sample(*args, sampler_name="sa_solver", sa_planner_spectrum_forecasts=1)
     assert not calls

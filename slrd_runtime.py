@@ -1363,6 +1363,7 @@ def run_scale_locked_ksampler(
     noise_mode: str = "legacy",
     stage_hw: tuple = (),
     sampler_options: Optional[dict] = None,
+    sa_planner_native_only: bool = False,
 ) -> ScaleLockedSampleResult:
     if steps < 1:
         raise ValueError("steps must be >= 1")
@@ -1387,19 +1388,26 @@ def run_scale_locked_ksampler(
     planner_seed = int(seed)
     detail_seed = int(seed) ^ 0x9E3779B97F4A7C15
 
-    lowres_out, anchors_x0, planner_sigmas, lowres_noise, pece_corrections = _run_lowres_planner(
-        model=model,
-        positive=positive,
-        negative=negative,
-        cfg=cfg,
-        sampler_name=sampler_name,
-        sigmas=sigmas,
-        lowres_latent=lowres_latent,
-        seed=planner_seed,
-        disable_noise=disable_noise,
-        pin_anchors=pin_anchors,
-        sampler_options=sampler_options,
-    )
+    # A native-only planner is an invocation-scoped quality comparator.
+    # Reset the context before either target stage: target Spectrum forecasts
+    # remain enabled, and no sampler or MODEL wrapper is modified.
+    with sa_native_only_scope(
+        bool(sa_planner_native_only)
+        and sampler_name in ("sa_solver", "sa_solver_pece")
+    ):
+        lowres_out, anchors_x0, planner_sigmas, lowres_noise, pece_corrections = _run_lowres_planner(
+            model=model,
+            positive=positive,
+            negative=negative,
+            cfg=cfg,
+            sampler_name=sampler_name,
+            sigmas=sigmas,
+            lowres_latent=lowres_latent,
+            seed=planner_seed,
+            disable_noise=disable_noise,
+            pin_anchors=pin_anchors,
+            sampler_options=sampler_options,
+        )
     if len(anchors_x0) == 0:
         raise RuntimeError("ScaleLockedResidualKSampler: planner pass did not record any x0 anchors.")
 

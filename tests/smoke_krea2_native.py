@@ -461,6 +461,51 @@ def main():
                 "forecast_enabled": [r["forecast"] for r in on_reports],
             }))
 
+    if reports_context is not None:
+        # Planner-native-only A/B: isolate the low-resolution Spectrum quality
+        # without giving up accelerated intermediate/final target stages.
+        # Same seed, sampler, Gaussian coupling and planner schedule.
+        for sampler_name in ("sa_solver", "sa_solver_pece"):
+            native_all, native_reports, _ = controls(
+                cases[1][1], sampler_name, "simple", 1.0, 12, False,
+                latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
+                sa_spectrum_forecasts=False,
+            )
+            planner_native, hybrid_reports, _ = controls(
+                cases[1][1], sampler_name, "simple", 1.0, 12, False,
+                latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
+                sa_spectrum_forecasts=True, sa_planner_spectrum_forecasts=False,
+            )
+            assert len(native_reports) == len(hybrid_reports) == 3
+            assert all(r["fallback"] is None for r in hybrid_reports), hybrid_reports
+            assert hybrid_reports[0]["native_only"] is True, hybrid_reports
+            assert hybrid_reports[0]["forecast"] == 0, hybrid_reports
+            assert hybrid_reports[0]["peak_history_bytes"] == 0, hybrid_reports
+            assert hybrid_reports[0]["actual"] == native_reports[0]["actual"], hybrid_reports
+            torch.testing.assert_close(
+                planner_native[1]["samples"], native_all[1]["samples"],
+                rtol=0, atol=0,
+            )
+            assert all(r["native_only"] is False for r in hybrid_reports[1:]), hybrid_reports
+            assert any(r["forecast"] > 0 for r in hybrid_reports[1:]), hybrid_reports
+            assert all(torch.isfinite(x["samples"]).all() for x in planner_native)
+
+            # Context lifetime: the next independent call must regain planner
+            # forecasts with no leaked native-only selection.
+            _, restored, _ = controls(
+                cases[1][1], sampler_name, "simple", 1.0, 12, False,
+                latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
+                sa_spectrum_forecasts=True, sa_planner_spectrum_forecasts=True,
+            )
+            assert all(not r["native_only"] for r in restored), restored
+            assert restored[0]["forecast"] > 0, restored
+            print(json.dumps({
+                "case": "sa_native_planner_only",
+                "sampler": sampler_name,
+                "reports": hybrid_reports,
+                "restored_planner_forecasts": restored[0]["forecast"],
+            }))
+
     # Native ER-SDE's deterministic ODE mode and stochastic reverse-time mode
     # use the same wrapper, stage planner and evaluation-skipping contract.
     for er_mode, eta, noise in (("ODE", 1.0, 1.0), ("Reverse-time SDE", .5, .6)):

@@ -296,6 +296,11 @@ class Krea2TurboFlowAlignedRegenerate:
                                "Off runs every SA predictor and PECE correction natively (a quality reference). "
                                "Forecasts on stochastic steps never reuse the forecast's noise estimate; they are most "
                                "effective on the deterministic high-resolution stages set by sa_sde_end_percent."}),
+                "sa_planner_spectrum_forecasts": ("BOOLEAN", {"default": True,
+                    "tooltip": "SA-Solver only: enable Spectrum forecasts in the low-resolution planner. "
+                               "Off evaluates every planner step natively while preserving Spectrum acceleration "
+                               "in the intermediate and final high-resolution stages. This is a quality comparison "
+                               "for planner texture loss; the planner uses the same native noise and solver."}),
             },
         }
 
@@ -328,6 +333,7 @@ class Krea2TurboFlowAlignedRegenerate:
         sa_corrector_order=4,
         sa_simple_order_2=False,
         sa_spectrum_forecasts=True,
+        sa_planner_spectrum_forecasts=True,
     ):
         if not isinstance(cfg, (int, float)) or not math.isfinite(cfg) or not 0.0 <= cfg <= 100.0:
             raise ValueError("Krea 2 CFG must be finite and within [0, 100]")
@@ -350,6 +356,8 @@ class Krea2TurboFlowAlignedRegenerate:
         elif sampler_name in ("sa_solver", "sa_solver_pece"):
             if type(sa_spectrum_forecasts) is not bool:
                 raise ValueError("sa_spectrum_forecasts must be a boolean")
+            if type(sa_planner_spectrum_forecasts) is not bool:
+                raise ValueError("sa_planner_spectrum_forecasts must be a boolean")
             sampler_options = krea2_sa_solver_options(
                 model, eta=sa_eta, sde_start_percent=sa_sde_start_percent,
                 sde_end_percent=sa_sde_end_percent, s_noise=sa_s_noise,
@@ -465,6 +473,10 @@ class Krea2TurboFlowAlignedRegenerate:
                 noise_mode="patch_coupled",
                 stage_hw=tuple(stage_hw),
                 sampler_options=sampler_options,
+                sa_planner_native_only=(
+                    sampler_name in ("sa_solver", "sa_solver_pece")
+                    and not sa_planner_spectrum_forecasts
+                ),
             )
         return (result.output, result.lowres_planner, result.denoised_output)
 

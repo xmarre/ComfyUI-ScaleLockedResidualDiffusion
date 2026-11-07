@@ -98,7 +98,23 @@ runtime and does not load weights independently.
     resolution-stage configuration or other samplers. Spectrum never consumes
     a raw forecast on a stochastic step, because a forecast cannot see SA's
     fresh noise increment. Forecasts are therefore most effective on the
-    deterministic stages. Tested on a real Krea 2 Turbo checkpoint
+    deterministic stages. `sa_planner_spectrum_forecasts` (default **true**)
+    independently controls Spectrum only during the low-resolution planner
+    pass. Set it to **false** while keeping `sa_spectrum_forecasts=true` to
+    evaluate all planner denoisers natively, retain the same seeded noise,
+    sigma schedule and planner anchors, then restore Spectrum acceleration
+    for both high-resolution stages. This isolates cases where the planner
+    preview appears over-smoothed despite a detailed final image. It is
+    an optional quality diagnostic, not proof that forecast error causes the
+    blur: the planner also operates at a lower native resolution. The
+    planner and target passes report `native_only` and `forecast` separately,
+    so verify planner `native_only=true, forecast=0`, target
+    `native_only=false` before interpreting results. With a 14-step
+    Spectrum turbo run that previously used 8 actual planner predictions
+    and 6 forecasts, the expected comparison uses 14 actual planner
+    predictions while retaining target forecast opportunities. It increases
+    planner runtime, without changing target-stage numerical code or the
+    underlying solver. Tested on a real Krea 2 Turbo checkpoint
     (14 steps, 1872→2672→3824 px, one seed): plain `sa_solver` at these
     defaults looked clean natively and with forecasts. Forecasts cut sampling
     time from 70 s to 45 s. If upscale stages still invent small details
