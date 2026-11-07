@@ -513,6 +513,63 @@ def main():
                 "restored_planner_forecasts": restored[0]["forecast"],
             }))
 
+    # ER-SDE's three modes must not contaminate later queued invocations,
+    # even when ComfyUI reuses the same node, MODEL patcher, and Spectrum
+    # wrapper instance. Test the *complete* three-resolution sampler, not just
+    # an options constructor or a toy noise-scaler.
+    for label, selected in (
+        ("native", model),
+        *((("spectrum", SpectrumApplyKrea2().apply(
+            model, preset="turbo", warmup=2, tail=1, bootstrap=False,
+            extrapolation_guard_enabled=False,
+        )[0]),) if reports_context is not None else ()),
+    ):
+        a = dict(sampler_name="er_sde", er_sde_solver_type="ER-SDE",
+                 er_sde_max_stage=3, er_sde_eta=1.0, er_sde_s_noise=1.0)
+        ode = dict(sampler_name="er_sde", er_sde_solver_type="ODE",
+                   er_sde_max_stage=1, er_sde_eta=1.0, er_sde_s_noise=1.0)
+        reverse = dict(sampler_name="er_sde", er_sde_solver_type="Reverse-time SDE",
+                       er_sde_max_stage=2, er_sde_eta=0.5, er_sde_s_noise=0.65)
+        profiles = (a, ode, reverse,
+                    dict(sampler_name="sa_solver", sa_sde_end_percent=.30,
+                         sa_s_noise=.5), a)
+        outcomes = []
+        receipts = []
+        for profile in profiles:
+            latent_parts, reports, _ = controls(
+                selected, profile["sampler_name"], "simple", 1.0, 12, False,
+                latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
+                **{k: v for k, v in profile.items() if k != "sampler_name"},
+            )
+            outcomes.append(tuple(part["samples"].clone() for part in latent_parts))
+            receipts.append(reports)
+            if label == "spectrum":
+                assert len(reports) == 3, reports
+                assert all(r["fallback"] is None for r in reports), reports
+                assert all(r["native_only"] is False for r in reports), reports
+        for before, after in zip(outcomes[0], outcomes[-1]):
+            torch.testing.assert_close(before, after, rtol=0, atol=0)
+        # The mode selector materially affects the native numerical output.
+        # A genuine ODE switch must not merely reuse the preceding ER-SDE
+        # option dictionary or stochastic sampler instance.
+        assert not torch.equal(outcomes[0][0], outcomes[1][0]), label
+        assert not torch.equal(outcomes[0][0], outcomes[2][0]), label
+        assert not torch.equal(outcomes[1][0], outcomes[2][0]), label
+        assert not base.diffusion_model._forward_pre_hooks
+        assert not base.diffusion_model.last._forward_pre_hooks
+        print(json.dumps({
+            "case": "er_sde_cross_run_state_isolation",
+            "model": label,
+            "modes": [x["er_sde_solver_type"] if x["sampler_name"] == "er_sde"
+                      else x["sampler_name"] for x in profiles],
+            "identical_return_to_first": True,
+            "spectrum_reports": [
+                [{"actual": p["actual"], "forecast": p["forecast"],
+                  "fallback": p["fallback"]} for p in rr]
+                for rr in receipts if rr
+            ],
+        }))
+
     # Native ER-SDE's deterministic ODE mode and stochastic reverse-time mode
     # use the same wrapper, stage planner and evaluation-skipping contract.
     for er_mode, eta, noise in (("ODE", 1.0, 1.0), ("Reverse-time SDE", .5, .6)):

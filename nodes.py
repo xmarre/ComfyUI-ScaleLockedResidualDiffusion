@@ -353,6 +353,16 @@ class Krea2TurboFlowAlignedRegenerate:
             sampler_options = krea2_er_sde_options(
                 er_sde_solver_type, er_sde_max_stage, er_sde_eta, er_sde_s_noise
             )
+            # Report the validated, effective backend values for each queued
+            # invocation. ODE/eta=0 force s_noise=0; the UI widgets alone
+            # cannot prove which parameters the sampler actually received.
+            er_scaler = sampler_options["noise_scaler"]
+            logger.info(
+                "Krea 2 ER-SDE invocation: solver_type=%s eta=%.6g "
+                "max_stage=%d s_noise=%.6g seed=%d",
+                er_scaler.solver_type, er_scaler.eta,
+                sampler_options["max_stage"], sampler_options["s_noise"], seed,
+            )
         elif sampler_name in ("sa_solver", "sa_solver_pece"):
             if type(sa_spectrum_forecasts) is not bool:
                 raise ValueError("sa_spectrum_forecasts must be a boolean")
