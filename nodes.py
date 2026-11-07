@@ -28,6 +28,7 @@ from .slrd_runtime import (
     guard_sampler_alignment,
     krea2_sampler_names,
     krea2_er_sde_options,
+    krea2_sa_solver_options,
     effective_er_sde_sigmas,
     make_lowres_latent,
     prepare_noise,
@@ -258,7 +259,8 @@ class Krea2TurboFlowAlignedRegenerate:
                 "sampler_name": (krea2_sampler_names(), {"default": "euler",
                     "tooltip": "Solver for planner and target passes. Every option skips the target model during composition-locked steps and supports resolution stages. "
                                "Euler reaches the lock release in closed form; the others run their native multistep update through the locked steps using the planner predictions. "
-                               "ER-SDE uses native stochastic multistep updates with patch-coupled noise across resolutions. "
+                               "ER-SDE and SA-Solver use native stochastic updates with patch-coupled noise across resolutions. "
+                               "SA-Solver PECE retains separate predictor and correction evaluations. "
                                "Non-Euler solvers are experimental and need visual validation."}),
                 "scheduler": (compat_scheduler_names(), {"default": "simple",
                     "tooltip": "ComfyUI sigma schedule applied consistently to planner and target. Changes locked-step count and denoising trajectory. Experimental alternatives need visual validation."}),
@@ -270,6 +272,20 @@ class Krea2TurboFlowAlignedRegenerate:
                     "tooltip": "Only used with er_sde. Native stochastic-strength exponent; zero selects ODE with no stochastic noise."}),
                 "er_sde_s_noise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.01,
                     "tooltip": "Only used with er_sde. Multiplies its patch-coupled per-step stochastic increments; ODE forces zero."}),
+                "sa_eta": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01,
+                    "tooltip": "SA-Solver only: stochastic strength (0 = ODE)."}),
+                "sa_sde_start_percent": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.001,
+                    "tooltip": "SA-Solver only: start of the stochastic model-sigma interval."}),
+                "sa_sde_end_percent": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.001,
+                    "tooltip": "SA-Solver only: end of the stochastic model-sigma interval."}),
+                "sa_s_noise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.01,
+                    "tooltip": "SA-Solver only: SDE noise multiplier, patch-coupled across scales."}),
+                "sa_predictor_order": ("INT", {"default": 3, "min": 1, "max": 6,
+                    "tooltip": "SA-Solver only: native Adams predictor order."}),
+                "sa_corrector_order": ("INT", {"default": 4, "min": 0, "max": 6,
+                    "tooltip": "SA-Solver only: native corrector order. PECE reevaluates corrections when greater than 0."}),
+                "sa_simple_order_2": ("BOOLEAN", {"default": False,
+                    "tooltip": "SA-Solver only: native simplified second-order coefficients."}),
             },
         }
 
@@ -294,6 +310,13 @@ class Krea2TurboFlowAlignedRegenerate:
         er_sde_max_stage=3,
         er_sde_eta=1.0,
         er_sde_s_noise=1.0,
+        sa_eta=1.0,
+        sa_sde_start_percent=0.2,
+        sa_sde_end_percent=0.8,
+        sa_s_noise=1.0,
+        sa_predictor_order=3,
+        sa_corrector_order=4,
+        sa_simple_order_2=False,
     ):
         if not isinstance(cfg, (int, float)) or not math.isfinite(cfg) or not 0.0 <= cfg <= 100.0:
             raise ValueError("Krea 2 CFG must be finite and within [0, 100]")
@@ -303,15 +326,23 @@ class Krea2TurboFlowAlignedRegenerate:
             )
         if scheduler not in compat_scheduler_names():
             raise ValueError(f"Unsupported Krea 2 scheduler: {scheduler!r}")
-        sampler_options = (
-            krea2_er_sde_options(er_sde_solver_type, er_sde_max_stage, er_sde_eta, er_sde_s_noise)
-            if sampler_name == "er_sde" else None
-        )
+        sampler_options = None
         composition_lock_sigma = float(composition_lock_sigma)
         if not math.isfinite(composition_lock_sigma) or not 0.0 <= composition_lock_sigma <= 1.0:
             raise ValueError("composition_lock_sigma must be within [0, 1]")
         if not isinstance(getattr(model, "model", None), comfy.model_base.Krea2):
             raise ValueError("Krea 2 Turbo Flow-Aligned Regenerate requires a native ComfyUI Krea2 MODEL")
+        if sampler_name == "er_sde":
+            sampler_options = krea2_er_sde_options(
+                er_sde_solver_type, er_sde_max_stage, er_sde_eta, er_sde_s_noise
+            )
+        elif sampler_name in ("sa_solver", "sa_solver_pece"):
+            sampler_options = krea2_sa_solver_options(
+                model, eta=sa_eta, sde_start_percent=sa_sde_start_percent,
+                sde_end_percent=sa_sde_end_percent, s_noise=sa_s_noise,
+                predictor_order=sa_predictor_order, corrector_order=sa_corrector_order,
+                simple_order_2=sa_simple_order_2,
+            )
         if not isinstance(latent_image, dict) or not isinstance(latent_image.get("samples"), torch.Tensor):
             raise TypeError("Krea 2 requires a LATENT dictionary with tensor samples")
         # Native ComfyUI uses four-channel EmptyLatentImage placeholders for Krea 2,
@@ -359,7 +390,7 @@ class Krea2TurboFlowAlignedRegenerate:
             # by the native denoiser, not the nominal outer schedule.
             lock_schedule = (
                 effective_er_sde_sigmas(torch.tensor(schedule, dtype=torch.float64), model).tolist()
-                if sampler_name == "er_sde" else schedule
+                if sampler_name in ("er_sde", "sa_solver", "sa_solver_pece") else schedule
             )
             if full_lock_prefix_length(lock_schedule, composition_lock_sigma) >= len(schedule) - 1:
                 raise ValueError("resolution stages need at least one step after the composition lock; raise steps or composition_lock_sigma")

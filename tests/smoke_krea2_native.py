@@ -161,7 +161,8 @@ def main():
     # locked steps: Euler through the closed-form handoff, the others by
     # integrating the locked prefix natively with the planner predictions.
     spectrum_forecast = {"euler", "dpmpp_2m", "res_multistep", "gradient_estimation",
-                         "deis", "ipndm", "ipndm_v", "er_sde"}
+                         "deis", "ipndm", "ipndm_v", "er_sde",
+                         "sa_solver", "sa_solver_pece"}
     solver_cases = [
         ("euler", "normal", 1.0),
         ("euler", "sgm_uniform", 2.0),
@@ -170,6 +171,16 @@ def main():
     ] + [(name, "simple", 1.0) for name in runtime.krea2_sampler_names()
          if name not in ("euler", "dpmpp_2m")]
     assert set(runtime.krea2_sampler_names()) == set(runtime.KREA2_SAMPLERS), runtime.krea2_sampler_names()
+
+    def solver_calls(sampler_name, steps):
+        return steps + max(0, steps - 1) if sampler_name == "sa_solver_pece" else steps
+
+    def target_calls(sampler_name, steps, locked):
+        if sampler_name == "sa_solver_pece":
+            # First PECE step has no correction, and all locked corrections
+            # use the corresponding corrected planner anchor without a DiT.
+            return 2 * (steps - locked) if locked else solver_calls(sampler_name, steps)
+        return steps - locked
 
     def controls(selected, sampler_name, scheduler, cfg, steps, count_calls, evaluate_locked=False, **extra):
         reports = []
@@ -212,12 +223,15 @@ def main():
             assert result[0]["samples"].shape == (1, 16, 1, 16, 20)
             if count_calls:
                 planner_hw = tuple(result[1]["samples"].shape[-2:])
-                assert counts == {planner_hw: steps, (16, 20): steps - locked}, (sampler_name, scheduler, counts)
+                assert counts == {
+                    planner_hw: solver_calls(sampler_name, steps),
+                    (16, 20): target_calls(sampler_name, steps, locked),
+                }, (sampler_name, scheduler, counts)
                 if sampler_name != "euler":
                     reference, _, reference_counts = controls(
                         selected, sampler_name, scheduler, cfg, steps, True,
                         evaluate_locked=True, max_stage_upscale=0.0)
-                    assert reference_counts[(16, 20)] == steps, reference_counts
+                    assert reference_counts[(16, 20)] == solver_calls(sampler_name, steps), reference_counts
                     for fast, slow in zip(result, reference):
                         # Locked steps discard the target prediction, so skipping
                         # it must not change any output.
@@ -230,7 +244,7 @@ def main():
                 if sampler_name in spectrum_forecast:
                     assert all(report["fallback"] is None for report in reports), reports
                     # Skipped locked steps never reach the diffusion model.
-                    assert reports[1]["denoiser_calls"] == steps - locked, reports
+                    assert reports[1]["denoiser_calls"] == target_calls(sampler_name, steps, locked), reports
                 else:
                     assert all(report["fallback"] for report in reports), reports
             print(json.dumps({
@@ -249,7 +263,7 @@ def main():
             extrapolation_guard_enabled=False,
         )[0]
         for sampler_name in ("res_multistep", "gradient_estimation",
-                             "deis", "ipndm", "ipndm_v", "er_sde"):
+                             "deis", "ipndm", "ipndm_v", "er_sde", "sa_solver"):
             outputs, reports, _ = controls(
                 aligned, sampler_name, "simple", 1.0, 20, False,
                 max_stage_upscale=0.0, composition_lock_sigma=0.72,
@@ -280,7 +294,11 @@ def main():
             assert [list(x["samples"].shape) for x in result] == [
                 [1, 16, 1, 24, 28], [1, 16, 1, 12, 14], [1, 16, 1, 24, 28]]
             if label == "native":
-                assert counts == {(12, 14): steps, (16, 20): free, (24, 28): free}, (sampler_name, counts)
+                assert counts == {
+                    (12, 14): solver_calls(sampler_name, steps),
+                    (16, 20): target_calls(sampler_name, steps, steps - free),
+                    (24, 28): solver_calls(sampler_name, free),
+                }, (sampler_name, counts)
             else:
                 first = free if sampler_name == "euler" else steps
                 assert [r["outer_steps"] for r in reports] == [steps, first, free], reports
@@ -290,6 +308,42 @@ def main():
                               "model_calls": {f"{h}x{w}": n for (h, w), n in counts.items()},
                               "reports": reports}))
 
+
+
+    # SA-PECE must preserve its second denoiser prediction at each corrected
+    # sigma, while native Scale-Locked skips both corresponding locked target
+    # calls. Spectrum may forecast only predictors and always runs corrections
+    # natively on unlocked steps.
+    for label, selected in cases:
+        result, reports, counts = controls(
+            selected, "sa_solver_pece", "simple", 1.0, 14, label == "native",
+            max_stage_upscale=0.0, composition_lock_sigma=0.72,
+        )
+        sigmas = runtime.calculate_sigmas(selected, scheduler="simple", steps=14, denoise=1.0)
+        effective = runtime.effective_er_sde_sigmas(sigmas, selected)
+        locked = runtime.full_lock_prefix_length(effective.tolist(), .72)
+        if label == "native":
+            planner_hw = tuple(result[1]["samples"].shape[-2:])
+            assert counts[planner_hw] == 27, counts
+            assert counts[(16, 20)] == 2 * (14 - locked), counts
+            reference, _, total = controls(
+                selected, "sa_solver_pece", "simple", 1.0, 14, True,
+                evaluate_locked=True, max_stage_upscale=0.0,
+                composition_lock_sigma=0.72,
+            )
+            assert total[(16, 20)] == 27, total
+            assert all(torch.equal(a["samples"], b["samples"])
+                       for a, b in zip(result, reference))
+        else:
+            assert len(reports) == 2 and all(r["fallback"] is None for r in reports), reports
+            assert reports[0]["pece_corrector_evaluations"] == 13, reports
+            assert reports[1]["denoiser_calls"] == 2 * (14 - locked), reports
+            assert reports[0]["forecast"] > 0 and reports[1]["forecast"] > 0, reports
+        print(json.dumps({
+            "case": label + "_pece", "locked": locked,
+            "counts": {f"{h}x{w}": n for (h, w), n in counts.items()},
+            "reports": reports,
+        }))
 
     # Native ER-SDE's deterministic ODE mode and stochastic reverse-time mode
     # use the same wrapper, stage planner and evaluation-skipping contract.

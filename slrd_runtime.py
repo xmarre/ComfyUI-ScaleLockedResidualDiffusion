@@ -82,6 +82,8 @@ KREA2_SAMPLERS = (
     "ipndm_v",
     "gradient_estimation",
     "er_sde",
+    "sa_solver",
+    "sa_solver_pece",
 )
 
 
@@ -131,9 +133,41 @@ def krea2_er_sde_options(solver_type="ER-SDE", max_stage=3, eta=1.0, s_noise=1.0
 
 
 def effective_er_sde_sigmas(sigmas: torch.Tensor, model) -> torch.Tensor:
-    """Use the native flow log-SNR first-sigma correction for step bookkeeping."""
+    """Native SNR solver first-sigma correction shared by ER-SDE and SA-Solver."""
     from comfy.k_diffusion.sampling import offset_first_sigma_for_snr
     return offset_first_sigma_for_snr(sigmas, _model_sampling_obj(model))
+
+
+SA_SOLVER_NAMES = frozenset(("sa_solver", "sa_solver_pece"))
+SNR_SOLVER_NAMES = SA_SOLVER_NAMES | {"er_sde"}
+
+
+def krea2_sa_solver_options(
+    model, *, eta=1.0, sde_start_percent=0.2, sde_end_percent=0.8,
+    s_noise=1.0, predictor_order=3, corrector_order=4, simple_order_2=False,
+) -> dict:
+    """ComfyUI SamplerSASolver options, using native model percent->sigma."""
+    values = (eta, sde_start_percent, sde_end_percent, s_noise)
+    if any(type(v) not in (int, float) or not math.isfinite(v) for v in values):
+        raise ValueError("SA-Solver eta, SDE percentages and s_noise must be finite")
+    if not (0 <= eta <= 10 and 0 <= s_noise <= 100 and
+            0 <= sde_start_percent <= sde_end_percent <= 1):
+        raise ValueError("SA-Solver SDE interval and noise values are invalid")
+    if (type(predictor_order) is not int or not 1 <= predictor_order <= 6 or
+            type(corrector_order) is not int or not 0 <= corrector_order <= 6 or
+            type(simple_order_2) is not bool):
+        raise ValueError("SA-Solver predictor/corrector order or simple_order_2 is invalid")
+    from comfy.k_diffusion.sa_solver import get_tau_interval_func
+    model_sampling = _model_sampling_obj(model)
+    start_sigma = model_sampling.percent_to_sigma(sde_start_percent)
+    end_sigma = model_sampling.percent_to_sigma(sde_end_percent)
+    return {
+        "tau_func": get_tau_interval_func(start_sigma, end_sigma, eta=float(eta)),
+        "s_noise": float(s_noise),
+        "predictor_order": predictor_order,
+        "corrector_order": corrector_order,
+        "simple_order_2": simple_order_2,
+    }
 
 
 def _er_sde_seed(seed: int, step: int, level: int) -> int:
@@ -192,6 +226,25 @@ class Krea2PatchCoupledERSDENoise:
         return field.to(device=self.device, dtype=self.dtype)
 
 
+
+class Krea2PatchCoupledSANoise(Krea2PatchCoupledERSDENoise):
+    """Native SA-Solver may request stochastic increments only in its SDE window.
+
+    Locate the actual sigma pair instead of advancing a dense step cursor;
+    this preserves common coarse noise even when stochastic intervals skip
+    steps, restart at release, or disable noise entirely.
+    """
+
+    def __call__(self, sigma, sigma_next):
+        for i in range(self.cursor, len(self.sigmas) - 1):
+            if (math.isclose(float(sigma), self.sigmas[i], rel_tol=1e-5, abs_tol=1e-6)
+                    and math.isclose(float(sigma_next), self.sigmas[i + 1],
+                                     rel_tol=1e-5, abs_tol=1e-6)):
+                self.cursor = i
+                return super().__call__(sigma, sigma_next)
+        raise RuntimeError("SA-Solver stochastic increment was requested out of sigma order")
+
+
 def _krea2_sampler_object(
     sampler_name: str, sampler_options: Optional[dict], *,
     model, low_shape: tuple, stage_shapes: tuple, stage_index: int,
@@ -199,19 +252,23 @@ def _krea2_sampler_object(
 ):
     # The generic SLRD node preserves its caller-selected native sampler.
     # Only the Krea 2 node passes validated options and enables patch coupling.
-    if sampler_name != "er_sde" or sampler_options is None:
+    if sampler_name not in SNR_SOLVER_NAMES or sampler_options is None:
         return comfy.samplers.sampler_object(sampler_name)
     options = dict(sampler_options)
+    if sampler_name in SA_SOLVER_NAMES and sampler_name == "sa_solver":
+        options["use_pece"] = False
     if options.get("s_noise", 1.0) > 0.0:
-        options["noise_sampler"] = Krea2PatchCoupledERSDENoise(
+        noise_cls = (Krea2PatchCoupledSANoise if sampler_name in SA_SOLVER_NAMES
+                     else Krea2PatchCoupledERSDENoise)
+        options["noise_sampler"] = noise_cls(
             low_shape=low_shape, stage_shapes=stage_shapes, stage_index=stage_index,
             seed=seed, start_step=start_step,
             sigmas=effective_er_sde_sigmas(sigmas, model),
             device=_resolve_sampler_device(model, noise_like.device),
             dtype=noise_like.dtype,
         )
-    # Call ComfyUI's genuine native ER-SDE (including its multistep history).
-    return comfy.samplers.ksampler("er_sde", options)
+    # Keep ComfyUI's native stochastic Adams/ER-SDE integration and history.
+    return comfy.samplers.ksampler(sampler_name, options)
 
 
 LOCK_SCHEDULE_OPTIONS = [
@@ -282,6 +339,7 @@ class ScaleLockedRuntimeContext:
     planner_sigmas: list[float]
     highres_noise: torch.Tensor
     noise_seed: int
+    pece_corrected_anchors: Optional[list[Optional[torch.Tensor]]] = None
 
     def prepared_noise(self) -> "ScaleLockedPreparedNoise":
         return ScaleLockedPreparedNoise(self.highres_noise, self.noise_seed)
@@ -613,6 +671,9 @@ def apply_scale_lock_to_guider(
 
     original_predict_noise = getattr(guider, "_slrd_original_predict_noise", guider.predict_noise)
     guider._slrd_original_predict_noise = original_predict_noise
+    corrected = runtime.pece_corrected_anchors
+    guider._slrd_pece_corrected_anchors = corrected
+    guider._slrd_pece_counts = {} if corrected is not None else None
     # A sampler-side latent noise mask is distinct from the scale-lock's
     # spatial mask. Preserve the evaluated path for masked sampling even
     # when the full lock would otherwise discard the target prediction.
@@ -624,12 +685,34 @@ def apply_scale_lock_to_guider(
     def _wrapped_predict_noise(self, x, timestep, model_options=None, seed=None):
         if model_options is None:
             model_options = {}
-        if getattr(self, "_slrd_skip_locked_model_calls", False):
-            locked = locked_planner_prediction(self, x, timestep)
-            if locked is not None:
-                return locked
-        base_noise = self._slrd_original_predict_noise(x, timestep, model_options=model_options, seed=seed)
-        return apply_scale_lock_to_noise_prediction(self, base_noise, x, timestep)
+        original_anchors = self._slrd_anchors_x0_cpu
+        corrected = getattr(self, "_slrd_pece_corrected_anchors", None)
+        if corrected is not None:
+            index = resolve_scale_lock_step_index(self, timestep)
+            counts = self._slrd_pece_counts
+            calls = counts.get(index, 0) + 1
+            if calls > 2:
+                raise RuntimeError("SA-PECE target made more than two predictions at one sigma")
+            counts[index] = calls
+            if calls == 2:
+                correction = corrected[index]
+                if correction is None:
+                    raise RuntimeError("SA-PECE corrected planner anchor missing for target")
+                # This invocation sees the corrected planner prediction only
+                # at the matching sigma. Restore the shared predictor anchors
+                # even if CFG/transformer evaluation raises.
+                revised = list(original_anchors)
+                revised[index] = correction
+                self._slrd_anchors_x0_cpu = revised
+        try:
+            if getattr(self, "_slrd_skip_locked_model_calls", False):
+                locked = locked_planner_prediction(self, x, timestep)
+                if locked is not None:
+                    return locked
+            base_noise = self._slrd_original_predict_noise(x, timestep, model_options=model_options, seed=seed)
+            return apply_scale_lock_to_noise_prediction(self, base_noise, x, timestep)
+        finally:
+            self._slrd_anchors_x0_cpu = original_anchors
 
     guider.predict_noise = types.MethodType(_wrapped_predict_noise, guider)
     return guider
@@ -722,7 +805,8 @@ def _run_lowres_planner(
     disable_noise: bool,
     pin_anchors: bool,
     sampler_options: Optional[dict] = None,
-) -> tuple[dict, list[torch.Tensor], list[float], torch.Tensor]:
+) -> tuple[dict, list[torch.Tensor], list[float], torch.Tensor,
+           Optional[list[Optional[torch.Tensor]]]]:
     sampler_obj = None
     guider = comfy.samplers.CFGGuider(model)
     guider.set_conds(positive, negative)
@@ -765,6 +849,36 @@ def _run_lowres_planner(
         pin_memory=pin_anchors,
     )
 
+
+    pece_corrections = None
+    if sampler_name == "sa_solver_pece":
+        # Native SA-Solver emits its callback before the corrected-state
+        # denoiser evaluation. Capture that separate prediction here; the
+        # callback-only trajectory recorder intentionally stores predictors.
+        pece_corrections = [None] * (len(sigmas) - 1)
+        calls_per_step = [0] * len(pece_corrections)
+        effective = effective_er_sde_sigmas(sigmas, model).detach().cpu().tolist()
+        predict_native = guider.predict_noise
+
+        def _capture_pece_predictor_and_corrector(self, x, timestep, model_options=None, seed=None):
+            sigma = float(timestep.flatten()[0]) if torch.is_tensor(timestep) else float(timestep)
+            matches = [i for i, expected in enumerate(effective[:-1])
+                       if math.isclose(sigma, float(expected), rel_tol=1e-5, abs_tol=1e-6)]
+            if len(matches) != 1:
+                raise RuntimeError("SA-PECE planner evaluation did not match its sigma schedule")
+            index = matches[0]
+            calls_per_step[index] += 1
+            if calls_per_step[index] > 2:
+                raise RuntimeError("SA-PECE planner unexpectedly evaluated a step more than twice")
+            result = predict_native(x, timestep, model_options=model_options, seed=seed)
+            if calls_per_step[index] == 2:
+                pece_corrections[index] = result.detach().to(
+                    device="cpu", dtype=_store_dtype_for(latent_samples)
+                ).contiguous().clone()
+            return result
+
+        guider.predict_noise = types.MethodType(_capture_pece_predictor_and_corrector, guider)
+
     samples = guider.sample(
         planner_noise,
         latent_samples,
@@ -781,10 +895,18 @@ def _run_lowres_planner(
     out.pop("downscale_ratio_spacial", None)
     out["samples"] = samples
 
-    recorded_sigmas = effective_er_sde_sigmas(sigmas, model) if sampler_name == "er_sde" else sigmas
+    recorded_sigmas = effective_er_sde_sigmas(sigmas, model) if sampler_name in SNR_SOLVER_NAMES else sigmas
     planner_sigmas = _planner_sigmas_for_recorded_steps(recorded_sigmas, len(recorder.x0_steps))
     recorder.step_sigmas = planner_sigmas
-    return out, recorder.x0_steps, planner_sigmas, planner_noise
+    if pece_corrections is not None:
+        order = int((sampler_options or {}).get("corrector_order", 4))
+        expected_counts = [1] + [2 if order > 0 else 1] * (len(sigmas) - 2)
+        if calls_per_step != expected_counts:
+            raise RuntimeError("SA-PECE planner correction evaluation count changed")
+        if any((pece_corrections[i] is None) != (expected_counts[i] == 1)
+               for i in range(len(calls_per_step))):
+            raise RuntimeError("SA-PECE corrected planner prediction is missing")
+    return out, recorder.x0_steps, planner_sigmas, planner_noise, pece_corrections
 
 
 def _build_highres_noise(
@@ -1034,6 +1156,7 @@ def _run_resolution_ladder(
     config: ScaleLockConfig,
     stage_hw: tuple,
     sampler_options: Optional[dict] = None,
+    pece_corrected_anchors: Optional[list] = None,
 ) -> ScaleLockedSampleResult:
     """Refine through increasing resolutions, each stage finishing its image.
 
@@ -1062,7 +1185,7 @@ def _run_resolution_ladder(
         raise ValueError("resolution stages do not support latent noise masks, spatial lock masks or manifold correction")
 
     target = highres_latent["samples"]
-    effective_sigmas = effective_er_sde_sigmas(sigmas, model) if sampler_name == "er_sde" else sigmas
+    effective_sigmas = effective_er_sde_sigmas(sigmas, model) if sampler_name in SNR_SOLVER_NAMES else sigmas
     sigma_values = [float(v) for v in effective_sigmas.detach().cpu().tolist()]
     total_steps = len(sigma_values) - 1
     release = full_lock_prefix_length(sigma_values, config.full_lock_sigma)
@@ -1077,7 +1200,7 @@ def _run_resolution_ladder(
 
     stage_noise = lowres_noise
     shapes = tuple(tuple(lowres_noise.shape[:-2]) + tuple(hw) for hw in sizes)
-    sampler = comfy.samplers.sampler_object(sampler_name) if sampler_name != "er_sde" else None
+    sampler = comfy.samplers.sampler_object(sampler_name) if sampler_name not in SNR_SOLVER_NAMES else None
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
     x0_output: dict = {}
     finished = None
@@ -1121,7 +1244,7 @@ def _run_resolution_ladder(
                 finished.to(device=stage_samples.device, dtype=torch.float32), hw
             ).to(dtype=stage_samples.dtype)
 
-        if sampler_name == "er_sde":
+        if sampler_name in SNR_SOLVER_NAMES:
             sampler = _krea2_sampler_object(
                 sampler_name, sampler_options, model=model, low_shape=tuple(lowres_noise.shape),
                 stage_shapes=shapes, stage_index=index, seed=stochastic_seed,
@@ -1139,6 +1262,7 @@ def _run_resolution_ladder(
             planner_sigmas=planner_sigmas,
             highres_noise=stage_noise,
             noise_seed=seed,
+            pece_corrected_anchors=pece_corrected_anchors,
         )
         guider = create_cfg_guider(model, positive, negative, cfg)
         apply_scale_lock_to_guider(guider, stage_runtime, config, skip_locked_model_calls=True)
@@ -1209,7 +1333,7 @@ def run_scale_locked_ksampler(
     # The Krea 2 ER-SDE node injects a verified single-prediction native
     # sampler and patch-coupled stochastic increments. The generic SLRD
     # alignment guard remains conservative for arbitrary ER-SDE samplers.
-    if not (sampler_name == "er_sde" and sampler_options is not None):
+    if not (sampler_name in SNR_SOLVER_NAMES and sampler_options is not None):
         guard_sampler_alignment(sampler_name, sampler_guard)
     sigmas = calculate_sigmas(model, scheduler=scheduler, steps=steps, denoise=denoise)
     if sigmas.numel() == 0:
@@ -1220,7 +1344,7 @@ def run_scale_locked_ksampler(
     planner_seed = int(seed)
     detail_seed = int(seed) ^ 0x9E3779B97F4A7C15
 
-    lowres_out, anchors_x0, planner_sigmas, lowres_noise = _run_lowres_planner(
+    lowres_out, anchors_x0, planner_sigmas, lowres_noise, pece_corrections = _run_lowres_planner(
         model=model,
         positive=positive,
         negative=negative,
@@ -1244,6 +1368,7 @@ def run_scale_locked_ksampler(
             planner_sigmas=planner_sigmas, lowres_noise=lowres_noise, detail_seed=detail_seed,
             stochastic_seed=planner_seed, nested_noise_strength=nested_noise_strength, noise_mode=noise_mode,
             config=config, stage_hw=tuple(stage_hw), sampler_options=sampler_options,
+            pece_corrected_anchors=pece_corrections,
         )
 
     runtime = ScaleLockedRuntimeContext(
@@ -1262,6 +1387,7 @@ def run_scale_locked_ksampler(
             mode=noise_mode,
         ),
         noise_seed=detail_seed,
+        pece_corrected_anchors=pece_corrections,
     )
     guider = create_cfg_guider(model, positive, negative, cfg)
     sampler = _krea2_sampler_object(

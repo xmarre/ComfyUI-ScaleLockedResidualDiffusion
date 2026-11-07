@@ -492,3 +492,59 @@ def test_er_sde_later_stage_restarts_from_release_step_noise():
         shape, (bigger,), 0, 71, 2, sigmas[2:], "cpu", torch.float32
     )
     assert torch.equal(expected, restarted(sigmas[2], sigmas[3]))
+
+
+
+def test_sa_stochastic_noise_is_patch_coupled_even_when_sde_skips_steps():
+    low = (1, 16, 1, 8, 10)
+    high = (1, 16, 1, 16, 20)
+    sigmas = torch.tensor([.9999, .85, .65, .45, .25, 0.0])
+    planner = runtime.Krea2PatchCoupledSANoise(
+        low, (high,), -1, 77, 0, sigmas, "cpu", torch.float32
+    )
+    target = runtime.Krea2PatchCoupledSANoise(
+        low, (high,), 0, 77, 0, sigmas, "cpu", torch.float32
+    )
+    coarse = planner(sigmas[2], sigmas[3])
+    fine = target(sigmas[2], sigmas[3])
+    assert coarse.shape == low and fine.shape == high
+    # Every patch-phase coarse component survives Gaussian refinement.
+    _assert_patch_phase_sum(coarse, fine)
+    torch.testing.assert_close(
+        target(sigmas[4], sigmas[5]),
+        runtime.Krea2PatchCoupledSANoise(
+            low, (high,), 0, 77, 4, sigmas[4:], "cpu", torch.float32
+        )(sigmas[4], sigmas[5]),
+        atol=0, rtol=0,
+    )
+    with pytest.raises(RuntimeError, match="out of sigma order"):
+        target(sigmas[1], sigmas[2])
+
+
+def test_sa_pece_uses_corrected_planner_anchor_on_second_same_sigma_call():
+    sigmas = [0.9, 0.7, 0.5]
+    reference = [torch.ones(1, 2, 6, 8) * i for i in (1, 2, 3)]
+    corrected = [None, torch.ones(1, 2, 6, 8) * 17, torch.ones(1, 2, 6, 8) * 29]
+    model_calls = []
+
+    def predict(x, timestep):
+        model_calls.append(float(timestep))
+        return torch.zeros_like(x)
+
+    context = runtime.ScaleLockedRuntimeContext(
+        model=None, highres_latent={"samples": torch.zeros(1, 2, 6, 8)},
+        lowres_latent=None, lowres_out=None, sigmas=None,
+        anchors_x0=reference, planner_sigmas=sigmas, highres_noise=None,
+        noise_seed=0, pece_corrected_anchors=corrected,
+    )
+    guider = runtime.apply_scale_lock_to_guider(
+        _Guider(predict), context, _config(0.0), skip_locked_model_calls=True
+    )
+    x = torch.zeros(1, 2, 6, 8)
+    torch.testing.assert_close(guider.predict_noise(x, torch.tensor(.9)), reference[0])
+    torch.testing.assert_close(guider.predict_noise(x, torch.tensor(.7)), reference[1])
+    torch.testing.assert_close(guider.predict_noise(x, torch.tensor(.7)), corrected[1])
+    assert model_calls == []
+    assert guider._slrd_anchors_x0_cpu[1] is reference[1]
+    with pytest.raises(RuntimeError, match="more than two"):
+        guider.predict_noise(x, torch.tensor(.7))

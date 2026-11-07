@@ -16,7 +16,7 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SAMPLERS = ("euler", "dpmpp_2m", "res_multistep", "deis", "ipndm", "ipndm_v", "gradient_estimation", "er_sde")
+SAMPLERS = ("euler", "dpmpp_2m", "res_multistep", "deis", "ipndm", "ipndm_v", "gradient_estimation", "er_sde", "sa_solver", "sa_solver_pece")
 
 
 def _node():
@@ -68,6 +68,7 @@ def _node():
         "krea2_er_sde_options": lambda mode, order, eta, noise: {
             "solver_type": mode, "max_stage": order, "eta": eta, "s_noise": noise,
         },
+        "krea2_sa_solver_options": lambda model, **kwargs: kwargs,
         "ScaleLockConfig": SimpleNamespace,
         "run_scale_locked_ksampler": run,
         "logger": SimpleNamespace(info=lambda *args: None, warning=lambda *args: None),
@@ -88,6 +89,8 @@ def test_existing_widget_slots_and_explicit_defaults():
         "steps", "composition_lock_sigma", "max_stage_upscale",
         "stage_megapixels", "cfg", "sampler_name", "scheduler",
         "er_sde_solver_type", "er_sde_max_stage", "er_sde_eta", "er_sde_s_noise",
+        "sa_eta", "sa_sde_start_percent", "sa_sde_end_percent", "sa_s_noise",
+        "sa_predictor_order", "sa_corrector_order", "sa_simple_order_2",
     ]
     assert schema["optional"]["cfg"][1]["default"] == 1.0
     assert schema["optional"]["sampler_name"][0] == list(SAMPLERS)
@@ -97,6 +100,12 @@ def test_existing_widget_slots_and_explicit_defaults():
     assert schema["optional"]["er_sde_max_stage"][1]["default"] == 3
     assert schema["optional"]["er_sde_eta"][1]["default"] == 1.0
     assert schema["optional"]["er_sde_s_noise"][1]["default"] == 1.0
+    assert schema["optional"]["sa_eta"][1]["default"] == 1.0
+    assert schema["optional"]["sa_sde_start_percent"][1]["default"] == 0.2
+    assert schema["optional"]["sa_sde_end_percent"][1]["default"] == 0.8
+    assert schema["optional"]["sa_predictor_order"][1]["default"] == 3
+    assert schema["optional"]["sa_corrector_order"][1]["default"] == 4
+    assert schema["optional"]["sa_simple_order_2"][1]["default"] is False
     assert node.sample(*args) == ("target", "planner", "denoised")
     assert (calls[-1]["cfg"], calls[-1]["sampler_name"],
             calls[-1]["scheduler"]) == (1.0, "euler", "simple")
@@ -150,5 +159,25 @@ def test_er_sde_options_are_routed_without_changing_other_solvers():
         "eta": .7, "s_noise": .8,
     }
     assert calls[-1]["stage_hw"]
+    node.sample(*args, sampler_name="euler")
+    assert calls[-1]["sampler_options"] is None
+
+
+
+@pytest.mark.parametrize("sampler_name", ["sa_solver", "sa_solver_pece"])
+def test_sa_solver_optional_controls_are_routed_to_native_sampler(sampler_name):
+    node, calls, args = _node()
+    node.sample(
+        *args, sampler_name=sampler_name, sa_eta=.45,
+        sa_sde_start_percent=.1, sa_sde_end_percent=.9,
+        sa_s_noise=.75, sa_predictor_order=5, sa_corrector_order=2,
+        sa_simple_order_2=True,
+    )
+    assert calls[-1]["sampler_name"] == sampler_name
+    assert calls[-1]["sampler_options"] == {
+        "eta": .45, "sde_start_percent": .1, "sde_end_percent": .9,
+        "s_noise": .75, "predictor_order": 5, "corrector_order": 2,
+        "simple_order_2": True,
+    }
     node.sample(*args, sampler_name="euler")
     assert calls[-1]["sampler_options"] is None
