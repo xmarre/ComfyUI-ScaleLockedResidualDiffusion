@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 import logging
 import math
 import types
@@ -43,6 +44,31 @@ from .slrd_core import (
 
 _LOGGER = logging.getLogger(__name__)
 
+
+
+@contextmanager
+def sa_native_only_scope(enabled: bool):
+    """Suppress only Spectrum forecasts for the scoped SA execution.
+
+    No mutation of the patcher, sampler, or process-global wrappers. The
+    contextvar is reset on cancellation, errors, and nested sampling.
+    Standalone Scale-Locked works when Spectrum is not installed.
+    """
+    if not enabled:
+        yield
+        return
+    try:
+        from comfyui_spectrum_krea2.runtime import FORCE_NATIVE
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"comfyui_spectrum_krea2", "comfyui_spectrum_krea2.runtime"}:
+            raise
+        yield
+        return
+    token = FORCE_NATIVE.set(True)
+    try:
+        yield
+    finally:
+        FORCE_NATIVE.reset(token)
 
 
 class _NullPreviewCallback:

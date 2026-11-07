@@ -29,6 +29,7 @@ from .slrd_runtime import (
     krea2_sampler_names,
     krea2_er_sde_options,
     krea2_sa_solver_options,
+    sa_native_only_scope,
     effective_er_sde_sigmas,
     make_lowres_latent,
     prepare_noise,
@@ -286,6 +287,8 @@ class Krea2TurboFlowAlignedRegenerate:
                     "tooltip": "SA-Solver only: native corrector order. PECE reevaluates corrections when greater than 0."}),
                 "sa_simple_order_2": ("BOOLEAN", {"default": False,
                     "tooltip": "SA-Solver only: native simplified second-order coefficients."}),
+                "sa_spectrum_forecasts": ("BOOLEAN", {"default": False,
+                    "tooltip": "SA-Solver only: experimental Spectrum predictor forecasts. Off by default until real-checkpoint image quality is verified. The native SA/PECE solver and composition locking still operate normally."}),
             },
         }
 
@@ -317,6 +320,7 @@ class Krea2TurboFlowAlignedRegenerate:
         sa_predictor_order=3,
         sa_corrector_order=4,
         sa_simple_order_2=False,
+        sa_spectrum_forecasts=False,
     ):
         if not isinstance(cfg, (int, float)) or not math.isfinite(cfg) or not 0.0 <= cfg <= 100.0:
             raise ValueError("Krea 2 CFG must be finite and within [0, 100]")
@@ -337,6 +341,8 @@ class Krea2TurboFlowAlignedRegenerate:
                 er_sde_solver_type, er_sde_max_stage, er_sde_eta, er_sde_s_noise
             )
         elif sampler_name in ("sa_solver", "sa_solver_pece"):
+            if type(sa_spectrum_forecasts) is not bool:
+                raise ValueError("sa_spectrum_forecasts must be a boolean")
             sampler_options = krea2_sa_solver_options(
                 model, eta=sa_eta, sde_start_percent=sa_sde_start_percent,
                 sde_end_percent=sa_sde_end_percent, s_noise=sa_s_noise,
@@ -427,27 +433,32 @@ class Krea2TurboFlowAlignedRegenerate:
             mid_schedule_hold=0.0,
             full_lock_sigma=composition_lock_sigma,
         )
-        result = run_scale_locked_ksampler(
-            model=model,
-            positive=positive,
-            negative=negative,
-            latent_image=prepared_latent,
-            seed=seed,
-            steps=steps,
-            cfg=cfg,
-            sampler_name=sampler_name,
-            scheduler=scheduler,
-            denoise=1.0,
-            target_megapixels=planner_megapixels,
-            nested_noise_strength=1.0,
-            add_noise=True,
-            pin_anchors=True,
-            sampler_guard="error",
-            config=config,
-            noise_mode="patch_coupled",
-            stage_hw=tuple(stage_hw),
-            sampler_options=sampler_options,
-        )
+        # Keep the opt-in out of ComfyUI sampler.extra_options and scope it to
+        # this invocation. No numerical solver implementation is replaced.
+        with sa_native_only_scope(
+            sampler_name in ("sa_solver", "sa_solver_pece") and not sa_spectrum_forecasts
+        ):
+            result = run_scale_locked_ksampler(
+                model=model,
+                positive=positive,
+                negative=negative,
+                latent_image=prepared_latent,
+                seed=seed,
+                steps=steps,
+                cfg=cfg,
+                sampler_name=sampler_name,
+                scheduler=scheduler,
+                denoise=1.0,
+                target_megapixels=planner_megapixels,
+                nested_noise_strength=1.0,
+                add_noise=True,
+                pin_anchors=True,
+                sampler_guard="error",
+                config=config,
+                noise_mode="patch_coupled",
+                stage_hw=tuple(stage_hw),
+                sampler_options=sampler_options,
+            )
         return (result.output, result.lowres_planner, result.denoised_output)
 
 

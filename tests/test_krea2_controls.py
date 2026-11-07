@@ -7,6 +7,7 @@ verified without introducing a second implementation of the node.
 from __future__ import annotations
 
 import ast
+from contextlib import nullcontext
 import math
 from pathlib import Path
 from types import SimpleNamespace
@@ -69,6 +70,7 @@ def _node():
             "solver_type": mode, "max_stage": order, "eta": eta, "s_noise": noise,
         },
         "krea2_sa_solver_options": lambda model, **kwargs: kwargs,
+        "sa_native_only_scope": lambda enabled: nullcontext(),
         "ScaleLockConfig": SimpleNamespace,
         "run_scale_locked_ksampler": run,
         "logger": SimpleNamespace(info=lambda *args: None, warning=lambda *args: None),
@@ -91,6 +93,7 @@ def test_existing_widget_slots_and_explicit_defaults():
         "er_sde_solver_type", "er_sde_max_stage", "er_sde_eta", "er_sde_s_noise",
         "sa_eta", "sa_sde_start_percent", "sa_sde_end_percent", "sa_s_noise",
         "sa_predictor_order", "sa_corrector_order", "sa_simple_order_2",
+        "sa_spectrum_forecasts",
     ]
     assert schema["optional"]["cfg"][1]["default"] == 1.0
     assert schema["optional"]["sampler_name"][0] == list(SAMPLERS)
@@ -106,6 +109,7 @@ def test_existing_widget_slots_and_explicit_defaults():
     assert schema["optional"]["sa_predictor_order"][1]["default"] == 3
     assert schema["optional"]["sa_corrector_order"][1]["default"] == 4
     assert schema["optional"]["sa_simple_order_2"][1]["default"] is False
+    assert schema["optional"]["sa_spectrum_forecasts"][1]["default"] is False
     assert node.sample(*args) == ("target", "planner", "denoised")
     assert (calls[-1]["cfg"], calls[-1]["sampler_name"],
             calls[-1]["scheduler"]) == (1.0, "euler", "simple")
@@ -181,3 +185,24 @@ def test_sa_solver_optional_controls_are_routed_to_native_sampler(sampler_name):
     }
     node.sample(*args, sampler_name="euler")
     assert calls[-1]["sampler_options"] is None
+
+
+
+@pytest.mark.parametrize("sampler_name", ["sa_solver", "sa_solver_pece"])
+@pytest.mark.parametrize("forecasts", [False, True])
+def test_sa_forecast_option_is_local_to_selected_sampler(sampler_name, forecasts):
+    node, calls, args = _node()
+    node.sample(*args, sampler_name=sampler_name, sa_spectrum_forecasts=forecasts)
+    assert calls[-1]["sampler_name"] == sampler_name
+    assert "sa_spectrum_forecasts" not in calls[-1]["sampler_options"]
+    # A future model path must never inherit the previous SA runtime toggle.
+    node.sample(*args, sampler_name="euler", sa_spectrum_forecasts=forecasts)
+    assert calls[-1]["sampler_name"] == "euler"
+    assert calls[-1]["sampler_options"] is None
+
+
+def test_sa_invalid_forecast_control_fails_before_sampling():
+    node, calls, args = _node()
+    with pytest.raises(ValueError, match="sa_spectrum_forecasts must be a boolean"):
+        node.sample(*args, sampler_name="sa_solver", sa_spectrum_forecasts=1)
+    assert not calls

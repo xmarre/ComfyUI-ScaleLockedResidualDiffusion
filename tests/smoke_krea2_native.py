@@ -183,6 +183,10 @@ def main():
         return steps - locked
 
     def controls(selected, sampler_name, scheduler, cfg, steps, count_calls, evaluate_locked=False, **extra):
+        if sampler_name in ("sa_solver", "sa_solver_pece"):
+            # The existing forecast regression cases remain opt-in. The new
+            # Krea 2 UI defaults to a native-only SA A/B control.
+            extra.setdefault("sa_spectrum_forecasts", True)
         reports = []
         token = reports_context.set(reports) if reports_context is not None else None
         calls.clear()
@@ -364,6 +368,40 @@ def main():
         assert pece_reports[0]["forecast"] > 0 and pece_reports[1]["forecast"] > 0, pece_reports
         assert pece_reports[1]["denoiser_calls"] == 16, pece_reports
         print(json.dumps({"case": "spectrum_pece_20_step_lock", "reports": pece_reports}))
+
+    if reports_context is not None:
+        # This is the exact quality-isolation path used by the new widget:
+        # native SA/PECE plus the same Scale-Locked stages, but 0 forecasts.
+        # It must be bitwise equal to running the native model without
+        # installing Spectrum, including the stochastic coupled increments.
+        for sampler_name in ("sa_solver", "sa_solver_pece"):
+            plain, _, _ = controls(
+                model, sampler_name, "simple", 1.0, 12, False,
+                latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
+                sa_spectrum_forecasts=False,
+            )
+            bypass, reports, _ = controls(
+                cases[1][1], sampler_name, "simple", 1.0, 12, False,
+                latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
+                sa_spectrum_forecasts=False,
+            )
+            assert len(reports) == 3 and all(r["fallback"] is None for r in reports), reports
+            assert all(r["native_only"] is True and r["forecast"] == 0 for r in reports), reports
+            for left, right in zip(plain, bypass):
+                torch.testing.assert_close(left["samples"], right["samples"], atol=0, rtol=0)
+            enabled, on_reports, _ = controls(
+                cases[1][1], sampler_name, "simple", 1.0, 12, False,
+                latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
+                sa_spectrum_forecasts=True,
+            )
+            assert len(on_reports) == 3 and all(not r["native_only"] for r in on_reports), on_reports
+            assert on_reports[0]["forecast"] > 0, on_reports
+            assert all(torch.isfinite(t["samples"]).all() for t in enabled)
+            print(json.dumps({
+                "case": "sa_12step_native_bypass",
+                "sampler": sampler_name, "records": reports,
+                "forecast_enabled": [r["forecast"] for r in on_reports],
+            }))
 
     # Native ER-SDE's deterministic ODE mode and stochastic reverse-time mode
     # use the same wrapper, stage planner and evaluation-skipping contract.
