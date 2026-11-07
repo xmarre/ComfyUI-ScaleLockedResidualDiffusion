@@ -386,7 +386,8 @@ def main():
                 sa_spectrum_forecasts=False,
             )
             assert len(reports) == 3 and all(r["fallback"] is None for r in reports), reports
-            assert all(r["native_only"] is True and r["forecast"] == 0 for r in reports), reports
+            assert all(r["native_only"] is True and r["forecast"] == 0 and
+                       r["peak_history_bytes"] == 0 for r in reports), reports
             for left, right in zip(plain, bypass):
                 torch.testing.assert_close(left["samples"], right["samples"], atol=0, rtol=0)
             enabled, on_reports, _ = controls(
