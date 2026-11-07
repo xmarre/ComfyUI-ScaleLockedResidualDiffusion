@@ -249,18 +249,28 @@ runtime and does not load weights independently.
   - **Experimental planner consistency** (`planner_fidelity_strength`,
     optional appended widget, default **0**) applies only in
     `planner_final_img2img`. At nonzero strength, every target x0 prediction
-    and completed resolution stage is projected toward the finished planner
-    under the same **area-downsampling measurement** used to compare images.
-    At strength 1, the output downscales to the planner latent to numerical
-    precision; 0 leaves the original regeneration unchanged.
-    The correction is the minimum-L2 right-pseudoinverse of the area
-    measurement operator, retaining high-resolution nullspace detail.
-    Unlike the older coarse/mid lock, it does not impose arbitrary frequency
-    cutoffs or reuse incomplete planner trajectory predictions.
-    This is **latent-space consistency, not a visual anatomy guarantee**.
-    Incorrect high-frequency features, ghost edges, or texture loss remain
-    possible; compare against strength 0 with your actual checkpoint.
-    It adds tensor projection work per model prediction, not DiT evaluations.
+    and completed resolution stage is projected toward the finished planner's
+    **area-downsampled latent measurements**. At strength 1 the result
+    downscales to the planner latent to numerical precision. Strength 0 leaves
+    original regeneration unchanged.
+  - **Planner detail strength** (`planner_detail_strength`, appended optional
+    widget, default **0.20**) controls the portion of target-generated
+    high-resolution detail retained relative to the *finished preceding
+    stage*. It is active only with nonzero `planner_fidelity_strength` in
+    `planner_final_img2img`. The previous lowband-only projection preserved
+    all of the model's unconstrained high-resolution residual, which could
+    create ghosted faces and duplicated contours despite perfect planner
+    measurement agreement. The revised projection removes a fraction
+    `1 - planner_detail_strength` of this **source-relative nullspace
+    residual**, leaving the separate planner measurement strength unchanged.
+    `0` preserves the source's latent detail (often softer), `0.20`
+    cautiously allows some new detail, and `1` restores the previous
+    unconstrained-detail experimental behavior. The completed stage is treated
+    the same way as each denoised prediction, so multistage regeneration cannot
+    bypass the bound. The constraint is mathematical, not semantic: correct
+    anatomy or absence of hallucinations is not guaranteed. It adds latent
+    tensor operations but no extra DiT evaluations; large-image visual testing
+    is still required.
   - The mode has been checked only on a small random CPU model for execution
     and initialization correctness. Whether it preserves a real planner image
     better than the trajectory mode is not yet established: compare both

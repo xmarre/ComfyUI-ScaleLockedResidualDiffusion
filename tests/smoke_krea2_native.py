@@ -880,6 +880,42 @@ def main():
             assert len(stages) == (2 if "stage_megapixels" in stage_options else 1)
             assert all(torch.isfinite(v["samples"]).all() for v in guided)
 
+    # High-resolution nullspace is unbounded with fidelity alone. The new
+    # detail control must deterministically limit source-relative innovations
+    # without changing native solver-call budgets or the finished planner.
+    for solver in ("euler", "sa_solver"):
+        full, _, full_stages, full_inputs = img2img(
+            model, solver, 8, planner_fidelity_strength=1.0,
+            planner_detail_strength=1.0, capture_inputs=True)
+        bounded, _, bounded_stages, bounded_inputs = img2img(
+            model, solver, 8, planner_fidelity_strength=1.0,
+            planner_detail_strength=0.2, capture_inputs=True)
+        source_only, _, _, _ = img2img(
+            model, solver, 8, planner_fidelity_strength=1.0,
+            planner_detail_strength=0.0)
+        assert torch.equal(full[1]["samples"], bounded[1]["samples"])
+        assert torch.equal(full[1]["samples"], source_only[1]["samples"])
+        assert torch.equal(full_stages[0]["noise"], bounded_stages[0]["noise"])
+        assert len(full_inputs) == len(bounded_inputs)
+        assert not torch.equal(full[0]["samples"], bounded[0]["samples"])
+        assert not torch.equal(bounded[0]["samples"], source_only[0]["samples"])
+        for result in (full, bounded, source_only):
+            planner = result[1]["samples"]
+            down = runtime.resize_4d_tensor(
+                result[0]["samples"].float(), tuple(planner.shape[-2:]))
+            torch.testing.assert_close(down, planner.float(), atol=8e-4, rtol=8e-4)
+
+    # A zero fidelity value must completely ignore the detail control.
+    for detail in (0.0, 1.0):
+        zero_fidelity, _, _, _ = img2img(
+            model, "euler", 8, planner_fidelity_strength=0.0,
+            planner_detail_strength=detail)
+        if detail == 0.0:
+            baseline_zero_fidelity = zero_fidelity
+        else:
+            for a, b in zip(baseline_zero_fidelity, zero_fidelity):
+                assert torch.equal(a["samples"], b["samples"])
+
     # Explicit trajectory mode ignores the img2img sigma and equals the default.
     for sampler_name in ("euler", "sa_solver"):
         explicit = img2img(model, sampler_name, 8, mode="trajectory", stage_megapixels="0.02",

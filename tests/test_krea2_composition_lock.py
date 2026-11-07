@@ -648,3 +648,62 @@ def test_planner_consistency_cache_keys_follow_actual_projection_device():
         torch.randn(1, 16, 6, 8), (10, 14), torch.device("meta"))
     assert set(projector._by_device) == {torch.device("meta")}
     assert all(t.device.type == "meta" for t in projector._by_device[torch.device("meta")])
+
+
+@pytest.mark.parametrize("layout", ["bchw", "bc1hw"])
+@pytest.mark.parametrize("detail_strength", [0.0, 0.2, 0.5, 1.0])
+def test_planner_bounded_detail_preserves_lowband_and_interpolates_nullspace(layout, detail_strength):
+    import torch.nn.functional as F
+    g = torch.Generator().manual_seed(333)
+    reference = torch.randn((1, 16, 6, 8), generator=g)
+    stage_source = torch.randn((1, 16, 10, 14), generator=g)
+    predicted = torch.randn((1, 16, 10, 14), generator=g)
+    if layout == "bc1hw":
+        reference, stage_source, predicted = (
+            t.unsqueeze(2) for t in (reference, stage_source, predicted)
+        )
+    source_before, predicted_before = stage_source.clone(), predicted.clone()
+    constraint = runtime.PlannerLatentConsistency(reference, (10, 14), predicted.device)
+    constrained = constraint.apply_bounded(predicted, 1.0, stage_source, detail_strength)
+    expected = constraint.apply(stage_source, 1.0) + detail_strength * (
+        constraint.apply(predicted, 1.0) - constraint.apply(stage_source, 1.0)
+    )
+    torch.testing.assert_close(constrained, expected, atol=3e-5, rtol=3e-5)
+    if layout == "bc1hw":
+        constrained = constrained.squeeze(2)
+        reference = reference.squeeze(2)
+    down = F.interpolate(constrained.float(), size=(6, 8), mode="area")
+    torch.testing.assert_close(down, reference, atol=3e-5, rtol=3e-5)
+    assert torch.equal(stage_source, source_before)
+    assert torch.equal(predicted, predicted_before)
+
+
+@pytest.mark.parametrize("strength", [0.0, 0.3, 0.75, 1.0])
+@pytest.mark.parametrize("detail_strength", [0.0, 0.2, 1.0])
+def test_planner_bounded_detail_keeps_exact_requested_measurement_strength(strength, detail_strength):
+    import torch.nn.functional as F
+    g = torch.Generator().manual_seed(19)
+    reference = torch.randn((2, 4, 8, 7), generator=g)
+    source = torch.randn((2, 4, 13, 11), generator=g)
+    denoised = torch.randn((2, 4, 13, 11), generator=g)
+    projector = runtime.PlannerLatentConsistency(reference, (13, 11), torch.device("cpu"))
+    actual = projector.apply_bounded(denoised, strength, source, detail_strength)
+    if strength == 0.0:
+        assert torch.equal(actual, denoised)
+    elif detail_strength == 1.0:
+        torch.testing.assert_close(actual, projector.apply(denoised, strength), atol=3e-5, rtol=3e-5)
+    measured = F.interpolate(actual, size=(8, 7), mode="area")
+    uncorrected = F.interpolate(denoised, size=(8, 7), mode="area")
+    torch.testing.assert_close(
+        measured, torch.lerp(uncorrected, reference, strength),
+        atol=3e-5, rtol=3e-5
+    )
+
+
+def test_planner_bounded_detail_handles_cross_device_input():
+    projector = runtime.PlannerLatentConsistency(
+        torch.randn((1, 16, 6, 8)), (10, 14), torch.device("cpu"))
+    prediction = torch.randn((1, 16, 1, 10, 14), device="meta")
+    source = torch.randn((1, 16, 1, 10, 14))
+    output = projector.apply_bounded(prediction, 1.0, source, 0.2)
+    assert output.device.type == "meta" and output.shape == prediction.shape

@@ -13,6 +13,11 @@ workflows keep their widget values and the existing behavior.
   opt-in in `planner_final_img2img` only, constraining target
   predictions and completed stages to preserve the finished planner's
   downsampled latent image.
+- `planner_detail_strength`: default 0.20, range 0–1. Active only with
+  nonzero planner fidelity. Caps source-relative high-resolution nullspace
+  innovation to the selected fraction at every target prediction and at
+  completion of each stage. Zero preserves source detail, one reproduces
+  the earlier unconstrained-detail projection.
 
 ## The two regeneration modes
 
@@ -64,12 +69,26 @@ area downsampler. Strength 1 enforces agreement to floating-point precision;
 strength 0 is a complete no-op. The completed stage is projected again to
 avoid multistep solvers passing residual planner drift to the next stage.
 
-This is a measurable *latent-space* constraint; it does not prove the
-decoded image will preserve every anatomical feature or that Krea 2 will
-avoid inventing fine detail in the operator's nullspace. Ghost contours,
-texture softening, or other visual regressions remain possible. Only
-small CPU-model execution and mathematical invariants have been verified;
-real-checkpoint A/B comparisons must precede enabling it by default.
+Crucially, exact agreement at the planner resolution leaves an unlimited
+high-resolution nullspace. This permitted severe ghosting in real-checkpoint
+output. The separate `planner_detail_strength` control now constrains the
+**new nullspace innovation relative to the finished preceding stage**,
+without changing planner measurement strength. The operator applied to a
+prediction X relative to the stage source S is:
+
+`X + fidelity * P(planner-D(X)) - (1-detail) * [X-S-P(D(X-S))]`.
+
+At full fidelity, its downsampled result matches the finished planner;
+detail=0 preserves the stage source's existing nullspace, detail=1 restores
+the former unbounded experimental projection. The same operation applies to
+the completed stage before passing it to the next resolution. It adds no
+denoiser evaluations.
+
+This establishes measurable latent-space fidelity and bounded introduction
+of new high-resolution latent features. It cannot guarantee the decoded
+image preserves every anatomical feature; blur, residual ghosting and other
+visual regressions are possible. Real-checkpoint A/B comparisons must
+precede release as a nonzero default for fidelity.
 
 ## Handoff diagnostics
 

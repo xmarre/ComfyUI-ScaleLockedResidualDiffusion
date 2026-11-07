@@ -1598,14 +1598,84 @@ class PlannerLatentConsistency:
         projected = (x32 + float(strength) * correction).to(dtype=x.dtype)
         return projected.unsqueeze(2) if temporal else projected
 
+    def apply_bounded(
+        self,
+        target: torch.Tensor,
+        strength: float,
+        stage_source: torch.Tensor,
+        detail_strength: float,
+    ) -> torch.Tensor:
+        """Enforce the planner measurement and limit source-relative nullspace drift.
 
-def guide_planner_fidelity(guider, projection: PlannerLatentConsistency, strength: float):
-    """Constrain native denoised predictions without replacing the sampler."""
+        The projector corrects D(target), but an arbitrary object can still
+        inhabit the nullspace of D. Restrict the part of target-source in that
+        nullspace to detail_strength, without weakening the planner measurement:
+
+            R = target - stage_source
+            R_null = R - P(D(R))
+            output = target + strength*P(planner-D(target))
+                     - (1-detail_strength)*R_null
+
+        P is the right pseudoinverse of D. With detail_strength=1 this is the
+        old projection; at 0 the source's high-resolution nullspace is preserved.
+        """
+        if strength == 0.0:
+            return target
+        if not 0.0 <= detail_strength <= 1.0 or not math.isfinite(detail_strength):
+            raise ValueError("planner_detail_strength must be finite and within [0, 1]")
+        temporal = target.ndim == 5 and target.shape[2] == 1
+        working = target.squeeze(2) if temporal else target
+        source = (stage_source.squeeze(2)
+                  if stage_source.ndim == 5 and stage_source.shape[2] == 1
+                  else stage_source)
+        if (working.ndim != 4 or source.ndim != 4 or
+                tuple(working.shape) != tuple(source.shape) or
+                tuple(working.shape[-2:]) != self.target_hw):
+            raise ValueError("planner detail constraint requires matching BCHW/BC1HW target and source")
+        x = working.float()
+        source = source.to(device=x.device, dtype=torch.float32)
+        reference, p_h, p_w = self._operands(x.device)
+
+        def lift(lowband: torch.Tensor) -> torch.Tensor:
+            return torch.matmul(torch.matmul(p_h, lowband), p_w.T)
+
+        corrected = x + float(strength) * lift(
+            reference - F.interpolate(x, size=self.low_hw, mode="area")
+        )
+        if detail_strength < 1.0:
+            innovation = x - source
+            nullspace_innovation = innovation - lift(
+                F.interpolate(innovation, size=self.low_hw, mode="area")
+            )
+            corrected = corrected - (1.0 - float(detail_strength)) * nullspace_innovation
+        corrected = corrected.to(dtype=working.dtype)
+        return corrected.unsqueeze(2) if temporal else corrected
+
+
+def guide_planner_fidelity(
+    guider,
+    projection: PlannerLatentConsistency,
+    strength: float,
+    stage_source_internal: torch.Tensor,
+    detail_strength: float,
+):
+    """Constrain planner measurements and bound new detail relative to the source.
+
+    A lowband-only projection leaves an unconstrained nullspace and can produce
+    catastrophic high-frequency ghost objects while satisfying D(x0)=planner.
+    Keep a configurable fraction of that *source-relative nullspace innovation*,
+    separately from the measurement strength, in native solver x0 predictions.
+    """
     original = guider.predict_noise
+    source_by_device = {stage_source_internal.device: stage_source_internal}
 
     def predict(self, x, timestep, model_options=None, seed=None):
         denoised = original(x, timestep, model_options=model_options, seed=seed)
-        return projection.apply(denoised, strength)
+        source = source_by_device.get(denoised.device)
+        if source is None:
+            source = stage_source_internal.to(device=denoised.device, dtype=torch.float32)
+            source_by_device[denoised.device] = source
+        return projection.apply_bounded(denoised, strength, source, detail_strength)
 
     guider.predict_noise = types.MethodType(predict, guider)
     return original
@@ -1630,6 +1700,7 @@ def _run_planner_final_img2img(
     stage_hw: tuple,
     start_sigma: float,
     planner_fidelity_strength: float = 0.0,
+    planner_detail_strength: float = 0.20,
     sampler_options: Optional[dict] = None,
     diagnostics: Optional[Krea2HandoffDiagnostics] = None,
 ) -> ScaleLockedSampleResult:
@@ -1650,6 +1721,8 @@ def _run_planner_final_img2img(
         raise ValueError("planner_final_img2img requires flow model sampling")
     if not 0.0 <= planner_fidelity_strength <= 1.0 or not math.isfinite(planner_fidelity_strength):
         raise ValueError("planner_fidelity_strength must be finite and within [0, 1]")
+    if not 0.0 <= planner_detail_strength <= 1.0 or not math.isfinite(planner_detail_strength):
+        raise ValueError("planner_detail_strength must be finite and within [0, 1]")
     if isinstance(highres_latent.get("noise_mask"), torch.Tensor):
         raise ValueError("planner_final_img2img does not support latent noise masks")
     if torch.count_nonzero(lowres_noise).item() == 0:
@@ -1718,8 +1791,13 @@ def _run_planner_final_img2img(
         guider = create_cfg_guider(model, positive, negative, cfg)
         projection = (PlannerLatentConsistency(planner_internal, hw, stage_samples.device)
                       if planner_fidelity_strength > 0 else None)
+        stage_source_internal = (
+            model.model.process_latent_in(start_latent.detach().float())
+            if projection is not None else None
+        )
         original_predict = (guide_planner_fidelity(
-            guider, projection, planner_fidelity_strength
+            guider, projection, planner_fidelity_strength,
+            stage_source_internal, planner_detail_strength
         ) if projection is not None else None)
         stage_x0: dict = {}
         callback = make_preview_callback(model, len(stage_sigmas) - 1, stage_x0)
@@ -1748,12 +1826,15 @@ def _run_planner_final_img2img(
             # resolution stage so planner drift does not accumulate.
             internal = model.model.process_latent_in(source.float())
             before = projection.relative_error(internal)
-            internal = projection.apply(internal, planner_fidelity_strength)
+            internal = projection.apply_bounded(
+                internal, planner_fidelity_strength, stage_source_internal,
+                planner_detail_strength,
+            )
             after = projection.relative_error(internal)
             _LOGGER.info(
-                "Krea 2 planner fidelity: stage=%d strength=%.3f "
+                "Krea 2 planner fidelity: stage=%d strength=%.3f detail_strength=%.3f "
                 "planner_lowband_relative_error_before=%.6f after=%.6f",
-                index, planner_fidelity_strength, before, after,
+                index, planner_fidelity_strength, planner_detail_strength, before, after,
             )
             source = model.model.process_latent_out(internal).to(dtype=source.dtype)
         if final:
@@ -1803,6 +1884,7 @@ def run_scale_locked_ksampler(
     img2img_start_sigma: Optional[float] = None,
     handoff_diagnostics: str = "off",
     planner_fidelity_strength: float = 0.0,
+    planner_detail_strength: float = 0.20,
 ) -> ScaleLockedSampleResult:
     if steps < 1:
         raise ValueError("steps must be >= 1")
@@ -1818,6 +1900,11 @@ def run_scale_locked_ksampler(
         raise ValueError("planner_fidelity_strength must be finite and within [0, 1]")
     if not img2img and planner_fidelity_strength != 0.0:
         raise ValueError("planner_fidelity_strength requires planner_final_img2img")
+    if (isinstance(planner_detail_strength, bool)
+            or not isinstance(planner_detail_strength, (int, float))
+            or not math.isfinite(planner_detail_strength)
+            or not 0.0 <= planner_detail_strength <= 1.0):
+        raise ValueError("planner_detail_strength must be finite and within [0, 1]")
     if img2img:
         if (config.lock_strength != 0.0 or config.mid_strength != 0.0 or config.spatial_mask is not None
                 or config.manifold_enabled):
@@ -1887,6 +1974,7 @@ def run_scale_locked_ksampler(
             nested_noise_strength=nested_noise_strength, noise_mode=noise_mode,
             stage_hw=tuple(stage_hw), start_sigma=img2img_start_sigma,
             planner_fidelity_strength=planner_fidelity_strength,
+            planner_detail_strength=planner_detail_strength,
             sampler_options=sampler_options, diagnostics=diagnostics,
         )
 

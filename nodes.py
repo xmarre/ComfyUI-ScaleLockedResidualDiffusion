@@ -327,12 +327,16 @@ class Krea2TurboFlowAlignedRegenerate:
                                "state and every denoised prediction as .latent files under "
                                "output/scale_locked_diagnostics for LoadLatent + VAE Decode. Sampling is unchanged."}),
                 "planner_fidelity_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Experimental, planner_final_img2img only. 0 preserves existing sampling. "
-                               "Nonzero values project high-resolution denoised predictions and completed stages "
-                               "toward the finished planner under the latent area-downsampling operator. "
-                               "1 enforces near-exact low-resolution latent consistency while leaving finer "
-                               "nullspace details free. Does not guarantee anatomy; validate texture and ghosting "
-                               "on your real checkpoint."}),
+                    "tooltip": "Experimental, planner_final_img2img only. 0 leaves sampling unchanged. "
+                               "At 1, enforces the completed planner's low-resolution latent measurements. "
+                               "This alone does not preserve fine anatomy; planner_detail_strength also bounds "
+                               "the high-resolution residual that previously caused severe ghosting."}),
+                "planner_detail_strength": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Experimental, active when planner_fidelity_strength > 0 in planner_final_img2img. "
+                               "Fraction of newly generated high-resolution detail permitted relative to the "
+                               "preceding finished stage. 0 preserves its finer latent structure (can be soft); "
+                               "1 reproduces the earlier unconstrained-detail projection, which can ghost or "
+                               "duplicate faces. Start at 0.20, increase only if the structure remains stable."}),
             },
         }
 
@@ -370,6 +374,7 @@ class Krea2TurboFlowAlignedRegenerate:
         img2img_start_sigma=0.65,
         handoff_diagnostics="off",
         planner_fidelity_strength=0.0,
+        planner_detail_strength=0.20,
     ):
         if regeneration_mode not in ("trajectory", "planner_final_img2img"):
             raise ValueError("regeneration_mode must be trajectory or planner_final_img2img")
@@ -383,6 +388,11 @@ class Krea2TurboFlowAlignedRegenerate:
             raise ValueError("planner_fidelity_strength must be finite and within [0, 1]")
         if not img2img and planner_fidelity_strength != 0.0:
             raise ValueError("planner_fidelity_strength requires planner_final_img2img")
+        if (isinstance(planner_detail_strength, bool)
+                or not isinstance(planner_detail_strength, (int, float))
+                or not math.isfinite(planner_detail_strength)
+                or not 0.0 <= planner_detail_strength <= 1.0):
+            raise ValueError("planner_detail_strength must be finite and within [0, 1]")
         if img2img:
             if (isinstance(img2img_start_sigma, bool) or not isinstance(img2img_start_sigma, (int, float))
                     or not math.isfinite(img2img_start_sigma) or not 0.0 < img2img_start_sigma < 1.0):
@@ -566,6 +576,7 @@ class Krea2TurboFlowAlignedRegenerate:
                 img2img_start_sigma=float(img2img_start_sigma) if img2img else None,
                 handoff_diagnostics=handoff_diagnostics,
                 planner_fidelity_strength=float(planner_fidelity_strength),
+                planner_detail_strength=float(planner_detail_strength),
             )
         return (result.output, result.lowres_planner, result.denoised_output)
 
