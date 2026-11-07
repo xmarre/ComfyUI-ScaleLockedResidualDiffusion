@@ -14,6 +14,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--comfy-root", type=Path, required=True)
     parser.add_argument("--spectrum-root", type=Path)
+    parser.add_argument("--kj-root", type=Path)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(args.comfy_root.resolve()))
@@ -301,6 +302,89 @@ def main():
         assert counts[tuple(result[1]["samples"].shape[-2:])] == 8, counts
         assert counts[(16, 20)] == 4, counts
         assert all(torch.isfinite(part["samples"]).all() for part in result), er_mode
+
+
+    if args.spectrum_root and args.kj_root:
+        # Exercise the real upstream KJ PreviewOverride __call__ in the
+        # complete Scale-Locked -> Spectrum -> native ER-SDE two-pass route.
+        # Only preview transport/decoder dependencies are stubbed to avoid
+        # external UI side effects in this CPU execution-contract test.
+        import ast
+        import logging
+        import time
+        import comfy.patcher_extension
+        from comfyui_spectrum_krea2.qualified_patches import _audited_kj_preview_type
+        kj_path = args.kj_root.resolve() / "nodes/preview_override_node.py"
+        parsed = ast.parse(kj_path.read_text(), filename=str(kj_path))
+        klass_ast = next(n for n in parsed.body if isinstance(n, ast.ClassDef)
+                         and n.name == "_PreviewOverrideWrapper")
+        mod = types.ModuleType("slrd_kj_fixture.preview_override_node")
+        mod.__file__ = str(kj_path)
+        class NoPreviewEncoder:
+            def submit(self, fn):
+                return True
+            def shutdown(self, drain_timeout=5.0):
+                pass
+        mod.__dict__.update({
+            "torch": torch, "comfy": __import__("comfy"),
+            "logging": logging, "time": time, "PromptServer": None,
+            "load_tiny_vae_decoder": None,
+            "_get_core_previewer": lambda *a: None,
+            "_is_ltx_latent_format": lambda *a: False,
+            "_is_av_model": lambda *a: False,
+            "_normalize_packed_x0": lambda x, *a: x,
+            "_frames_per_token": lambda *a: (1, 1),
+            "_AsyncPreviewEncoder": NoPreviewEncoder,
+            "latent_preview": types.SimpleNamespace(
+                Latent2RGBPreviewer=lambda *a, **kw: None,
+            ),
+        })
+        sys.modules[mod.__name__] = mod
+        exec(compile(ast.Module(body=[klass_ast], type_ignores=[]), str(kj_path), "exec"),
+             mod.__dict__)
+        assert _audited_kj_preview_type(mod._PreviewOverrideWrapper)
+
+        selected = SpectrumApplyKrea2().apply(
+            model, preset="turbo", warmup=2, tail=1,
+            bootstrap=False, extrapolation_guard_enabled=False,
+        )[0]
+        with_preview = selected.clone()
+        with_preview.add_wrapper_with_key(
+            comfy.patcher_extension.WrappersMP.OUTER_SAMPLE,
+            "kj_preview_override",
+            mod._PreviewOverrideWrapper(512, None, 80, False, tiny_vae="none"),
+        )
+
+        def run_kj(candidate):
+            receipts = []
+            tok = reports_context.set(receipts)
+            try:
+                with torch.inference_mode():
+                    result = node.sample(
+                        candidate, positive, negative,
+                        {"samples": torch.zeros(1, 4, 16, 20)},
+                        42, .01, 0.0, 0.0, steps=14, sampler_name="er_sde",
+                        max_stage_upscale=0.0,
+                    )
+            finally:
+                reports_context.reset(tok)
+            return result, receipts
+
+        baseline, base_reports = run_kj(selected)
+        tested, kj_reports = run_kj(with_preview)
+        assert len(kj_reports) == len(base_reports) == 2
+        for base_report, kj_report in zip(base_reports, kj_reports):
+            assert kj_report["fallback"] is None, kj_report
+            assert kj_report["forecast"] > 0, kj_report
+            assert (kj_report["actual"], kj_report["forecast"]) == (
+                base_report["actual"], base_report["forecast"],
+            )
+        for original, actual in zip(baseline, tested):
+            torch.testing.assert_close(
+                original["samples"], actual["samples"], atol=0, rtol=0,
+            )
+        print(json.dumps({"case": "kj_preview_spectrum_slrd_er_sde",
+                          "reports": kj_reports}))
 
     try:
         node.sample(model, positive, negative, {"samples": torch.zeros(1, 4, 24, 28)},
