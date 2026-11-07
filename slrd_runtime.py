@@ -1206,7 +1206,11 @@ def run_scale_locked_ksampler(
         out = clean_latent(highres_latent)
         return ScaleLockedSampleResult(output=out, lowres_planner=clean_latent(lowres_latent), denoised_output=out)
 
-    guard_sampler_alignment(sampler_name, sampler_guard)
+    # The Krea 2 ER-SDE node injects a verified single-prediction native
+    # sampler and patch-coupled stochastic increments. The generic SLRD
+    # alignment guard remains conservative for arbitrary ER-SDE samplers.
+    if not (sampler_name == "er_sde" and sampler_options is not None):
+        guard_sampler_alignment(sampler_name, sampler_guard)
     sigmas = calculate_sigmas(model, scheduler=scheduler, steps=steps, denoise=denoise)
     if sigmas.numel() == 0:
         out = clean_latent(highres_latent)
