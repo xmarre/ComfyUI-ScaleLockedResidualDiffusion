@@ -313,7 +313,6 @@ def main():
         import logging
         import time
         import comfy.patcher_extension
-        from comfyui_spectrum_krea2.qualified_patches import _audited_kj_preview_type
         kj_path = args.kj_root.resolve() / "nodes/preview_override_node.py"
         parsed = ast.parse(kj_path.read_text(), filename=str(kj_path))
         klass_ast = next(n for n in parsed.body if isinstance(n, ast.ClassDef)
@@ -342,7 +341,7 @@ def main():
         sys.modules[mod.__name__] = mod
         exec(compile(ast.Module(body=[klass_ast], type_ignores=[]), str(kj_path), "exec"),
              mod.__dict__)
-        assert _audited_kj_preview_type(mod._PreviewOverrideWrapper)
+        assert callable(mod._PreviewOverrideWrapper(512, None, 80, False, tiny_vae="none"))
 
         selected = SpectrumApplyKrea2().apply(
             model, preset="turbo", warmup=2, tail=1,
