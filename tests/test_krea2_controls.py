@@ -99,7 +99,13 @@ def test_existing_widget_slots_and_explicit_defaults():
         "sa_eta", "sa_sde_start_percent", "sa_sde_end_percent", "sa_s_noise",
         "sa_predictor_order", "sa_corrector_order", "sa_simple_order_2",
         "sa_spectrum_forecasts", "sa_planner_spectrum_forecasts",
+        "regeneration_mode", "img2img_start_sigma", "handoff_diagnostics",
     ]
+    assert schema["optional"]["regeneration_mode"][0] == ["trajectory", "planner_final_img2img"]
+    assert schema["optional"]["regeneration_mode"][1]["default"] == "trajectory"
+    assert schema["optional"]["img2img_start_sigma"][1]["default"] == 0.65
+    assert schema["optional"]["handoff_diagnostics"][0] == ["off", "log", "log_and_save_latents"]
+    assert schema["optional"]["handoff_diagnostics"][1]["default"] == "off"
     assert schema["optional"]["cfg"][1]["default"] == 1.0
     assert schema["optional"]["sampler_name"][0] == list(SAMPLERS)
     assert schema["optional"]["sampler_name"][1]["default"] == "euler"
@@ -120,6 +126,9 @@ def test_existing_widget_slots_and_explicit_defaults():
     assert (calls[-1]["cfg"], calls[-1]["sampler_name"],
             calls[-1]["scheduler"]) == (1.0, "euler", "simple")
     assert calls[-1]["stage_hw"] == ()
+    assert calls[-1]["regeneration_mode"] == "trajectory"
+    assert calls[-1]["img2img_start_sigma"] is None
+    assert calls[-1]["handoff_diagnostics"] == "off"
 
 
 def test_configured_cfg_sampler_scheduler_route_to_both_passes():
@@ -239,3 +248,57 @@ def test_sa_invalid_planner_forecast_control_rejected_before_any_sampling():
     with pytest.raises(ValueError, match="sa_planner_spectrum_forecasts must be a boolean"):
         node.sample(*args, sampler_name="sa_solver", sa_planner_spectrum_forecasts=1)
     assert not calls
+
+
+
+@pytest.mark.parametrize("sampler_name", SAMPLERS)
+def test_planner_final_img2img_routes_with_every_solver_and_ignores_lock_sigma(sampler_name):
+    node, calls, args = _node()
+    node.sample(*args, sampler_name=sampler_name, regeneration_mode="planner_final_img2img",
+                img2img_start_sigma=0.4, stage_megapixels="2")
+    call = calls[-1]
+    assert call["regeneration_mode"] == "planner_final_img2img"
+    assert call["img2img_start_sigma"] == 0.4
+    assert call["sampler_name"] == sampler_name and call["stage_hw"]
+    # A composition lock that would leave no trajectory step is irrelevant here.
+    node.sample(*args, sampler_name=sampler_name, regeneration_mode="planner_final_img2img",
+                composition_lock_sigma=0.0, steps=2, img2img_start_sigma=0.6, stage_megapixels="2")
+    assert calls[-1]["regeneration_mode"] == "planner_final_img2img"
+
+
+def test_trajectory_mode_ignores_img2img_sigma():
+    node, calls, args = _node()
+    node.sample(*args, img2img_start_sigma=0.3)
+    first = dict(calls[-1])
+    node.sample(*args, img2img_start_sigma=0.9)
+    assert calls[-1] == first
+    assert first["img2img_start_sigma"] is None and first["regeneration_mode"] == "trajectory"
+
+
+@pytest.mark.parametrize("extra, message", [
+    ({"regeneration_mode": "img2img"}, "regeneration_mode must be"),
+    ({"handoff_diagnostics": "verbose"}, "handoff_diagnostics must be"),
+    ({"regeneration_mode": "planner_final_img2img", "img2img_start_sigma": 0.0}, "strictly between"),
+    ({"regeneration_mode": "planner_final_img2img", "img2img_start_sigma": 1.0}, "strictly between"),
+    ({"regeneration_mode": "planner_final_img2img", "img2img_start_sigma": float("nan")}, "strictly between"),
+    ({"regeneration_mode": "planner_final_img2img", "img2img_start_sigma": True}, "strictly between"),
+    # linspace(1, 0, 9): 0.05 lies below the last nonzero sigma 0.125.
+    ({"regeneration_mode": "planner_final_img2img", "img2img_start_sigma": 0.05}, "no usable refinement"),
+])
+def test_invalid_img2img_configuration_rejected_before_sampling(extra, message):
+    node, calls, args = _node()
+    with pytest.raises(ValueError, match=message):
+        node.sample(*args, **extra)
+    assert not calls
+
+
+@pytest.mark.parametrize("index", [6, 7])
+def test_img2img_rejects_nonzero_trajectory_lock_strengths(index):
+    node, calls, args = _node()
+    args = list(args)
+    args[index] = 0.25
+    with pytest.raises(ValueError, match="coarse_lock_strength and mid_lock_strength to 0"):
+        node.sample(*args, regeneration_mode="planner_final_img2img")
+    assert not calls
+    node.sample(*args)  # trajectory mode keeps its existing lock-strength behavior
+    assert calls[-1]["regeneration_mode"] == "trajectory"

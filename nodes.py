@@ -304,6 +304,27 @@ class Krea2TurboFlowAlignedRegenerate:
                                "Off evaluates every planner step natively while preserving Spectrum acceleration "
                                "in the intermediate and final high-resolution stages. This is a quality comparison "
                                "for planner texture loss; the planner uses the same native noise and solver."}),
+                "regeneration_mode": (["trajectory", "planner_final_img2img"], {"default": "trajectory",
+                    "tooltip": "trajectory (default, unchanged): the first high-resolution stage follows the planner's "
+                               "denoising trajectory above composition_lock_sigma, then refines freely. "
+                               "planner_final_img2img: every high-resolution stage starts from the finished image "
+                               "below it (the completed planner for the first stage), resized and re-noised to "
+                               "img2img_start_sigma, then denoised natively to zero. In this mode "
+                               "composition_lock_sigma is not used, and coarse_lock_strength and mid_lock_strength "
+                               "must be 0."}),
+                "img2img_start_sigma": ("FLOAT", {"default": 0.65, "min": 0.01, "max": 0.99, "step": 0.01,
+                    "tooltip": "planner_final_img2img only: noise level the finished image is re-noised to before "
+                               "each high-resolution stage. Refinement resumes at the first step of the normal sigma "
+                               "schedule at or below this value (the effective sigma is logged); the schedule is not "
+                               "rescaled, so lower values also mean fewer high-resolution steps (raise steps for more). Lower values keep "
+                               "more of the finished image and allow less structural change; higher values regenerate "
+                               "more. Neither guarantees correct anatomy."}),
+                "handoff_diagnostics": (["off", "log", "log_and_save_latents"], {"default": "off",
+                    "tooltip": "Opt-in handoff diagnostics for both regeneration modes. log reports, per "
+                               "high-resolution step, how far the denoised prediction and the state's clean component "
+                               "are from the finished planner. log_and_save_latents also writes each stage's starting "
+                               "state and every denoised prediction as .latent files under "
+                               "output/scale_locked_diagnostics for LoadLatent + VAE Decode. Sampling is unchanged."}),
             },
         }
 
@@ -337,7 +358,24 @@ class Krea2TurboFlowAlignedRegenerate:
         sa_simple_order_2=False,
         sa_spectrum_forecasts=True,
         sa_planner_spectrum_forecasts=True,
+        regeneration_mode="trajectory",
+        img2img_start_sigma=0.65,
+        handoff_diagnostics="off",
     ):
+        if regeneration_mode not in ("trajectory", "planner_final_img2img"):
+            raise ValueError("regeneration_mode must be trajectory or planner_final_img2img")
+        if handoff_diagnostics not in ("off", "log", "log_and_save_latents"):
+            raise ValueError("handoff_diagnostics must be off, log or log_and_save_latents")
+        img2img = regeneration_mode == "planner_final_img2img"
+        if img2img:
+            if (isinstance(img2img_start_sigma, bool) or not isinstance(img2img_start_sigma, (int, float))
+                    or not math.isfinite(img2img_start_sigma) or not 0.0 < img2img_start_sigma < 1.0):
+                raise ValueError("img2img_start_sigma must be a finite value strictly between 0 and 1")
+            if coarse_lock_strength != 0.0 or mid_lock_strength != 0.0:
+                raise ValueError(
+                    "planner_final_img2img does not apply planner trajectory anchors; "
+                    "set coarse_lock_strength and mid_lock_strength to 0"
+                )
         if not isinstance(cfg, (int, float)) or not math.isfinite(cfg) or not 0.0 <= cfg <= 100.0:
             raise ValueError("Krea 2 CFG must be finite and within [0, 100]")
         if sampler_name not in krea2_sampler_names():
@@ -418,7 +456,25 @@ class Krea2TurboFlowAlignedRegenerate:
         if (len(schedule) != steps + 1 or any(not math.isfinite(v) or not 0.0 <= v <= 1.0 for v in schedule)
                 or any(a <= b for a, b in zip(schedule, schedule[1:])) or schedule[-1] != 0.0):
             raise ValueError("Krea 2 requires a strictly decreasing flow sigma schedule in [0, 1] ending at zero")
-        if stage_hw:
+        if img2img:
+            start = full_lock_prefix_length(schedule, float(img2img_start_sigma))
+            if start == 0 or start >= steps:
+                raise ValueError(
+                    "img2img_start_sigma leaves no usable refinement steps on this schedule; "
+                    "it must lie below the first sigma and at or above the last nonzero sigma"
+                )
+            logger.info(
+                "Krea 2 planner_final_img2img: start sigma %.4f -> schedule sigma %.6f at step %d of %d "
+                "(%d high-resolution steps per stage); composition_lock_sigma is not used",
+                float(img2img_start_sigma), schedule[start], start, steps, steps - start,
+            )
+            if stage_hw:
+                logger.info(
+                    "Krea 2 resolution stages: planner %sx%s -> %s -> output %sx%s",
+                    low_w * 8, low_h * 8, " -> ".join(f"{w * 8}x{h * 8}" for h, w in stage_hw),
+                    target_w * 8, target_h * 8,
+                )
+        elif stage_hw:
             # ER-SDE shifts the initial CONST sigma away from 1.0 for finite
             # log-SNR; lock/release planning must use the sigma actually seen
             # by the native denoiser, not the nominal outer schedule.
@@ -490,6 +546,9 @@ class Krea2TurboFlowAlignedRegenerate:
                     sampler_name in ("sa_solver", "sa_solver_pece")
                     and not sa_planner_spectrum_forecasts
                 ),
+                regeneration_mode=regeneration_mode,
+                img2img_start_sigma=float(img2img_start_sigma) if img2img else None,
+                handoff_diagnostics=handoff_diagnostics,
             )
         return (result.output, result.lowres_planner, result.denoised_output)
 

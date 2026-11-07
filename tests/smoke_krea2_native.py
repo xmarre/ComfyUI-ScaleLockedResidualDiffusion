@@ -712,6 +712,257 @@ def main():
         print(json.dumps({"case": "kj_preview_spectrum_slrd_er_sde",
                           "reports": kj_reports}))
 
+    # ---- planner_final_img2img: every high-resolution stage is img2img of
+    # the finished image below it, run by the genuine native ComfyUI path.
+    import tempfile
+    import comfy.model_management
+    import folder_paths
+    import safetensors.torch
+
+    detail_seed = 42 ^ 0x9E3779B97F4A7C15
+    img2img_sigma = .55
+    model_sampling = model.get_model_object("model_sampling")
+
+    def img2img(selected, sampler_name, steps, *, latent_hw=(16, 20), capture_inputs=False,
+                mode="planner_final_img2img", fail=None, **extra):
+        if sampler_name in ("sa_solver", "sa_solver_pece"):
+            extra.setdefault("sa_spectrum_forecasts", True)
+        reports, stages, inputs = [], [], []
+        token = reports_context.set(reports) if reports_context is not None else None
+        original_guider = runtime.create_cfg_guider
+        original_preview = runtime.make_preview_callback
+
+        def capture_guider(*a, **kw):
+            guider = original_guider(*a, **kw)
+            native_sample = guider.sample
+
+            def sample(noise, latent_image, sampler, sigmas, **kws):
+                out = native_sample(noise, latent_image, sampler, sigmas, **kws)
+                stages.append({"noise": noise.detach().clone(), "latent": latent_image.detach().clone(),
+                               "sigmas": sigmas.detach().cpu().clone(), "out": out.detach().clone()})
+                return out
+            guider.sample = sample
+            return guider
+
+        def failing_preview(*a, **kw):
+            inner = original_preview(*a, **kw)
+
+            def callback(step, x0, x, total):
+                if tuple(x.shape[-2:]) == fail[0] and step == fail[1]:
+                    raise comfy.model_management.InterruptProcessingException()
+                inner(step, x0, x, total)
+            return callback
+
+        runtime.create_cfg_guider = capture_guider
+        if fail is not None:
+            runtime.make_preview_callback = failing_preview
+        hook = base.diffusion_model.register_forward_pre_hook(
+            lambda module, args: inputs.append((args[0].detach().clone(), args[1].detach().clone()))
+        ) if capture_inputs else None
+        try:
+            with torch.inference_mode():
+                result = node.sample(
+                    selected, positive, negative, {"samples": torch.zeros(1, 4, *latent_hw)},
+                    42, .01, 0.0, 0.0, steps=steps, sampler_name=sampler_name,
+                    regeneration_mode=mode, img2img_start_sigma=img2img_sigma, **extra,
+                )
+        finally:
+            runtime.create_cfg_guider = original_guider
+            runtime.make_preview_callback = original_preview
+            if hook is not None:
+                hook.remove()
+            if reports_context is not None:
+                reports_context.reset(token)
+        assert all(torch.isfinite(x["samples"]).all() for x in result), sampler_name
+        assert not base.diffusion_model._forward_pre_hooks
+        return result, reports, stages, inputs
+
+    for sampler_name in runtime.KREA2_SAMPLERS:
+        steps = 8
+        schedule = runtime.calculate_sigmas(model, scheduler="simple", steps=steps, denoise=1.0)
+        start = runtime.img2img_start_index(schedule.tolist(), img2img_sigma)
+        assert 0 < start < steps
+        free = steps - start
+        for stage_options, sizes in (({"max_stage_upscale": 0.0}, [(16, 20)]),
+                                     ({"stage_megapixels": "0.02"}, [(16, 20), (24, 28)])):
+            latent_hw = sizes[-1]
+            result, _, stages, inputs = img2img(model, sampler_name, steps, latent_hw=latent_hw,
+                                                capture_inputs=True, **stage_options)
+            planner = result[1]["samples"]
+            planner_hw = tuple(planner.shape[-2:])
+            # The planner is identical to the trajectory mode's finished planner.
+            trajectory = controls(model, sampler_name, "simple", 1.0, steps, False,
+                                  latent=torch.zeros(1, 4, *latent_hw), **stage_options)[0]
+            assert torch.equal(trajectory[1]["samples"], planner), sampler_name
+            lowres_noise = runtime.prepare_noise(torch.zeros(planner.shape), 42)
+            noise = lowres_noise
+            assert len(stages) == len(sizes), (sampler_name, len(stages))
+            for index, (stage, hw) in enumerate(zip(stages, sizes)):
+                final = index == len(sizes) - 1
+                seed = detail_seed if final else runtime._stage_seed(detail_seed, index)
+                noise = runtime._build_highres_noise(
+                    {"samples": torch.zeros(planner.shape[:-2] + hw)}, noise, seed, 1.0, "patch_coupled")
+                # Patch-coupled noise chain and seeds match the trajectory ladder's.
+                assert torch.equal(stage["noise"].cpu(), noise), (sampler_name, index)
+                assert torch.equal(stage["sigmas"], schedule[start:].to(stage["sigmas"].dtype)), sampler_name
+                # Source: the finished planner, then each finished stage below.
+                source = planner if index == 0 else stages[index - 1]["out"]
+                expected_latent = runtime.resize_4d_tensor(source.float(), hw)
+                assert torch.equal(stage["latent"].float(), expected_latent), (sampler_name, index)
+                # First native denoiser input = sigma_k * noise + (1 - sigma_k) * clean.
+                first = next(x for x, t in inputs if tuple(x.shape[-2:]) == hw)
+                timestep = next(t for x, t in inputs if tuple(x.shape[-2:]) == hw)
+                sigma = schedule[start]
+                expected_x = sigma * noise + (1 - sigma) * base.process_latent_in(expected_latent)
+                torch.testing.assert_close(first.reshape(expected_x.shape), expected_x, atol=1e-5, rtol=1e-5)
+                torch.testing.assert_close(timestep.flatten()[0].float(),
+                                           model_sampling.timestep(sigma).float(), atol=1e-6, rtol=1e-6)
+            assert torch.equal(result[0]["samples"], stages[-1]["out"].to(result[0]["samples"].dtype))
+            counts = {}
+            for x, _ in inputs:
+                counts[tuple(x.shape[-2:])] = counts.get(tuple(x.shape[-2:]), 0) + 1
+            expected_counts = {planner_hw: solver_calls(sampler_name, steps)}
+            expected_counts.update({hw: solver_calls(sampler_name, free) for hw in sizes})
+            assert counts == expected_counts, (sampler_name, counts, expected_counts)
+            again = img2img(model, sampler_name, steps, latent_hw=latent_hw, **stage_options)[0]
+            for a, b in zip(result, again):
+                assert torch.equal(a["samples"], b["samples"]), sampler_name
+            print(json.dumps({"case": "img2img_native", "sampler": sampler_name, "options": stage_options,
+                              "start_index": start, "start_sigma": float(schedule[start]),
+                              "model_calls": {f"{h}x{w}": n for (h, w), n in counts.items()}}))
+
+    # Explicit trajectory mode ignores the img2img sigma and equals the default.
+    for sampler_name in ("euler", "sa_solver"):
+        explicit = img2img(model, sampler_name, 8, mode="trajectory", stage_megapixels="0.02",
+                           latent_hw=(24, 28))[0]
+        default = controls(model, sampler_name, "simple", 1.0, 8, False,
+                           latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02")[0]
+        for a, b in zip(explicit, default):
+            assert torch.equal(a["samples"], b["samples"]), sampler_name
+
+    # Diagnostics are observational: outputs are bitwise unchanged, and the
+    # saved .latent files load as ComfyUI SaveLatent files.
+    created = []
+    original_diagnostics = runtime.Krea2HandoffDiagnostics
+
+    class CapturedDiagnostics(original_diagnostics):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            created.append(self)
+
+    runtime.Krea2HandoffDiagnostics = CapturedDiagnostics
+    previous_output = folder_paths.get_output_directory()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder_paths.set_output_directory(tmp)
+            for mode in ("planner_final_img2img", "trajectory"):
+                for sampler_name in ("euler", "dpmpp_2m", "sa_solver_pece"):
+                    plain = img2img(model, sampler_name, 8, mode=mode, stage_megapixels="0.02",
+                                    latent_hw=(24, 28))[0]
+                    created.clear()
+                    observed, _, stages, _ = img2img(model, sampler_name, 8, mode=mode, stage_megapixels="0.02",
+                                                     latent_hw=(24, 28),
+                                                     handoff_diagnostics="log_and_save_latents")
+                    for a, b in zip(plain, observed):
+                        assert torch.equal(a["samples"], b["samples"]), (mode, sampler_name)
+                    diag = created[-1]
+                    records = diag.records
+                    assert {r["stage"] for r in records} == {0, 1}, records
+                    if mode == "planner_final_img2img":
+                        assert all(not r["locked"] for r in records)
+                        firsts = [r for r in records if r["step"] == 0]
+                        assert len(firsts) == 2 and all(r["state_clean_vs_stage_source"] < 1e-4 for r in firsts), firsts
+                        state = safetensors.torch.load_file(
+                            next(p for p in diag.saved if p.endswith("stage0_step000_state.latent")))
+                        assert "latent_format_version_0" in state
+                        expected_state = base.process_latent_out(
+                            stages[0]["sigmas"][0] * stages[0]["noise"]
+                            + (1 - stages[0]["sigmas"][0]) * base.process_latent_in(stages[0]["latent"].float()))
+                        torch.testing.assert_close(state["latent_tensor"], expected_state, atol=1e-4, rtol=1e-4)
+                    else:
+                        assert any(r["locked"] for r in records) or sampler_name == "euler"
+                    assert any(p.endswith("planner_final.latent") for p in diag.saved)
+                    print(json.dumps({"case": "handoff_diagnostics", "mode": mode, "sampler": sampler_name,
+                                      "files": len(diag.saved),
+                                      "first_records": [r for r in records if r["stage"] == 0][:2]}))
+    finally:
+        folder_paths.set_output_directory(previous_output)
+        runtime.Krea2HandoffDiagnostics = original_diagnostics
+
+    # Invalid img2img configurations fail before any model evaluation.
+    for extra, message in (({"img2img_start_sigma": .01}, "no usable refinement"),
+                           ({"img2img_start_sigma": 1.0}, "strictly between")):
+        calls.clear()
+        hook = base.diffusion_model.register_forward_pre_hook(lambda module, args: calls.append(1))
+        try:
+            node.sample(model, positive, negative, {"samples": torch.zeros(1, 4, 16, 20)}, 42, .01, 0.0, 0.0,
+                        steps=8, regeneration_mode="planner_final_img2img", **extra)
+        except ValueError as exc:
+            assert message in str(exc), exc
+        else:
+            raise AssertionError(extra)
+        finally:
+            hook.remove()
+        assert not calls
+    try:
+        node.sample(model, positive, negative, {"samples": torch.zeros(1, 4, 16, 20)}, 42, .01, 0.2, 0.0,
+                    steps=8, regeneration_mode="planner_final_img2img")
+    except ValueError as exc:
+        assert "coarse_lock_strength" in str(exc)
+    else:
+        raise AssertionError("trajectory lock strengths must be rejected in img2img mode")
+
+    # Interruption inside a high-resolution stage leaves no hooks or Spectrum
+    # state behind; the next run reproduces the uninterrupted result exactly.
+    for label, selected in cases:
+        for sampler_name in ("euler", "sa_solver"):
+            options = {"stage_megapixels": "0.02", "latent_hw": (24, 28)}
+            if sampler_name == "sa_solver":
+                options["sa_spectrum_forecasts"] = False
+            reference, ref_reports, _, _ = img2img(selected, sampler_name, 8, **options)
+            try:
+                img2img(selected, sampler_name, 8, fail=((24, 28), 1), **options)
+            except comfy.model_management.InterruptProcessingException:
+                pass
+            else:
+                raise AssertionError("interrupt was not raised")
+            assert not base.diffusion_model._forward_pre_hooks
+            assert not base.diffusion_model.last._forward_pre_hooks
+            repeated, rep_reports, _, _ = img2img(selected, sampler_name, 8, **options)
+            for a, b in zip(reference, repeated):
+                assert torch.equal(a["samples"], b["samples"]), (label, sampler_name)
+            if label == "spectrum":
+                assert ref_reports == rep_reports, (ref_reports, rep_reports)
+                if sampler_name == "sa_solver":
+                    # The scoped native-only flag was restored after the interrupt.
+                    forecasting = img2img(selected, sampler_name, 8, stage_megapixels="0.02",
+                                          latent_hw=(24, 28))[1]
+                    assert not any(r.get("native_only") for r in forecasting), forecasting
+
+    # Spectrum stays operational in the planner and in every img2img stage.
+    if reports_context is not None:
+        aligned = SpectrumApplyKrea2().apply(
+            model, preset="turbo", warmup=2, tail=1, bootstrap=False,
+            extrapolation_guard_enabled=False,
+        )[0]
+        steps = 20
+        schedule = runtime.calculate_sigmas(model, scheduler="simple", steps=steps, denoise=1.0)
+        free = steps - runtime.img2img_start_index(schedule.tolist(), img2img_sigma)
+        for sampler_name in runtime.KREA2_SAMPLERS:
+            for stage_options, n_stages in (({"max_stage_upscale": 0.0}, 1), ({"stage_megapixels": "0.02"}, 2)):
+                latent_hw = (16, 20) if n_stages == 1 else (24, 28)
+                result, reports, _, _ = img2img(aligned, sampler_name, steps, latent_hw=latent_hw, **stage_options)
+                assert len(reports) == 1 + n_stages, (sampler_name, reports)
+                assert reports[0]["outer_steps"] == steps
+                assert [r["outer_steps"] for r in reports[1:]] == [free] * n_stages, reports
+                assert all(r["fallback"] is None for r in reports), reports
+                assert all(r["forecast"] > 0 for r in reports), (sampler_name, reports)
+                assert not base.diffusion_model._forward_pre_hooks
+                print(json.dumps({"case": "img2img_spectrum", "sampler": sampler_name, "stages": n_stages,
+                                  "stage_steps": free,
+                                  "reports": [{k: r[k] for k in ("outer_steps", "actual", "forecast",
+                                                                  "denoiser_calls", "fallback")} for r in reports]}))
+
     try:
         node.sample(model, positive, negative, {"samples": torch.zeros(1, 4, 24, 28)},
                     42, .01, 0.0, 0.0, steps=2, composition_lock_sigma=0.0, stage_megapixels="0.02")

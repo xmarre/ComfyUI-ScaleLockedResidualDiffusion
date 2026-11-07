@@ -1107,6 +1107,7 @@ def sample_with_runtime(
     restore_after: bool = True,
     analytic_full_lock: bool = False,
     skip_locked_model_calls: bool = False,
+    diagnostics: Optional["Krea2HandoffDiagnostics"] = None,
 ) -> ScaleLockedSampleResult:
     if runtime.sigmas.numel() == 0:
         out = clean_latent(runtime.highres_latent)
@@ -1135,6 +1136,12 @@ def sample_with_runtime(
 
     x0_output = {}
     callback = make_preview_callback(runtime.model, len(sigmas) - 1, x0_output)
+    if diagnostics is not None:
+        diagnostics.set_planner(runtime.lowres_out["samples"])
+        callback = diagnostics.wrap(
+            callback, stage=0, stage_hw=tuple(latent_samples.shape[-2:]), sigmas=sigmas,
+            noise=runtime.highres_noise, source=runtime.lowres_out["samples"], lock_sigma=config.full_lock_sigma,
+        )
     noise_mask = runtime.highres_latent.get("noise_mask", None)
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
@@ -1200,6 +1207,7 @@ def _run_resolution_ladder(
     stage_hw: tuple,
     sampler_options: Optional[dict] = None,
     pece_corrected_anchors: Optional[list] = None,
+    diagnostics: Optional["Krea2HandoffDiagnostics"] = None,
 ) -> ScaleLockedSampleResult:
     """Refine through increasing resolutions, each stage finishing its image.
 
@@ -1247,6 +1255,8 @@ def _run_resolution_ladder(
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
     x0_output: dict = {}
     finished = None
+    if diagnostics is not None:
+        diagnostics.set_planner(lowres_out["samples"])
 
     for index, hw in enumerate(sizes):
         final = index == len(sizes) - 1
@@ -1311,6 +1321,13 @@ def _run_resolution_ladder(
         apply_scale_lock_to_guider(guider, stage_runtime, config, skip_locked_model_calls=True)
         stage_x0: dict = {}
         callback = make_preview_callback(model, len(stage_sigmas) - 1, stage_x0)
+        if diagnostics is not None:
+            callback = diagnostics.wrap(
+                callback, stage=index, stage_hw=hw,
+                sigmas=effective_er_sde_sigmas(stage_sigmas, model) if sampler_name in SNR_SOLVER_NAMES else stage_sigmas,
+                noise=stage_noise, source=lowres_out["samples"] if finished is None else finished,
+                lock_sigma=config.full_lock_sigma,
+            )
         try:
             finished = guider.sample(
                 stage_noise,
@@ -1328,6 +1345,279 @@ def _run_resolution_ladder(
             x0_output = stage_x0
 
     samples = finished.to(comfy.model_management.intermediate_device())
+    out = clean_latent(highres_latent)
+    out["samples"] = samples
+    if "x0" in x0_output:
+        try:
+            x0_out = model.model.process_latent_out(x0_output["x0"].cpu())
+        except Exception:
+            x0_out = x0_output["x0"].detach().cpu()
+        denoised = clean_latent(highres_latent)
+        denoised["samples"] = x0_out
+    else:
+        denoised = out
+    return ScaleLockedSampleResult(output=out, lowres_planner=clean_latent(lowres_out), denoised_output=denoised)
+
+
+REGENERATION_MODES = ("trajectory", "planner_final_img2img")
+HANDOFF_DIAGNOSTIC_MODES = ("off", "log", "log_and_save_latents")
+
+
+def img2img_start_index(sigma_values, start_sigma: float) -> int:
+    """Schedule index where planner-final img2img refinement starts.
+
+    The refinement resumes the native schedule at its first sigma that does
+    not exceed ``start_sigma``, the same discrete suffix rule as ComfyUI's
+    KSamplerAdvanced ``start_at_step`` and the composition-lock release. The
+    schedule itself is never rescaled; the returned sigma is exact.
+    """
+    values = [float(v) for v in sigma_values]
+    if isinstance(start_sigma, bool) or not isinstance(start_sigma, (int, float)) \
+            or not math.isfinite(start_sigma) or not 0.0 < float(start_sigma) < 1.0:
+        raise ValueError("img2img_start_sigma must be a finite value strictly between 0 and 1")
+    steps = len(values) - 1
+    index = full_lock_prefix_length(values, float(start_sigma))
+    if index == 0:
+        raise ValueError(
+            "img2img_start_sigma is at or above the first schedule sigma; that discards the planner "
+            "image entirely. Lower img2img_start_sigma."
+        )
+    if index >= steps:
+        raise ValueError(
+            "img2img_start_sigma is below every nonzero schedule sigma, leaving no refinement step; "
+            "raise img2img_start_sigma or steps"
+        )
+    return index
+
+
+class Krea2HandoffDiagnostics:
+    """Opt-in observer for the planner-to-target handoff.
+
+    It reads the preview callback's denoised prediction and state, never the
+    sampler inputs, so sampling is bitwise unchanged. Metrics compare against
+    the finished planner latent in the model's internal space:
+
+    * ``x0_vs_planner_lowband``: the prediction area-reduced to the planner
+      grid against the finished planner (structural drift).
+    * ``state_clean_vs_planner_lowband``: the clean component
+      ``(x - sigma * noise_scale * noise) / (1 - sigma)`` of the state against
+      the finished planner. Exact for the injected start noise of
+      deterministic solvers; stochastic steps add fresh noise.
+    * ``state_clean_vs_stage_source``: the same clean component against the
+      stage's resized source image. Planner-final img2img starts at ~0 by
+      construction; trajectory mode shows how far its release state is
+      from the finished planner.
+    * ``x0_vs_stage_source``: the prediction against the stage's own resized
+      source image at full resolution.
+
+    Optional ``.latent`` files (ComfyUI SaveLatent format, output space) hold
+    each stage's starting state and every denoised prediction, for decoding
+    with LoadLatent + VAE Decode. Nothing is decoded here.
+    """
+
+    def __init__(self, model, mode: str, regeneration_mode: str, seed: int):
+        if mode not in HANDOFF_DIAGNOSTIC_MODES or mode == "off":
+            raise ValueError(f"unsupported handoff diagnostics mode: {mode!r}")
+        self.model = model
+        self.regeneration_mode = regeneration_mode
+        self.save = mode == "log_and_save_latents"
+        self.seed = int(seed)
+        self.reference = None
+        self.directory = None
+        self.records: list[dict] = []
+        self.saved: list[str] = []
+
+    def set_planner(self, planner_out: torch.Tensor) -> None:
+        with torch.no_grad():
+            self.reference = self.model.model.process_latent_in(
+                planner_out.detach().to(device="cpu", dtype=torch.float32)
+            )
+        if self.save:
+            self._save("planner_final", planner_out)
+
+    def _output_dir(self):
+        if self.directory is None:
+            import os
+            import time
+            import folder_paths
+            name = f"krea2_handoff_{time.strftime('%Y%m%d-%H%M%S')}_seed{self.seed}_{self.regeneration_mode}"
+            self.directory = os.path.join(folder_paths.get_output_directory(), "scale_locked_diagnostics", name)
+            os.makedirs(self.directory, exist_ok=True)
+        return self.directory
+
+    def _save(self, name: str, output_space: torch.Tensor) -> None:
+        import os
+        import safetensors.torch
+        path = os.path.join(self._output_dir(), name + ".latent")
+        safetensors.torch.save_file({
+            "latent_tensor": output_space.detach().to(device="cpu", dtype=torch.float32).contiguous(),
+            "latent_format_version_0": torch.tensor([]),
+        }, path)
+        self.saved.append(path)
+
+    @staticmethod
+    def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
+        return float((a - b).norm() / b.norm().clamp_min(1e-12))
+
+    def wrap(self, callback, *, stage: int, stage_hw, sigmas: torch.Tensor, noise: torch.Tensor,
+             source: Optional[torch.Tensor], lock_sigma: Optional[float]):
+        if self.reference is None:
+            raise RuntimeError("handoff diagnostics need the finished planner first")
+        sigma_values = [float(v) for v in sigmas.detach().cpu().tolist()]
+        planner_hw = tuple(self.reference.shape[-2:])
+        noise_scale = float(getattr(_model_sampling_obj(self.model), "noise_scale", 1.0))
+        source_in = None
+        if source is not None:
+            with torch.no_grad():
+                source_in = self.model.model.process_latent_in(
+                    resize_4d_tensor(source.detach().to(device="cpu", dtype=torch.float32), tuple(stage_hw))
+                )
+        state = {"previous_locked": None}
+
+        def observe(step, x0, x, total_steps):
+            sigma = sigma_values[step] if 0 <= step < len(sigma_values) else float("nan")
+            locked = lock_sigma is not None and sigma > lock_sigma
+            with torch.no_grad():
+                pred = x0.detach().to(device="cpu", dtype=torch.float32)
+                record = {
+                    "regeneration_mode": self.regeneration_mode, "stage": stage,
+                    "stage_hw": list(stage_hw), "step": int(step), "total_steps": int(total_steps),
+                    "sigma": sigma, "locked": bool(locked),
+                    "x0_vs_planner_lowband": self._rel(resize_4d_tensor(pred, planner_hw), self.reference),
+                }
+                if 0.0 < sigma < 0.99:
+                    clean = (x.detach().to(device="cpu", dtype=torch.float32)
+                             - sigma * noise_scale * noise.detach().to(device="cpu", dtype=torch.float32)
+                             ) / (1.0 - sigma)
+                    record["state_clean_vs_planner_lowband"] = self._rel(
+                        resize_4d_tensor(clean, planner_hw), self.reference)
+                    if source_in is not None:
+                        record["state_clean_vs_stage_source"] = self._rel(clean, source_in)
+                if source_in is not None:
+                    record["x0_vs_stage_source"] = self._rel(pred, source_in)
+                self.records.append(record)
+                _LOGGER.info("Krea 2 handoff diagnostics: %s", record)
+                if self.save:
+                    released = state["previous_locked"] is True and not locked
+                    if step == 0 or released:
+                        self._save(f"stage{stage}_step{step:03d}_state",
+                                   self.model.model.process_latent_out(x.detach().float().cpu()))
+                    self._save(f"stage{stage}_step{step:03d}_x0", self.model.model.process_latent_out(pred))
+            state["previous_locked"] = locked
+            callback(step, x0, x, total_steps)
+
+        return observe
+
+
+def _run_planner_final_img2img(
+    *,
+    model,
+    positive,
+    negative,
+    cfg,
+    sampler_name: str,
+    sigmas: torch.Tensor,
+    highres_latent: dict,
+    lowres_latent: dict,
+    lowres_out: dict,
+    lowres_noise: torch.Tensor,
+    detail_seed: int,
+    stochastic_seed: int,
+    nested_noise_strength: float,
+    noise_mode: str,
+    stage_hw: tuple,
+    start_sigma: float,
+    sampler_options: Optional[dict] = None,
+    diagnostics: Optional[Krea2HandoffDiagnostics] = None,
+) -> ScaleLockedSampleResult:
+    """Img2img refinement of the finished planner image at each stage.
+
+    Every stage resizes the finished latent of the stage below (the planner
+    for the first one), and the native sampler re-noises it to the exact
+    schedule sigma ``sigmas[k]`` through ``CFGGuider.inner_sample`` and the
+    model's ``noise_scaling``: ``x = sigma_k * s * noise + (1 - sigma_k) * clean``
+    with ``clean = process_latent_in(resized)`` and the patch-coupled noise
+    used by the trajectory path. The native solver then runs ``sigmas[k:]``
+    from a fresh start, so no multistep history, PECE correction or planner
+    trajectory anchor carries into it. Composition-lock settings are unused.
+    """
+    if not isinstance(_model_sampling_obj(model), comfy.model_sampling.CONST):
+        raise ValueError("planner_final_img2img requires flow model sampling")
+    if isinstance(highres_latent.get("noise_mask"), torch.Tensor):
+        raise ValueError("planner_final_img2img does not support latent noise masks")
+    if torch.count_nonzero(lowres_noise).item() == 0:
+        raise ValueError("planner_final_img2img requires Gaussian noise (add_noise)")
+    sigma_values = [float(v) for v in sigmas.detach().cpu().tolist()]
+    start = img2img_start_index(sigma_values, start_sigma)
+    target = highres_latent["samples"]
+    sizes = [tuple(map(int, hw)) for hw in stage_hw] + [tuple(map(int, target.shape[-2:]))]
+    previous = tuple(map(int, lowres_latent["samples"].shape[-2:]))
+    for hw in sizes:
+        if hw[0] < previous[0] or hw[1] < previous[1] or hw == previous or hw[0] % 2 or hw[1] % 2:
+            raise ValueError("resolution stages must grow monotonically in both dimensions on the 16-pixel grid")
+        previous = hw
+
+    stage_sigmas = sigmas[start:]
+    _LOGGER.info(
+        "Krea 2 planner_final_img2img: requested start sigma %.4f -> schedule sigma %.6f "
+        "(step %d of %d, %d refinement steps per stage, %d stage(s))",
+        float(start_sigma), sigma_values[start], start, len(sigma_values) - 1,
+        len(sigma_values) - 1 - start, len(sizes),
+    )
+    shapes = tuple(tuple(lowres_noise.shape[:-2]) + tuple(hw) for hw in sizes)
+    disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+    source = lowres_out["samples"]  # finished planner, output latent space
+    stage_noise = lowres_noise
+    x0_output: dict = {}
+    if diagnostics is not None:
+        diagnostics.set_planner(source)
+
+    for index, hw in enumerate(sizes):
+        final = index == len(sizes) - 1
+        stage_latent = highres_latent if final else resize_latent_dict(highres_latent, hw)
+        stage_samples = stage_latent["samples"]
+        seed = detail_seed if final else _stage_seed(detail_seed, index)
+        stage_noise = _build_highres_noise(
+            highres_latent=stage_latent,
+            lowres_noise=stage_noise,
+            seed=seed,
+            hf_strength=nested_noise_strength,
+            mode=noise_mode,
+        )
+        # Output-space latent; CFGGuider.inner_sample applies process_latent_in.
+        start_latent = resize_4d_tensor(
+            source.to(device=stage_samples.device, dtype=torch.float32), hw
+        ).to(dtype=stage_samples.dtype)
+        if sampler_name in SNR_SOLVER_NAMES:
+            sampler = _krea2_sampler_object(
+                sampler_name, sampler_options, model=model, low_shape=tuple(lowres_noise.shape),
+                stage_shapes=shapes, stage_index=index, seed=stochastic_seed,
+                start_step=start, sigmas=stage_sigmas, noise_like=stage_noise,
+            )
+        else:
+            sampler = comfy.samplers.sampler_object(sampler_name)
+        guider = create_cfg_guider(model, positive, negative, cfg)
+        stage_x0: dict = {}
+        callback = make_preview_callback(model, len(stage_sigmas) - 1, stage_x0)
+        if diagnostics is not None:
+            callback = diagnostics.wrap(
+                callback, stage=index, stage_hw=hw, sigmas=stage_sigmas, noise=stage_noise,
+                source=source, lock_sigma=None,
+            )
+        source = guider.sample(
+            stage_noise,
+            start_latent,
+            sampler,
+            stage_sigmas,
+            denoise_mask=None,
+            callback=callback,
+            disable_pbar=disable_pbar,
+            seed=seed,
+        )
+        if final:
+            x0_output = stage_x0
+
+    samples = source.to(comfy.model_management.intermediate_device())
     out = clean_latent(highres_latent)
     out["samples"] = samples
     if "x0" in x0_output:
@@ -1364,9 +1654,26 @@ def run_scale_locked_ksampler(
     stage_hw: tuple = (),
     sampler_options: Optional[dict] = None,
     sa_planner_native_only: bool = False,
+    regeneration_mode: str = "trajectory",
+    img2img_start_sigma: Optional[float] = None,
+    handoff_diagnostics: str = "off",
 ) -> ScaleLockedSampleResult:
     if steps < 1:
         raise ValueError("steps must be >= 1")
+    if regeneration_mode not in REGENERATION_MODES:
+        raise ValueError(f"regeneration_mode must be one of {', '.join(REGENERATION_MODES)}")
+    if handoff_diagnostics not in HANDOFF_DIAGNOSTIC_MODES:
+        raise ValueError(f"handoff_diagnostics must be one of {', '.join(HANDOFF_DIAGNOSTIC_MODES)}")
+    img2img = regeneration_mode == "planner_final_img2img"
+    if img2img:
+        if (config.lock_strength != 0.0 or config.mid_strength != 0.0 or config.spatial_mask is not None
+                or config.manifold_enabled):
+            raise ValueError(
+                "planner_final_img2img does not apply planner trajectory anchors; "
+                "set coarse_lock_strength and mid_lock_strength to 0"
+            )
+        if denoise != 1.0 or not add_noise:
+            raise ValueError("planner_final_img2img requires a full planner pass with added noise")
 
     highres_latent = fix_latent_channels(model, latent_image)
     lowres_latent = make_lowres_latent(highres_latent, target_megapixels)
@@ -1384,6 +1691,9 @@ def run_scale_locked_ksampler(
         out = clean_latent(highres_latent)
         return ScaleLockedSampleResult(output=out, lowres_planner=clean_latent(lowres_latent), denoised_output=out)
 
+    if img2img:
+        # Reject an unusable start sigma before spending the planner pass.
+        img2img_start_index(sigmas.tolist(), img2img_start_sigma)
     disable_noise = not bool(add_noise)
     planner_seed = int(seed)
     detail_seed = int(seed) ^ 0x9E3779B97F4A7C15
@@ -1411,6 +1721,19 @@ def run_scale_locked_ksampler(
     if len(anchors_x0) == 0:
         raise RuntimeError("ScaleLockedResidualKSampler: planner pass did not record any x0 anchors.")
 
+    diagnostics = (None if handoff_diagnostics == "off" else
+                   Krea2HandoffDiagnostics(model, handoff_diagnostics, regeneration_mode, int(seed)))
+    if img2img:
+        return _run_planner_final_img2img(
+            model=model, positive=positive, negative=negative, cfg=cfg,
+            sampler_name=sampler_name, sigmas=sigmas, highres_latent=highres_latent,
+            lowres_latent=lowres_latent, lowres_out=lowres_out, lowres_noise=lowres_noise,
+            detail_seed=detail_seed, stochastic_seed=planner_seed,
+            nested_noise_strength=nested_noise_strength, noise_mode=noise_mode,
+            stage_hw=tuple(stage_hw), start_sigma=img2img_start_sigma,
+            sampler_options=sampler_options, diagnostics=diagnostics,
+        )
+
     if stage_hw:
         return _run_resolution_ladder(
             model=model, positive=positive, negative=negative, cfg=cfg,
@@ -1419,7 +1742,7 @@ def run_scale_locked_ksampler(
             planner_sigmas=planner_sigmas, lowres_noise=lowres_noise, detail_seed=detail_seed,
             stochastic_seed=planner_seed, nested_noise_strength=nested_noise_strength, noise_mode=noise_mode,
             config=config, stage_hw=tuple(stage_hw), sampler_options=sampler_options,
-            pece_corrected_anchors=pece_corrections,
+            pece_corrected_anchors=pece_corrections, diagnostics=diagnostics,
         )
 
     runtime = ScaleLockedRuntimeContext(
@@ -1459,5 +1782,6 @@ def run_scale_locked_ksampler(
         guider=guider, sampler=sampler, runtime=runtime, config=config,
         analytic_full_lock=analytic_full_lock,
         skip_locked_model_calls=config.full_lock_sigma is not None,
+        diagnostics=diagnostics,
     )
 

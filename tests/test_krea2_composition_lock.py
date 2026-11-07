@@ -548,3 +548,29 @@ def test_sa_pece_uses_corrected_planner_anchor_on_second_same_sigma_call():
     assert guider._slrd_anchors_x0_cpu[1] is reference[1]
     with pytest.raises(RuntimeError, match="more than two"):
         guider.predict_noise(x, torch.tensor(.7))
+
+
+
+def test_img2img_start_index_uses_exact_native_schedule_suffix():
+    sigmas = _flow_sigmas(14).tolist()
+    index = runtime.img2img_start_index(sigmas, 0.65)
+    # First schedule sigma at or below the request; the schedule is not rescaled.
+    assert sigmas[index] <= 0.65 < sigmas[index - 1]
+    assert index == core.full_lock_prefix_length(sigmas, 0.65)
+    exact = sigmas[9]
+    assert runtime.img2img_start_index(sigmas, exact) == 9
+    assert runtime.img2img_start_index(sigmas, math.nextafter(exact, 0.0)) == 10
+
+
+@pytest.mark.parametrize("value, message", [
+    (0.0, "strictly between"), (1.0, "strictly between"), (float("nan"), "strictly between"),
+    (True, "strictly between"), (1e-6, "no refinement step"),
+])
+def test_img2img_start_index_rejects_unusable_values(value, message):
+    with pytest.raises(ValueError, match=message):
+        runtime.img2img_start_index(_flow_sigmas(14).tolist(), value)
+
+
+def test_img2img_start_index_rejects_start_at_first_sigma():
+    with pytest.raises(ValueError, match="first schedule sigma"):
+        runtime.img2img_start_index([0.9, 0.5, 0.0], 0.95)
