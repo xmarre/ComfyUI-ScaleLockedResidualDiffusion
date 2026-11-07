@@ -378,6 +378,25 @@ def main():
         print(json.dumps({"case": "spectrum_pece_20_step_lock", "reports": pece_reports}))
 
     if reports_context is not None:
+        # Opt-in active-PECE acceleration through the resolution ladder: after
+        # two actual predicted phases, predictions are solver-owned skips and
+        # every unlocked correction is an exact model evaluation.
+        balanced = SpectrumApplyKrea2().apply(
+            model, preset="turbo", warmup=2, tail=1, bootstrap=False,
+            extrapolation_guard_enabled=False, sa_pece_forecast_policy="balanced",
+        )[0]
+        _, accelerated, _ = controls(
+            balanced, "sa_solver_pece", "simple", 1.0, 12, False,
+            latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
+        )
+        assert len(accelerated) == 3 and all(r["fallback"] is None for r in accelerated), accelerated
+        assert all(r["sa_pece_forecast_policy"] == "balanced" for r in accelerated)
+        assert accelerated[0]["sa_pece_skipped_predictions"] == 10, accelerated
+        assert accelerated[0]["pece_corrector_evaluations"] == 11, accelerated
+        assert all(r["sa_pece_skipped_predictions"] > 0 for r in accelerated[1:]), accelerated
+        print(json.dumps({"case": "sa_pece_balanced_ladder", "reports": accelerated}))
+
+    if reports_context is not None:
         # This is the exact quality-isolation path used by the new widget:
         # native SA/PECE plus the same Scale-Locked stages, but 0 forecasts.
         # It must be bitwise equal to running the native model without
