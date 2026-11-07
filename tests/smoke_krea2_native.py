@@ -872,9 +872,9 @@ def main():
                 planner_fidelity_strength=1.0, **stage_options)
             assert torch.equal(plain[1]["samples"], guided[1]["samples"])
             assert torch.equal(guided[0]["samples"], guided[2]["samples"])
-            downsampled = torch.nn.functional.interpolate(
+            downsampled = runtime.resize_4d_tensor(
                 guided[0]["samples"].float(),
-                size=tuple(guided[1]["samples"].shape[-2:]), mode="area")
+                tuple(guided[1]["samples"].shape[-2:]))
             torch.testing.assert_close(downsampled, guided[1]["samples"].float(),
                                        rtol=8e-4, atol=8e-4)
             assert len(stages) == (2 if "stage_megapixels" in stage_options else 1)
