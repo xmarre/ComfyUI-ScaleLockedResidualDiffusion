@@ -1369,12 +1369,11 @@ def _img2img_root_seed(seed: int, stage_index: int) -> int:
 
 
 def img2img_start_index(sigma_values, start_sigma: float) -> int:
-    """Schedule index where planner-final img2img refinement starts.
+    """Index of the first native sigma at or below the requested img2img start.
 
-    The refinement resumes the native schedule at its first sigma that does
-    not exceed ``start_sigma``, the same discrete suffix rule as ComfyUI's
-    KSamplerAdvanced ``start_at_step`` and the composition-lock release. The
-    schedule itself is never rescaled; the returned sigma is exact.
+    This selects the *number of remaining steps*, not the start noise level.
+    The first sigma is replaced with the actual requested value by
+    img2img_refinement_sigmas, retaining all later native schedule points.
     """
     values = [float(v) for v in sigma_values]
     if isinstance(start_sigma, bool) or not isinstance(start_sigma, (int, float)) \
@@ -1393,6 +1392,23 @@ def img2img_start_index(sigma_values, start_sigma: float) -> int:
             "raise img2img_start_sigma or steps"
         )
     return index
+
+
+def img2img_refinement_sigmas(sigmas: torch.Tensor, start_sigma: float) -> tuple[int, torch.Tensor]:
+    """Use the requested start noise, preserving the native remaining steps.
+
+    Replace only the first sigma in the discrete suffix. Merely selecting the
+    existing lower sigma makes distinct UI inputs (e.g. 0.30 and 0.35 at
+    20 steps) silently produce identical images. Inserting an additional
+    nearly coincident step would instead alter cost and potentially destabilize
+    multistep solvers. Keep the native remainder and return a fresh tensor.
+    """
+    index = img2img_start_index(sigmas.detach().cpu().tolist(), start_sigma)
+    tail = sigmas[index:].clone()
+    tail[0] = float(start_sigma)
+    if not bool(tail[0] > tail[1]):
+        raise ValueError("img2img_start_sigma must exceed the next native schedule sigma")
+    return index, tail
 
 
 class Krea2HandoffDiagnostics:
@@ -1541,11 +1557,12 @@ def _run_planner_final_img2img(
 
     Every stage resizes the finished latent of the stage below (the planner
     for the first one), and the native sampler adds fresh stage-specific noise
-    independent of the source image, at the exact
-    schedule sigma ``sigmas[k]`` through ``CFGGuider.inner_sample`` and the
-    model's ``noise_scaling``: ``x = sigma_k * s * noise + (1 - sigma_k) * clean``
-    with ``clean = process_latent_in(resized)`` and the patch-coupled noise
-    used by the trajectory path. The native solver then runs ``sigmas[k:]``
+    independent of the source image, at the requested start sigma through
+    ``CFGGuider.inner_sample`` and the model's ``noise_scaling``:
+    ``x = start_sigma * noise_scale * noise + (1 - start_sigma) * clean``,
+    where ``clean = process_latent_in(resized)``. The first native suffix
+    sigma is replaced by the requested value; later sigmas are unchanged.
+    The native solver then runs that suffix
     from a fresh start, so no multistep history, PECE correction or planner
     trajectory anchor carries into it. Composition-lock settings are unused.
     """
@@ -1556,7 +1573,7 @@ def _run_planner_final_img2img(
     if torch.count_nonzero(lowres_noise).item() == 0:
         raise ValueError("planner_final_img2img requires Gaussian noise (add_noise)")
     sigma_values = [float(v) for v in sigmas.detach().cpu().tolist()]
-    start = img2img_start_index(sigma_values, start_sigma)
+    start, stage_sigmas = img2img_refinement_sigmas(sigmas, start_sigma)
     target = highres_latent["samples"]
     sizes = [tuple(map(int, hw)) for hw in stage_hw] + [tuple(map(int, target.shape[-2:]))]
     previous = tuple(map(int, lowres_latent["samples"].shape[-2:]))
@@ -1565,12 +1582,12 @@ def _run_planner_final_img2img(
             raise ValueError("resolution stages must grow monotonically in both dimensions on the 16-pixel grid")
         previous = hw
 
-    stage_sigmas = sigmas[start:]
     _LOGGER.info(
-        "Krea 2 planner_final_img2img: requested start sigma %.4f -> schedule sigma %.6f "
-        "(step %d of %d, %d refinement steps per stage, %d stage(s))",
-        float(start_sigma), sigma_values[start], start, len(sigma_values) - 1,
-        len(sigma_values) - 1 - start, len(sizes),
+        "Krea 2 planner_final_img2img: requested start sigma %.4f -> effective sigma %.6f "
+        "(native suffix step %d of %d, %d refinement steps per stage, %d stage(s)); "
+        "first suffix sigma replaced, later sigmas unchanged",
+        float(start_sigma), float(stage_sigmas[0]), start, len(sigma_values) - 1,
+        len(stage_sigmas) - 1, len(sizes),
     )
     shapes = tuple(tuple(lowres_noise.shape[:-2]) + tuple(hw) for hw in sizes)
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED

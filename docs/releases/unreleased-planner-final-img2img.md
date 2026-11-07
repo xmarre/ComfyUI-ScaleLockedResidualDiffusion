@@ -32,10 +32,12 @@ high-resolution stage then starts from a finished image:
    seed-deterministic Gaussian field independent of the noise that generated
    its finished source. The field is lifted with the existing patch-coupled
    algorithm; it is not the same realization as trajectory-mode noise.
-3. `s` is the first sigma of the node's normal schedule at or below
-   `img2img_start_sigma`. This is the KSamplerAdvanced `start_at_step` rule.
-   The schedule is not rescaled, and the effective sigma and the number of
-   remaining steps are logged.
+3. The selected native schedule suffix determines the number of refinement
+   steps. Its first sigma is replaced by the requested
+   `img2img_start_sigma` value; subsequent sigmas are unchanged. This
+   avoids quantizing distinct UI values (e.g. 0.30 and 0.35) to the same
+   effective sigma without inserting extra, potentially near-coincident
+   solver steps. Both the effective sigma and step count are logged.
 4. The selected native solver runs that schedule suffix to zero from a fresh
    start. ER-SDE and SA-Solver keep their patch-coupled stochastic increments,
    which are indexed by the absolute schedule step.

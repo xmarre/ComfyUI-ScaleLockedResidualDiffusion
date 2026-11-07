@@ -571,6 +571,26 @@ def test_img2img_start_index_rejects_unusable_values(value, message):
         runtime.img2img_start_index(_flow_sigmas(14).tolist(), value)
 
 
+@pytest.mark.parametrize("requested", [0.30, 0.35])
+def test_img2img_continuous_start_replaces_only_first_suffix_sigma(requested):
+    sigmas = _flow_sigmas(20).float()
+    index, suffix = runtime.img2img_refinement_sigmas(sigmas, requested)
+    assert index == 18  # both values formerly snapped to sigma 0.259758
+    assert suffix.shape == sigmas[index:].shape
+    assert float(suffix[0]) == pytest.approx(requested, abs=1e-7)
+    assert torch.equal(suffix[1:], sigmas[index + 1:])
+    assert torch.equal(sigmas, _flow_sigmas(20).float())  # no in-place modification
+    assert torch.all(suffix[:-1] > suffix[1:])
+
+
+def test_img2img_continuous_start_obeys_original_exact_points():
+    sigmas = _flow_sigmas(14).float()
+    requested = float(sigmas[9])
+    index, suffix = runtime.img2img_refinement_sigmas(sigmas, requested)
+    assert index == 9
+    assert torch.equal(suffix, sigmas[9:])
+
+
 def test_img2img_start_index_rejects_start_at_first_sigma():
     with pytest.raises(ValueError, match="first schedule sigma"):
         runtime.img2img_start_index([0.9, 0.5, 0.0], 0.95)

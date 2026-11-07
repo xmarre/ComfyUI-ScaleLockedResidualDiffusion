@@ -314,9 +314,10 @@ class Krea2TurboFlowAlignedRegenerate:
                                "must be 0."}),
                 "img2img_start_sigma": ("FLOAT", {"default": 0.65, "min": 0.01, "max": 0.99, "step": 0.01,
                     "tooltip": "planner_final_img2img only: noise level the finished image is re-noised to before "
-                               "each high-resolution stage. Refinement resumes at the first step of the normal sigma "
-                               "schedule at or below this value (the effective sigma is logged); the schedule is not "
-                               "rescaled, so lower values also mean fewer high-resolution steps (raise steps for more). Lower values keep "
+                               "each high-resolution stage. The first sigma of the native refinement suffix is "
+                               "set to this exact value, while later sigma points remain unchanged. This means "
+                               "values like 0.30 and 0.35 have distinct effects even at 20 steps. Lower values can "
+                               "also leave fewer high-resolution steps across scheduler boundaries (raise steps for more). Lower values keep "
                                "more of the finished image and allow less structural change; higher values regenerate "
                                "more. Neither guarantees correct anatomy."}),
                 "handoff_diagnostics": (["off", "log", "log_and_save_latents"], {"default": "off",
@@ -464,9 +465,9 @@ class Krea2TurboFlowAlignedRegenerate:
                     "it must lie below the first sigma and at or above the last nonzero sigma"
                 )
             logger.info(
-                "Krea 2 planner_final_img2img: start sigma %.4f -> schedule sigma %.6f at step %d of %d "
-                "(%d high-resolution steps per stage); composition_lock_sigma is not used",
-                float(img2img_start_sigma), schedule[start], start, steps, steps - start,
+                "Krea 2 planner_final_img2img: requested start sigma %.4f -> effective sigma %.6f at suffix step %d of %d "
+                "(%d high-resolution steps per stage); later schedule sigmas unchanged; composition_lock_sigma is not used",
+                float(img2img_start_sigma), float(img2img_start_sigma), start, steps, steps - start,
             )
             if stage_hw:
                 logger.info(

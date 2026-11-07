@@ -724,7 +724,7 @@ def main():
     model_sampling = model.get_model_object("model_sampling")
 
     def img2img(selected, sampler_name, steps, *, latent_hw=(16, 20), capture_inputs=False,
-                mode="planner_final_img2img", fail=None, **extra):
+                mode="planner_final_img2img", fail=None, start_sigma=None, **extra):
         if sampler_name in ("sa_solver", "sa_solver_pece"):
             extra.setdefault("sa_spectrum_forecasts", True)
         reports, stages, inputs = [], [], []
@@ -764,7 +764,9 @@ def main():
                 result = node.sample(
                     selected, positive, negative, {"samples": torch.zeros(1, 4, *latent_hw)},
                     42, .01, 0.0, 0.0, steps=steps, sampler_name=sampler_name,
-                    regeneration_mode=mode, img2img_start_sigma=img2img_sigma, **extra,
+                    regeneration_mode=mode,
+                    img2img_start_sigma=img2img_sigma if start_sigma is None else start_sigma,
+                    **extra,
                 )
         finally:
             runtime.create_cfg_guider = original_guider
@@ -780,9 +782,10 @@ def main():
     for sampler_name in runtime.KREA2_SAMPLERS:
         steps = 8
         schedule = runtime.calculate_sigmas(model, scheduler="simple", steps=steps, denoise=1.0)
-        start = runtime.img2img_start_index(schedule.tolist(), img2img_sigma)
+        start, expected_sigmas = runtime.img2img_refinement_sigmas(schedule, img2img_sigma)
         assert 0 < start < steps
-        free = steps - start
+        free = len(expected_sigmas) - 1
+        assert abs(float(expected_sigmas[0]) - img2img_sigma) < 1e-7
         for stage_options, sizes in (({"max_stage_upscale": 0.0}, [(16, 20)]),
                                      ({"stage_megapixels": "0.02"}, [(16, 20), (24, 28)])):
             latent_hw = sizes[-1]
@@ -811,7 +814,7 @@ def main():
                 noise = runtime._build_highres_noise(
                     {"samples": torch.zeros(planner.shape[:-2] + hw)}, root, seed, 1.0, "patch_coupled")
                 assert torch.equal(stage["noise"].cpu(), noise), (sampler_name, index)
-                assert torch.equal(stage["sigmas"], schedule[start:].to(stage["sigmas"].dtype)), sampler_name
+                assert torch.equal(stage["sigmas"], expected_sigmas.to(stage["sigmas"].dtype)), sampler_name
                 # Source: the finished planner, then each finished stage below.
                 source = planner if index == 0 else stages[index - 1]["out"]
                 expected_latent = runtime.resize_4d_tensor(source.float(), hw)
@@ -819,7 +822,7 @@ def main():
                 # First native denoiser input = sigma_k * noise + (1 - sigma_k) * clean.
                 first = next(x for x, t in inputs if tuple(x.shape[-2:]) == hw)
                 timestep = next(t for x, t in inputs if tuple(x.shape[-2:]) == hw)
-                sigma = schedule[start]
+                sigma = expected_sigmas[0]
                 expected_x = sigma * noise + (1 - sigma) * base.process_latent_in(expected_latent)
                 torch.testing.assert_close(first.reshape(expected_x.shape), expected_x, atol=1e-5, rtol=1e-5)
                 torch.testing.assert_close(timestep.flatten()[0].float(),
@@ -835,8 +838,27 @@ def main():
             for a, b in zip(result, again):
                 assert torch.equal(a["samples"], b["samples"]), sampler_name
             print(json.dumps({"case": "img2img_native", "sampler": sampler_name, "options": stage_options,
-                              "start_index": start, "start_sigma": float(schedule[start]),
+                              "start_index": start, "start_sigma": float(expected_sigmas[0]),
                               "model_calls": {f"{h}x{w}": n for (h, w), n in counts.items()}}))
+
+    # The user's 20-step 0.30 vs 0.35 example must not alias to an identical
+    # discrete start sigma (both previously snapped to 0.259758).
+    for sampler_name in ("euler", "sa_solver"):
+        low, _, low_stages, low_inputs = img2img(
+            model, sampler_name, 20, start_sigma=0.30, capture_inputs=True)
+        high, _, high_stages, high_inputs = img2img(
+            model, sampler_name, 20, start_sigma=0.35, capture_inputs=True)
+        assert torch.equal(low[1]["samples"], high[1]["samples"]), sampler_name
+        assert len(low_stages) == len(high_stages) == 1
+        assert len(low_stages[0]["sigmas"]) == len(high_stages[0]["sigmas"])
+        assert torch.equal(low_stages[0]["sigmas"][1:], high_stages[0]["sigmas"][1:])
+        assert abs(float(low_stages[0]["sigmas"][0]) - 0.30) < 1e-6
+        assert abs(float(high_stages[0]["sigmas"][0]) - 0.35) < 1e-6
+        assert torch.equal(low_stages[0]["noise"], high_stages[0]["noise"])
+        target_hw = tuple(low_stages[0]["latent"].shape[-2:])
+        low_first = next(x for x, _ in low_inputs if tuple(x.shape[-2:]) == target_hw)
+        high_first = next(x for x, _ in high_inputs if tuple(x.shape[-2:]) == target_hw)
+        assert not torch.equal(low_first, high_first), sampler_name
 
     # Explicit trajectory mode ignores the img2img sigma and equals the default.
     for sampler_name in ("euler", "sa_solver"):

@@ -225,18 +225,23 @@ runtime and does not load weights independently.
     (nonzero values are rejected). All ten samplers and Spectrum forecasting
     are supported; latent noise masks are rejected.
   - `img2img_start_sigma` (default 0.65, planner-final mode only) chooses `s`.
-    Refinement resumes at the first sigma of the node's normal schedule at or
-    below this value, the same rule as KSamplerAdvanced's `start_at_step`; the
-    schedule is never rescaled, and the effective sigma and step count are
-    logged. Lower values keep more of the finished image and leave less room
-    for structural change, but also leave fewer high-resolution steps; raise
-    `steps` for more. Higher values regenerate more. Neither setting
-    guarantees correct anatomy. With Krea 2's schedule (simple scheduler):
+    The normal schedule selects how many steps remain, then its first retained
+    sigma is replaced with the **requested** sigma (no extra model call).
+    All later sigmas remain the original native schedule values. The start
+    noise therefore responds to each slider change, instead of silently
+    snapping to a discrete schedule point. For example, with 20 steps,
+    requests **0.30** and **0.35** both retain 2 refinement steps per
+    stage, but start at different noise levels (0.30 versus 0.35), yielding
+    different target denoiser inputs. Changing the value across a schedule
+    boundary can also change the number of remaining steps. Lower noise
+    generally preserves more of the finished image but may leave insufficient
+    refinement; raise `steps` if needed. Neither setting guarantees
+    correct anatomy. The effective sigma and number of steps are logged.
 
     | `steps` | start 0.45 | start 0.65 | start 0.75 |
     |---|---|---|---|
-    | 14 | sigma 0.345, 2 steps | sigma 0.637, 5 steps | sigma 0.703, 6 steps |
-    | 20 | sigma 0.441, 4 steps | sigma 0.630, 7 steps | sigma 0.721, 9 steps |
+    | 14 | sigma 0.450, 2 steps | sigma 0.650, 5 steps | sigma 0.750, 6 steps |
+    | 20 | sigma 0.450, 4 steps | sigma 0.650, 7 steps | sigma 0.750, 9 steps |
 
     Each stage evaluates the model once per remaining step (SA-Solver PECE
     also evaluates its corrections), the same per-stage cost as the trajectory
