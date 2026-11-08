@@ -387,5 +387,6 @@ def test_upscale_only_node_routes_without_target_refinement(method):
 def test_planner_final_modes_reject_nonzero_trajectory_band_strengths(mode):
     node, calls, args = _node()
     with pytest.raises(ValueError, match="set coarse_lock_strength and mid_lock_strength to 0"):
-        node.sample(*args, regeneration_mode=mode, coarse_lock_strength=0.5)
+        modified = args[:6] + (0.5,) + args[7:]
+        node.sample(*modified, regeneration_mode=mode)
     assert not calls
