@@ -876,6 +876,53 @@ def main():
                               "method": method, "options": options,
                               "target_dit_evaluations": 0}))
 
+    # Native-range refinement: planner -> one in-range img2img pass ->
+    # trained SesquiLSR final enlargement, with no final-resolution DiT.
+    original_native_limit = runtime.KREA2_NATIVE_MAX_AXIS_PX
+    runtime.KREA2_NATIVE_MAX_AXIS_PX = 256  # small real native model for CPU CI
+    try:
+        assert runtime.krea2_native_refine_hw((12, 12), (48, 48)) == (32, 32)
+        for invalid_planner, invalid_target in (
+            ((32, 32), (48, 48)),
+            ((12, 12), (24, 24)),
+        ):
+            try:
+                runtime.krea2_native_refine_hw(invalid_planner, invalid_target)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("unsupported native-refine geometry was accepted")
+        for sampler_name in ("euler", "sa_solver"):
+            result, _, stages, inputs = img2img(
+                model, sampler_name, 8, latent_hw=(48, 48),
+                mode="planner_final_native_refine",
+                latent_upscale_method="sesqui_wan21",
+                capture_inputs=True)
+            assert len(stages) == 1
+            assert tuple(stages[0]["latent"].shape[-2:]) == (32, 32)
+            assert all(tuple(x.shape[-2:]) != (48, 48) for x, _ in inputs)
+            planner = result[1]["samples"]
+            assert all(tuple(x.shape[-2:]) in (tuple(planner.shape[-2:]), (32, 32))
+                       for x, _ in inputs)
+            expected = runtime._enlarge_stage_source(
+                model, stages[0]["out"], (48, 48),
+                torch.zeros_like(result[0]["samples"]), "sesqui_wan21")
+            torch.testing.assert_close(
+                result[0]["samples"], expected.cpu(), atol=0, rtol=0)
+            assert torch.equal(result[0]["samples"], result[2]["samples"])
+            again, _, _, _ = img2img(
+                model, sampler_name, 8, latent_hw=(48, 48),
+                mode="planner_final_native_refine",
+                latent_upscale_method="sesqui_wan21")
+            for a, b in zip(result, again):
+                assert torch.equal(a["samples"], b["samples"])
+            print(json.dumps({"case": "native_range_refinement",
+                              "sampler": sampler_name,
+                              "target_dit_above_256px": 0,
+                              "native_stage_hw": list(stages[0]["latent"].shape[-2:])}))
+    finally:
+        runtime.KREA2_NATIVE_MAX_AXIS_PX = original_native_limit
+
     # The user's 20-step 0.30 vs 0.35 example must not alias to an identical
     # discrete start sigma (both previously snapped to 0.259758).
     for sampler_name in ("euler", "sa_solver"):

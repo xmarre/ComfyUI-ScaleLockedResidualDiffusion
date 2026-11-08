@@ -63,6 +63,7 @@ def _node():
             [float(x) for x in text.split(",") if x.strip()] if text else []
         ),
         "plan_stage_megapixels": lambda *args: [],
+        "krea2_native_refine_hw": lambda planner, target: (256, 256),
         "full_lock_prefix_length": prefix,
         "calculate_sigmas": calculate_sigmas,
         "effective_er_sde_sigmas": lambda sigmas, model: sigmas,
@@ -105,7 +106,7 @@ def test_existing_widget_slots_and_explicit_defaults():
     ]
     assert schema["optional"]["latent_upscale_method"][0] == ["interpolate", "sesqui_wan21"]
     assert schema["optional"]["latent_upscale_method"][1]["default"] == "interpolate"
-    assert schema["optional"]["regeneration_mode"][0] == ["trajectory", "planner_final_img2img", "planner_final_upscale_only"]
+    assert schema["optional"]["regeneration_mode"][0] == ["trajectory", "planner_final_img2img", "planner_final_upscale_only", "planner_final_native_refine"]
     assert schema["optional"]["regeneration_mode"][1]["default"] == "trajectory"
     assert schema["optional"]["img2img_start_sigma"][1]["default"] == 0.65
     assert schema["optional"]["handoff_diagnostics"][0] == ["off", "log", "log_and_save_latents"]
@@ -284,7 +285,7 @@ def test_trajectory_mode_ignores_img2img_sigma():
 
 
 @pytest.mark.parametrize("extra, message", [
-    ({"regeneration_mode": "img2img"}, "regeneration_mode must be"),
+    ({"regeneration_mode": "img2img"}, "invalid regeneration_mode"),
     ({"handoff_diagnostics": "verbose"}, "handoff_diagnostics must be"),
     ({"regeneration_mode": "planner_final_img2img", "img2img_start_sigma": 0.0}, "strictly between"),
     ({"regeneration_mode": "planner_final_img2img", "img2img_start_sigma": 1.0}, "strictly between"),
@@ -389,4 +390,41 @@ def test_planner_final_modes_reject_nonzero_trajectory_band_strengths(mode):
     with pytest.raises(ValueError, match="set coarse_lock_strength and mid_lock_strength to 0"):
         modified = args[:6] + (0.5,) + args[7:]
         node.sample(*modified, regeneration_mode=mode)
+    assert not calls
+
+
+def test_native_refine_mode_uses_one_internal_stage_and_preserves_saved_widget_order():
+    node, calls, args = _node()
+    args = list(args)
+    args[3] = {"samples": torch.zeros(1, 16, 444, 444)}
+    node.sample(*args, regeneration_mode="planner_final_native_refine",
+                latent_upscale_method="sesqui_wan21", img2img_start_sigma=0.4,
+                max_stage_upscale=1.2)
+    call = calls[-1]
+    assert call["stage_hw"] == ()
+    assert call["img2img_start_sigma"] == 0.4
+    assert call["regeneration_mode"] == "planner_final_native_refine"
+    assert call["latent_upscale_method"] == "sesqui_wan21"
+
+
+def test_native_refine_rejects_manual_stage_or_wrong_backend_before_sampling():
+    node, calls, args = _node()
+    args = list(args)
+    args[3] = {"samples": torch.zeros(1, 16, 444, 444)}
+    with pytest.raises(ValueError, match="requires latent_upscale_method=sesqui_wan21"):
+        node.sample(*args, regeneration_mode="planner_final_native_refine")
+    with pytest.raises(ValueError, match="clear stage_megapixels"):
+        node.sample(*args, regeneration_mode="planner_final_native_refine",
+                    latent_upscale_method="sesqui_wan21", stage_megapixels="4")
+    assert not calls
+
+
+@pytest.mark.parametrize("index", [6, 7])
+def test_native_refine_rejects_trajectory_band_locks(index):
+    node, calls, args = _node()
+    args = list(args)
+    args[index] = 0.4
+    with pytest.raises(ValueError, match="set coarse_lock_strength and mid_lock_strength to 0"):
+        node.sample(*args, regeneration_mode="planner_final_native_refine",
+                    latent_upscale_method="sesqui_wan21")
     assert not calls

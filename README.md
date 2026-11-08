@@ -246,6 +246,22 @@ runtime and does not load weights independently.
     Each stage evaluates the model once per remaining step (SA-Solver PECE
     also evaluates its corrections), the same per-stage cost as the trajectory
     mode at an equal release sigma.
+  - **Native-range refine + learned final upscale**:
+    For outputs above Krea 2 Turbo's documented 2048px-per-axis inference
+    range, set `regeneration_mode=planner_final_native_refine`,
+    `latent_upscale_method=sesqui_wan21`, keep `stage_megapixels` empty,
+    and use `img2img_start_sigma` as in planner-final img2img. This
+    finishes the planner, runs **one** native img2img target pass at no
+    more than 2048px on either axis (with the final canvas aspect ratio),
+    then enlarges the completed native output through SesquiLSR to the
+    requested dimensions **without running diffusion at the final size**.
+    The planner must be smaller than the native refinement canvas on both
+    axes. Both band-lock strengths must be 0. This retains some model-based
+    detail synthesis, which `planner_final_upscale_only` cannot produce,
+    while avoiding target denoising outside the advertised resolution
+    range. It is **experimental**, and does not guarantee anatomically
+    correct refinement or absence of VAE/upscaler artifacts. The prior
+    modes, including the interpolation default, remain unchanged.
   - **Planner-final learned upscale without target denoising**:
     Select `regeneration_mode=planner_final_upscale_only` and
     `latent_upscale_method=sesqui_wan21`. The sampler completes the planner,

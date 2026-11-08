@@ -139,3 +139,38 @@ high-resolution texture and could expose blur or reconstruction artifacts
 from latent upscaling/VAE decoding. Its visual effect with the user's real
 checkpoint has **not** been evaluated on a GPU; correct native execution
 alone does not establish improved anatomy.
+
+
+## Experimental native-range img2img refinement followed by SesquiLSR
+
+The `planner_final_upscale_only` comparator returned poor high-resolution
+quality when a user enlarged a 1408×1408 planner to 3552×3552 through two
+latent-only scaling stages: no additional texture was synthesized. The
+`planner_final_img2img` mode synthesizes fine details but has been observed
+to modify clean planner anatomy when its target pass runs at 3552×3552,
+beyond Krea 2 Turbo's published 2048px-per-axis range.
+
+The optional `regeneration_mode=planner_final_native_refine` uses the
+completed planner, performs **one native img2img denoising pass** at the
+largest 16px-aligned canvas within 2048px per axis that matches the final
+aspect ratio, and then uses the trained `sesqui_wan21` model to enlarge
+its completed output-space VAE latent to the final canvas. No denoiser
+evaluation occurs above 2048px. The user must select
+`latent_upscale_method=sesqui_wan21` and leave `stage_megapixels` empty;
+the native stage is chosen automatically. The planner must be smaller
+than that stage on both axes. The previous img2img sigma suffix, coupled
+noise generation and native solver/Spectrum execution are reused without
+modification. The final output port and denoised output port return the
+same completed enlarged latent, and diagnostics retain the native-stage
+and final enlarged artifacts.
+
+Example: planner 1408×1408 -> native model refinement 2048×2048 ->
+SesquiLSR enlargement 3552×3552, without a 3552px DiT pass.
+
+This addresses a quality/performance trade-off in a demonstrably
+unsupported-resolution path, **not a proven root-cause elimination for
+anatomy hallucinations**. Native CPU tests verify tensor shape, exact
+upscaling, solver execution, no final-size model calls, determinism and
+unchanged behavior of other modes. No Krea 2 GPU real-checkpoint image
+quality comparison has been performed; do not treat structural tests as
+empirical acceptance.

@@ -1383,7 +1383,8 @@ def _run_resolution_ladder(
     return ScaleLockedSampleResult(output=out, lowres_planner=clean_latent(lowres_out), denoised_output=denoised)
 
 
-REGENERATION_MODES = ("trajectory", "planner_final_img2img", "planner_final_upscale_only")
+REGENERATION_MODES = ("trajectory", "planner_final_img2img", "planner_final_upscale_only", "planner_final_native_refine")
+KREA2_NATIVE_MAX_AXIS_PX = 2048
 HANDOFF_DIAGNOSTIC_MODES = ("off", "log", "log_and_save_latents")
 
 
@@ -1624,6 +1625,82 @@ def _run_planner_final_upscale_only(
     )
 
 
+def krea2_native_refine_hw(planner_hw: tuple, final_hw: tuple) -> tuple:
+    """Maximum in-range Krea 2 target grid retaining the final aspect ratio.
+
+    Krea 2 Turbo's official inference guidance covers axes up to 2048 px.
+    Refine once within that range, then upscale the *finished* VAE latent
+    without invoking the DiT above that resolution.
+    """
+    ph, pw = map(int, planner_hw)
+    fh, fw = map(int, final_hw)
+    max_latent_side = KREA2_NATIVE_MAX_AXIS_PX // 8
+    if max(fh, fw) <= max_latent_side:
+        raise ValueError("planner_final_native_refine requires a final resolution above "
+                         "2048 pixels per axis; use planner_final_img2img otherwise")
+    scale = max_latent_side / max(fh, fw)
+    nh = max(2, min(fh, 2 * round(fh * scale / 2)))
+    nw = max(2, min(fw, 2 * round(fw * scale / 2)))
+    if nh <= ph or nw <= pw:
+        raise ValueError("planner_final_native_refine requires a planner smaller than "
+                         "the 2048-pixel native refinement stage on both axes; "
+                         "reduce planner_megapixels or choose another regeneration mode")
+    return (nh, nw)
+
+
+def _run_planner_final_native_refine(
+    *, model, positive, negative, cfg, sampler_name, sigmas,
+    highres_latent: dict, lowres_latent: dict, lowres_out: dict,
+    lowres_noise: torch.Tensor, detail_seed: int, stochastic_seed: int,
+    nested_noise_strength: float, noise_mode: str, start_sigma: float,
+    planner_fidelity_strength: float, planner_detail_strength: float,
+    sampler_options: Optional[dict], diagnostics: Optional[Krea2HandoffDiagnostics],
+) -> ScaleLockedSampleResult:
+    """Native-range img2img refinement followed by SesquiLSR-only enlargement.
+
+    The DiT is never evaluated above its official 2048 px axis range. This
+    does not guarantee anatomy fidelity: the native img2img pass can still
+    change the image, and the trained upscaler cannot invent information
+    absent from the completed native stage.
+    """
+    final_hw = tuple(map(int, highres_latent["samples"].shape[-2:]))
+    native_hw = krea2_native_refine_hw(lowres_out["samples"].shape[-2:], final_hw)
+    _LOGGER.info(
+        "Krea 2 native-range refine: planner %sx%s -> native img2img %sx%s "
+        "-> SesquiLSR-only output %sx%s (no diffusion beyond %d px axis)",
+        lowres_out["samples"].shape[-1] * 8, lowres_out["samples"].shape[-2] * 8,
+        native_hw[1] * 8, native_hw[0] * 8, final_hw[1] * 8, final_hw[0] * 8,
+        KREA2_NATIVE_MAX_AXIS_PX,
+    )
+    native_target = resize_latent_dict(highres_latent, native_hw)
+    refined = _run_planner_final_img2img(
+        model=model, positive=positive, negative=negative, cfg=cfg,
+        sampler_name=sampler_name, sigmas=sigmas,
+        highres_latent=native_target, lowres_latent=lowres_latent,
+        lowres_out=lowres_out, lowres_noise=lowres_noise,
+        detail_seed=detail_seed, stochastic_seed=stochastic_seed,
+        nested_noise_strength=nested_noise_strength, noise_mode=noise_mode,
+        stage_hw=(), start_sigma=start_sigma,
+        planner_fidelity_strength=planner_fidelity_strength,
+        planner_detail_strength=planner_detail_strength,
+        sampler_options=sampler_options, diagnostics=diagnostics,
+        latent_upscale_method="sesqui_wan21", diagnostics_final_stage=False,
+    )
+    final_latent = _enlarge_stage_source(
+        model, refined.output["samples"], final_hw, highres_latent["samples"],
+        "sesqui_wan21",
+    )
+    if diagnostics is not None:
+        if diagnostics.save:
+            diagnostics._save("stage1_source_resized", final_latent)
+        diagnostics.save_completed(1, final_latent, final=True)
+    out = clean_latent(highres_latent)
+    out["samples"] = final_latent.to(comfy.model_management.intermediate_device())
+    return ScaleLockedSampleResult(
+        output=out, lowres_planner=refined.lowres_planner, denoised_output=out
+    )
+
+
 def _run_planner_final_img2img(
     *,
     model,
@@ -1647,6 +1724,7 @@ def _run_planner_final_img2img(
     sampler_options: Optional[dict] = None,
     diagnostics: Optional[Krea2HandoffDiagnostics] = None,
     latent_upscale_method: str = "interpolate",
+    diagnostics_final_stage: bool = True,
 ) -> ScaleLockedSampleResult:
     """Img2img refinement of the finished planner image at each stage.
 
@@ -1752,7 +1830,7 @@ def _run_planner_final_img2img(
             seed=seed,
         )
         if diagnostics is not None:
-            diagnostics.save_completed(index, source, final=final)
+            diagnostics.save_completed(index, source, final=final and diagnostics_final_stage)
         if final:
             x0_output = stage_x0
 
@@ -1804,6 +1882,8 @@ def run_scale_locked_ksampler(
         raise ValueError("steps must be >= 1")
     if latent_upscale_method not in LATENT_UPSCALE_METHODS:
         raise ValueError(f"latent_upscale_method must be one of {', '.join(LATENT_UPSCALE_METHODS)}")
+    if regeneration_mode == "planner_final_native_refine" and latent_upscale_method != "sesqui_wan21":
+        raise ValueError("planner_final_native_refine requires latent_upscale_method=sesqui_wan21")
     if latent_upscale_method != "interpolate":
         if regeneration_mode == "trajectory" and not stage_hw:
             raise ValueError(
@@ -1817,8 +1897,9 @@ def run_scale_locked_ksampler(
         raise ValueError(f"regeneration_mode must be one of {', '.join(REGENERATION_MODES)}")
     if handoff_diagnostics not in HANDOFF_DIAGNOSTIC_MODES:
         raise ValueError(f"handoff_diagnostics must be one of {', '.join(HANDOFF_DIAGNOSTIC_MODES)}")
-    img2img = regeneration_mode == "planner_final_img2img"
+    img2img = regeneration_mode in ("planner_final_img2img", "planner_final_native_refine")
     upscale_only = regeneration_mode == "planner_final_upscale_only"
+    native_refine = regeneration_mode == "planner_final_native_refine"
     if (isinstance(planner_fidelity_strength, bool)
             or not isinstance(planner_fidelity_strength, (int, float))
             or not math.isfinite(planner_fidelity_strength)
@@ -1867,7 +1948,13 @@ def run_scale_locked_ksampler(
         # Reject unusable configurations before spending the planner pass.
         img2img_start_index(sigmas.tolist(), img2img_start_sigma)
         if isinstance(highres_latent.get("noise_mask"), torch.Tensor):
-            raise ValueError("planner_final_img2img does not support latent noise masks")
+            raise ValueError("planner-final img2img does not support latent noise masks")
+        if native_refine:
+            if stage_hw:
+                raise ValueError("planner_final_native_refine computes its sole native-range "
+                                 "refinement stage automatically; clear stage_megapixels")
+            krea2_native_refine_hw(lowres_latent["samples"].shape[-2:],
+                                   highres_latent["samples"].shape[-2:])
     disable_noise = not bool(add_noise)
     planner_seed = int(seed)
     detail_seed = int(seed) ^ 0x9E3779B97F4A7C15
@@ -1902,6 +1989,18 @@ def run_scale_locked_ksampler(
             model=model, highres_latent=highres_latent, lowres_out=lowres_out,
             stage_hw=tuple(stage_hw), latent_upscale_method=latent_upscale_method,
             diagnostics=diagnostics,
+        )
+    if native_refine:
+        return _run_planner_final_native_refine(
+            model=model, positive=positive, negative=negative, cfg=cfg,
+            sampler_name=sampler_name, sigmas=sigmas, highres_latent=highres_latent,
+            lowres_latent=lowres_latent, lowres_out=lowres_out, lowres_noise=lowres_noise,
+            detail_seed=detail_seed, stochastic_seed=planner_seed,
+            nested_noise_strength=nested_noise_strength, noise_mode=noise_mode,
+            start_sigma=img2img_start_sigma,
+            planner_fidelity_strength=planner_fidelity_strength,
+            planner_detail_strength=planner_detail_strength,
+            sampler_options=sampler_options, diagnostics=diagnostics,
         )
     if img2img:
         return _run_planner_final_img2img(

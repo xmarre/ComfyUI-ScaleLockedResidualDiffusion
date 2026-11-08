@@ -30,6 +30,7 @@ from .slrd_runtime import (
     krea2_sampler_names,
     krea2_er_sde_options,
     krea2_sa_solver_options,
+    krea2_native_refine_hw,
     sa_native_only_scope,
     effective_er_sde_sigmas,
     make_lowres_latent,
@@ -305,7 +306,7 @@ class Krea2TurboFlowAlignedRegenerate:
                                "Off evaluates every planner step natively while preserving Spectrum acceleration "
                                "in the intermediate and final high-resolution stages. This is a quality comparison "
                                "for planner texture loss; the planner uses the same native noise and solver."}),
-                "regeneration_mode": (["trajectory", "planner_final_img2img", "planner_final_upscale_only"], {"default": "trajectory",
+                "regeneration_mode": (["trajectory", "planner_final_img2img", "planner_final_upscale_only", "planner_final_native_refine"], {"default": "trajectory",
                     "tooltip": "trajectory (default, unchanged): the first high-resolution stage follows the planner's "
                                "denoising trajectory above composition_lock_sigma, then refines freely. "
                                "planner_final_img2img: every high-resolution stage starts from the finished image "
@@ -315,7 +316,12 @@ class Krea2TurboFlowAlignedRegenerate:
                                "must be 0. planner_final_upscale_only completes the same planner, enlarges its clean "
                                "Wan VAE latent, and returns the enlarged latent without high-resolution denoising. "
                                "Use sesqui_wan21 for learned latent scaling. No extra target diffusion texture is "
-                               "synthesized; high-resolution denoiser evaluations are exactly zero."}),
+                               "synthesized; high-resolution denoiser evaluations are exactly zero. "
+                               "planner_final_native_refine: finish the planner, run one img2img refinement at "
+                               "at most 2048 pixels per axis, then SesquiLSR-upscale the completed latent "
+                               "to final dimensions WITHOUT diffusion above 2048. Requires sesqui_wan21; "
+                               "stage_megapixels must be empty. This balances native-detail refinement "
+                               "against structural drift at unsupported target resolutions."}),
                 "img2img_start_sigma": ("FLOAT", {"default": 0.65, "min": 0.01, "max": 0.99, "step": 0.01,
                     "tooltip": "planner_final_img2img only: noise level the finished image is re-noised to before "
                                "each high-resolution stage. The first sigma of the native refinement suffix is "
@@ -389,12 +395,16 @@ class Krea2TurboFlowAlignedRegenerate:
     ):
         if latent_upscale_method not in ("interpolate", "sesqui_wan21"):
             raise ValueError("latent_upscale_method must be interpolate or sesqui_wan21")
-        if regeneration_mode not in ("trajectory", "planner_final_img2img", "planner_final_upscale_only"):
-            raise ValueError("regeneration_mode must be trajectory, planner_final_img2img or planner_final_upscale_only")
+        if regeneration_mode not in ("trajectory", "planner_final_img2img", "planner_final_upscale_only", "planner_final_native_refine"):
+            raise ValueError("invalid regeneration_mode; select trajectory, planner_final_img2img, "
+                             "planner_final_upscale_only or planner_final_native_refine")
+        if regeneration_mode == "planner_final_native_refine" and latent_upscale_method != "sesqui_wan21":
+            raise ValueError("planner_final_native_refine requires latent_upscale_method=sesqui_wan21")
         if handoff_diagnostics not in ("off", "log", "log_and_save_latents"):
             raise ValueError("handoff_diagnostics must be off, log or log_and_save_latents")
-        img2img = regeneration_mode == "planner_final_img2img"
+        img2img = regeneration_mode in ("planner_final_img2img", "planner_final_native_refine")
         upscale_only = regeneration_mode == "planner_final_upscale_only"
+        native_refine = regeneration_mode == "planner_final_native_refine"
         if (isinstance(planner_fidelity_strength, bool)
                 or not isinstance(planner_fidelity_strength, (int, float))
                 or not math.isfinite(planner_fidelity_strength)
@@ -476,7 +486,13 @@ class Krea2TurboFlowAlignedRegenerate:
             raise ValueError("Final LATENT must be larger than the planner canvas")
 
         explicit_stages = parse_stage_megapixels(stage_megapixels)
-        if explicit_stages:
+        if native_refine:
+            if explicit_stages:
+                raise ValueError("planner_final_native_refine computes one 2048px-or-smaller refinement "
+                                 "automatically; clear stage_megapixels")
+            krea2_native_refine_hw((low_h, low_w), (target_h, target_w))
+            stage_mp = []
+        elif explicit_stages:
             stage_mp = explicit_stages
         else:
             stage_mp = plan_stage_megapixels(low_h * low_w * 64.0, target_h * target_w * 64.0, max_stage_upscale)
@@ -508,9 +524,9 @@ class Krea2TurboFlowAlignedRegenerate:
                     "it must lie below the first sigma and at or above the last nonzero sigma"
                 )
             logger.info(
-                "Krea 2 planner_final_img2img: requested start sigma %.4f -> effective sigma %.6f at suffix step %d of %d "
+                "Krea 2 %s: requested start sigma %.4f -> effective sigma %.6f at suffix step %d of %d "
                 "(%d high-resolution steps per stage); later schedule sigmas unchanged; composition_lock_sigma is not used",
-                float(img2img_start_sigma), float(img2img_start_sigma), start, steps, steps - start,
+                regeneration_mode, float(img2img_start_sigma), float(img2img_start_sigma), start, steps, steps - start,
             )
             if stage_hw:
                 logger.info(
@@ -538,11 +554,18 @@ class Krea2TurboFlowAlignedRegenerate:
         if not math.isfinite(shift) or abs(shift - 1.15) > 1e-5:
             raise ValueError("Krea 2 Turbo mode requires the native flow sampling shift 1.15")
         if max(target_h, target_w) * 8 > 2048:
-            logger.warning(
-                "Krea 2 Turbo experimental target %sx%s exceeds the official "
-                "2048-pixel-axis inference range; visual fidelity and VRAM use are unvalidated",
-                target_w * 8, target_h * 8,
-            )
+            if upscale_only or native_refine:
+                logger.info(
+                    "Krea 2 final output %sx%s is latent-upscaled; no target model inference "
+                    "above the official 2048px per-axis range (mode=%s)",
+                    target_w * 8, target_h * 8, regeneration_mode,
+                )
+            else:
+                logger.warning(
+                    "Krea 2 Turbo experimental target %sx%s exceeds the official "
+                    "2048-pixel-axis inference range; visual fidelity and VRAM use are unvalidated",
+                    target_w * 8, target_h * 8,
+                )
 
         config = ScaleLockConfig(
             lock_strength=coarse_lock_strength,
