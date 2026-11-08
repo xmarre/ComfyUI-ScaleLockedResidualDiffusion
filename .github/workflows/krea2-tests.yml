@@ -7,6 +7,9 @@ on:
       - "slrd_runtime.py"
       - "slrd_core.py"
       - "nodes.py"
+      - "diagnostic_load.py"
+      - "tests/test_diagnostic_load.py"
+      - "workflows/krea2-handoff-diagnostics.json"
       - "resolution.py"
       - "tests/test_krea2_flow.py"
       - "tests/test_krea2_composition_lock.py"
@@ -20,6 +23,9 @@ on:
       - "slrd_runtime.py"
       - "slrd_core.py"
       - "nodes.py"
+      - "diagnostic_load.py"
+      - "tests/test_diagnostic_load.py"
+      - "workflows/krea2-handoff-diagnostics.json"
       - "resolution.py"
       - "tests/test_krea2_flow.py"
       - "tests/test_krea2_composition_lock.py"
@@ -40,12 +46,12 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install pytest
+          python -m pip install pytest safetensors
       - name: Compile changed Python
-        run: python -m py_compile krea2_flow.py nodes.py slrd_runtime.py slrd_core.py resolution.py
+        run: python -m py_compile krea2_flow.py nodes.py slrd_runtime.py slrd_core.py resolution.py diagnostic_load.py
       - name: Validate nested-noise coupling
         working-directory: tests
-        run: python -m pytest -q --rootdir=. --confcutdir=. test_krea2_flow.py test_krea2_composition_lock.py test_krea2_controls.py
+        run: python -m pytest -q --rootdir=. --confcutdir=. test_krea2_flow.py test_krea2_composition_lock.py test_krea2_controls.py test_diagnostic_load.py
 
   native-krea2-cpu:
     runs-on: ubuntu-latest

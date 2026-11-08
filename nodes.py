@@ -12,6 +12,7 @@ import comfy.model_base
 
 from .slrd_core import build_nested_noise, clone_latent, full_lock_prefix_length, init_scale_lock_state, latent_target_hw_from_megapixels, parse_stage_megapixels, plan_stage_megapixels, resize_4d_tensor, resize_mask
 from .resolution import DISPLAY_NAME as RESOLUTION_DISPLAY_NAME, NODE_ID as RESOLUTION_NODE_ID, ResolutionSelectorUncapped
+from .diagnostic_load import SLRDLoadKrea2HandoffDiagnostics
 from .slrd_runtime import (
     LOCK_SCHEDULE_OPTIONS,
     MID_SCHEDULE_OPTIONS,
@@ -2026,6 +2027,7 @@ NODE_CLASS_MAPPINGS = {
     "ScaleLockedResidualSamplerCustomAdvanced": ScaleLockedResidualSamplerCustomAdvanced,
     "ScaleLockedNestedNoisePreview": ScaleLockedNestedNoisePreview,
     "ScaleLockedDetailerHookProvider": ScaleLockedDetailerHookProvider,
+    "SLRDLoadKrea2HandoffDiagnostics": SLRDLoadKrea2HandoffDiagnostics,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2037,5 +2039,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ScaleLockedResidualSamplerCustomAdvanced": "Scale-Locked Residual SamplerCustomAdvanced",
     "ScaleLockedNestedNoisePreview": "Scale-Locked Nested Noise Preview",
     "ScaleLockedDetailerHookProvider": "Scale-Locked Detailer Hook Provider",
+    "SLRDLoadKrea2HandoffDiagnostics": "Scale-Locked Load Krea 2 Handoff Diagnostics",
 }
 
