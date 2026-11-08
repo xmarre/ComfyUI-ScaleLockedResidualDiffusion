@@ -114,15 +114,11 @@ identical to the previous head across 162 native cases.
 
 ## Planner-final upscale-only output mode
 
-A third `regeneration_mode=planner_final_upscale_only` is an opt-in way
-to return the completed planner after SesquiLSR enlargement, **without
-starting any additional high-resolution diffusion**. It was introduced
-after a real Krea 2 generation with `img2img_start_sigma=0.40`, 12 total
-planner steps and 3552px final resolution showed that the clean enlarged
-initial state matched its source (relative error 5.8e-8), while two native
-high-resolution SA-Solver predictions still diverged from that source by
-about 0.19 in relative latent L2. Those values describe whole latents,
-not the error of any specific anatomical feature.
+A third `regeneration_mode=planner_final_upscale_only` returns the
+completed planner after SesquiLSR enlargement, **without any additional
+high-resolution diffusion**. This is a causal comparator for identifying
+content changes introduced by a target denoiser. It cannot synthesize new
+high-resolution detail beyond the trained latent reconstruction.
 
 The mode returns the final enlarged LATENT in both `output` and
 `denoised_output`, and the untouched finished planner in `lowres_planner`.
@@ -133,22 +129,20 @@ Use the normal VAE to decode the result. The existing
 `planner_final_img2img` and `trajectory` modes retain their numerical
 behavior and remain the defaults.
 
-This mode isolates and removes the target-model regeneration as a possible
-source of new geometry. However, it also forgoes diffusion-generated
-high-resolution texture and could expose blur or reconstruction artifacts
-from latent upscaling/VAE decoding. Its visual effect with the user's real
-checkpoint has **not** been evaluated on a GPU; correct native execution
-alone does not establish improved anatomy.
+This mode excludes target-model regeneration as a possible source of new
+geometry. It also forgoes diffusion-generated high-resolution texture and
+can exhibit blur or reconstruction artifacts from latent upscaling/VAE
+decoding. Native execution tests do not establish decoded-image quality.
 
 
 ## Experimental native-range img2img refinement followed by SesquiLSR
 
-The `planner_final_upscale_only` comparator returned poor high-resolution
-quality when a user enlarged a 1408×1408 planner to 3552×3552 through two
-latent-only scaling stages: no additional texture was synthesized. The
-`planner_final_img2img` mode synthesizes fine details but has been observed
-to modify clean planner anatomy when its target pass runs at 3552×3552,
-beyond Krea 2 Turbo's published 2048px-per-axis range.
+Latent-only enlargement preserves the completed planner as far as the
+learned upscaler and VAE permit, but does not synthesize new scene detail.
+Full-resolution img2img can generate additional texture while altering
+existing structures. Krea 2 Turbo's published inference configuration
+supports a maximum axis length of 2048 pixels, so larger target-model
+passes fall outside that supported range.
 
 The optional `regeneration_mode=planner_final_native_refine` uses the
 completed planner, performs **one native img2img denoising pass** at the
