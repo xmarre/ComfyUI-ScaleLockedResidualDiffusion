@@ -76,6 +76,15 @@ doubled finger and eye contours; the learned result decodes close to the
 original. LPIPS uses VGG16 rather than upstream's setup, so absolute values
 are not comparable with upstream's table.
 
+**Evidence provenance and reproducibility:** these figures were collected
+in a separate cloud experiment and documented here; the exact eight image
+identifiers, generated panels, and benchmark execution script are not included
+in this repository. Consequently the CI suite cannot independently reproduce
+the reported image-quality metrics. The CPU native integration tests do
+verify the shipped weights, architecture, model-input construction and solver
+compatibility; they do **not** verify the PSNR/LPIPS table or image quality
+after Krea 2 high-resolution regeneration.
+
 Cost on CPU (4 threads, fp32, one image): 2.8 s / +0.8 GiB peak memory for
 1408 px → 2240 px; 7.8–8.0 s / +1.8 GiB for 2240 px → 3552 px or
 2448×1632 → 4608×3072; 10.7 s / +1.9 GiB for a direct two-pass

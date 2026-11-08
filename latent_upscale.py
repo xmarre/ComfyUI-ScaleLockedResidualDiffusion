@@ -46,8 +46,8 @@ def _verified_state_dict(path: Path = _WEIGHTS_PATH):
     """Load the pinned weights once, after checking their SHA-256."""
     global _state_dict
     with _lock:
-        if _state_dict is not None:
-            return _state_dict
+        # Preflight runs for each generation. Never allow a previous model
+        # load to bypass the current bundled weight integrity check.
         if not path.is_file():
             raise FileNotFoundError(
                 f"SesquiLSR Wan21 weights are missing: expected {path}. They ship with this "
@@ -59,6 +59,8 @@ def _verified_state_dict(path: Path = _WEIGHTS_PATH):
                 f"SesquiLSR Wan21 weights at {path} failed verification "
                 f"(sha256 {digest}, expected {SESQUI_WAN21_SHA256}); refusing to load them."
             )
+        if _state_dict is not None:
+            return _state_dict
         from safetensors.torch import load_file
         _state_dict = load_file(str(path), device="cpu")
         return _state_dict
@@ -77,15 +79,22 @@ def _model_for(device: torch.device):
     key = torch.device(device)
     with _lock:
         model = _models.get(key)
-    if model is not None:
-        return model
+        if model is not None:
+            return model
     state = _verified_state_dict()
-    from .third_party.sesqui_lsr import LatentUpscaler
-    model = LatentUpscaler(in_channels=SESQUI_WAN21_CHANNELS)
-    model.load_state_dict(state)
-    model = model.to(device=key, dtype=torch.float32).eval().requires_grad_(False)
+    # Serialize construction and device transfer for the same cache. Previously
+    # competing invocations built and allocated redundant CUDA models before
+    # setdefault chose one, creating an avoidable VRAM peak during first use.
     with _lock:
-        return _models.setdefault(key, model)
+        model = _models.get(key)
+        if model is not None:
+            return model
+        from .third_party.sesqui_lsr import LatentUpscaler
+        model = LatentUpscaler(in_channels=SESQUI_WAN21_CHANNELS)
+        model.load_state_dict(state)
+        model = model.to(device=key, dtype=torch.float32).eval().requires_grad_(False)
+        _models[key] = model
+        return model
 
 
 def sesqui_hops(src_hw, dst_hw) -> list[tuple[int, int]]:

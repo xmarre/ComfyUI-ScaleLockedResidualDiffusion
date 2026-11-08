@@ -145,3 +145,52 @@ def test_missing_or_corrupted_weights_fail_before_loading(tmp_path, monkeypatch)
     with pytest.raises(ValueError, match="failed verification"):
         lu._verified_state_dict(corrupt)
     assert lu._state_dict is None
+
+
+def test_cached_state_does_not_skip_weight_integrity_preflight(tmp_path, monkeypatch):
+    """Replacing or removing weights after the first run must fail before sampling."""
+    monkeypatch.setattr(lu, "_state_dict", {"cached": torch.tensor(1)})
+    missing = tmp_path / "missing.safetensors"
+    with pytest.raises(FileNotFoundError, match="weights are missing"):
+        lu._verified_state_dict(missing)
+    damaged = tmp_path / "damaged.safetensors"
+    damaged.write_bytes(b"corrupt after a successful previous run")
+    with pytest.raises(ValueError, match="failed verification"):
+        lu._verified_state_dict(damaged)
+
+
+def test_concurrent_first_use_constructs_one_model(monkeypatch):
+    """Parallel workflows must not allocate duplicate GPU models on cache miss."""
+    import concurrent.futures
+    import threading
+    import time
+
+    from importlib import import_module
+    model_module = import_module(f"{PACKAGE}.third_party.sesqui_lsr")
+    constructions = []
+    class SlowModel:
+        def __init__(self, *, in_channels):
+            constructions.append(in_channels)
+            time.sleep(0.03)  # reliably exposes build-outside-lock races
+        def load_state_dict(self, state):
+            return self
+        def to(self, **kwargs):
+            return self
+        def eval(self):
+            return self
+        def requires_grad_(self, enabled):
+            return self
+
+    monkeypatch.setattr(lu, "_models", {})
+    monkeypatch.setattr(lu, "_verified_state_dict", lambda: {})
+    monkeypatch.setattr(model_module, "LatentUpscaler", SlowModel)
+
+    start = threading.Barrier(8)
+    def load():
+        start.wait()
+        return lu._model_for(torch.device("cpu"))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: load(), range(8)))
+    assert constructions == [lu.SESQUI_WAN21_CHANNELS]
+    assert all(model is results[0] for model in results)
