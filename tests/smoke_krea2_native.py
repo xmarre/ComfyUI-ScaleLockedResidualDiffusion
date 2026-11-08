@@ -1233,20 +1233,54 @@ def main():
         runtime.calculate_sigmas(model, scheduler="simple", steps=8, denoise=1.0), img2img_sigma)
     assert sum(tuple(x.shape[-2:]) == (32, 36) for x, _ in inputs) == len(expected_sigmas) - 1
 
-    # Trajectory without stages never enlarges a completed latent: reject the
-    # learned method before the planner runs instead of silently ignoring it.
-    calls.clear()
-    hook = base.diffusion_model.register_forward_pre_hook(lambda module, args: calls.append(1))
+    # Regression: a learned-upscaler preflight previously rejected valid
+    # single-stage trajectory graphs when sesqui_wan21 was selected. The first
+    # target stage follows planner predictions, not a completed clean latent.
+    # An unused selection must preserve native execution and report a no-op.
+    original_ensure = runtime.ensure_latent_upscaler
+    def unexpected_weight_preflight(method):
+        raise AssertionError("single-stage trajectory must not load unused upscaler weights")
+    runtime.ensure_latent_upscaler = unexpected_weight_preflight
     try:
-        node.sample(model, positive, negative, {"samples": torch.zeros(1, 4, 16, 20)}, 42, .01, 0.0, 0.0,
-                    steps=8, max_stage_upscale=0.0, latent_upscale_method="sesqui_wan21")
-    except ValueError as exc:
-        assert "nothing to enlarge" in str(exc), exc
-    else:
-        raise AssertionError("trajectory without stages must reject sesqui_wan21")
+        for label, selected in cases:
+            for sampler_name in ("euler", "sa_solver"):
+                baseline, baseline_reports, baseline_stages, baseline_inputs = img2img(
+                    selected, sampler_name, 8, mode="trajectory",
+                    latent_hw=(16, 20), max_stage_upscale=0.0,
+                    capture_inputs=True,
+                )
+                selected_learned, learned_reports, learned_stages, learned_inputs = img2img(
+                    selected, sampler_name, 8, mode="trajectory",
+                    latent_hw=(16, 20), max_stage_upscale=0.0,
+                    latent_upscale_method="sesqui_wan21",
+                    capture_inputs=True,
+                )
+                assert len(baseline_stages) == len(learned_stages) == 1
+                for reference, observed in zip(baseline, selected_learned):
+                    assert torch.equal(reference["samples"], observed["samples"]), (label, sampler_name)
+                assert baseline_reports == learned_reports, (label, sampler_name)
+                assert len(baseline_inputs) == len(learned_inputs)
+                assert all(torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
+                           for a, b in zip(baseline_inputs, learned_inputs))
+                print(json.dumps({"case": "sesqui_trajectory_single_stage_compat",
+                                  "model": label, "sampler": sampler_name,
+                                  "target_calls_unchanged": True, "upscaler_loaded": False}))
     finally:
-        hook.remove()
-    assert not calls
+        runtime.ensure_latent_upscaler = original_ensure
+
+    # Automatic stage planning must still use SesquiLSR for a subsequent
+    # finished-latent handoff when the requested area growth exceeds the cap.
+    auto, _, auto_stages, _ = img2img(
+        model, "euler", 8, mode="trajectory", latent_hw=(32, 36),
+        max_stage_upscale=4.0, latent_upscale_method="sesqui_wan21",
+    )
+    assert len(auto_stages) > 1, "expected automatic intermediate stage"
+    torch.testing.assert_close(
+        auto_stages[-1]["latent"].float().cpu(),
+        sesqui_reference(auto_stages[-2]["out"], (32, 36)),
+        rtol=1e-5, atol=1e-5,
+    )
+    assert tuple(auto[0]["samples"].shape[-2:]) == (32, 36)
 
     # Diagnostics measure against the actual learned start latent.
     created.clear()

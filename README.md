@@ -315,9 +315,16 @@ runtime and does not load weights independently.
   - Where it applies: every `planner_final_img2img` stage (the finished
     planner for the first stage, then each finished stage), and trajectory
     stages after the first. The trajectory mode's first stage follows planner
-    predictions instead of enlarging a finished image, so it is unchanged;
-    `trajectory` without resolution stages therefore has nothing to enlarge
-    and rejects `sesqui_wan21` before sampling.
+    predictions instead of enlarging a finished image, so it is unchanged.
+    `trajectory` with `sesqui_wan21` is valid even when no intermediate
+    stage is needed: the original trajectory runs unchanged, and the backend
+    logs that the learned upscaler is inactive for this invocation. It does
+    not load unused upscaler weights or insert an extra diffusion stage.
+    With intermediate stages, SesquiLSR remains active on completed
+    stage-to-stage handoffs. An empty `stage_megapixels` field permits
+    automatic intermediate stages when the output/planner **pixel-area**
+    growth exceeds `max_stage_upscale` (default 4× area growth); a ratio
+    of 6 requires a stage, whereas a ratio of 3 does not.
   - Output sizes are exact. SesquiLSR is trained for 1x to 2x per axis; a
     larger jump (for example a direct 1408 px to 3552 px handoff) is split
     into the fewest latent-only passes that each stay within 2x. No diffusion

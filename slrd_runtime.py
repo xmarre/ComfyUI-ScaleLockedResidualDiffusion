@@ -1884,17 +1884,31 @@ def run_scale_locked_ksampler(
         raise ValueError(f"latent_upscale_method must be one of {', '.join(LATENT_UPSCALE_METHODS)}")
     if regeneration_mode == "planner_final_native_refine" and latent_upscale_method != "sesqui_wan21":
         raise ValueError("planner_final_native_refine requires latent_upscale_method=sesqui_wan21")
-    if latent_upscale_method != "interpolate":
-        if regeneration_mode == "trajectory" and not stage_hw:
-            raise ValueError(
-                f"latent_upscale_method={latent_upscale_method} has nothing to enlarge: trajectory mode "
-                "without resolution stages never enlarges a completed latent. Use planner_final_img2img, "
-                "add resolution stages, or select interpolate."
-            )
-        # Verify the bundled weights before the planner pass.
-        ensure_latent_upscaler(latent_upscale_method)
     if regeneration_mode not in REGENERATION_MODES:
         raise ValueError(f"regeneration_mode must be one of {', '.join(REGENERATION_MODES)}")
+    # A trajectory's first target stage is driven by intermediate planner x0
+    # predictions, not an enlarged completed latent. In a one-stage trajectory
+    # there is no clean-latent handoff for SesquiLSR. Preserve the original
+    # sampler execution rather than rejecting an otherwise valid saved graph
+    # or forcing an extra diffusion stage. The selected method is explicitly
+    # reported as inactive for this invocation.
+    learned_handoff_unused = (
+        regeneration_mode == "trajectory"
+        and not stage_hw
+        and latent_upscale_method != "interpolate"
+    )
+    if learned_handoff_unused:
+        _LOGGER.warning(
+            "Krea 2 trajectory: latent_upscale_method=%s is inactive for a "
+            "single-stage trajectory (no completed-latent handoff). Running "
+            "the unchanged trajectory sampler. To use SesquiLSR in trajectory, "
+            "configure an intermediate resolution stage; this adds a "
+            "diffusion stage.",
+            latent_upscale_method,
+        )
+    elif latent_upscale_method != "interpolate":
+        # Only load and verify weights when an actual learned handoff exists.
+        ensure_latent_upscaler(latent_upscale_method)
     if handoff_diagnostics not in HANDOFF_DIAGNOSTIC_MODES:
         raise ValueError(f"handoff_diagnostics must be one of {', '.join(HANDOFF_DIAGNOSTIC_MODES)}")
     img2img = regeneration_mode in ("planner_final_img2img", "planner_final_native_refine")

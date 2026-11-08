@@ -18,11 +18,19 @@ stage re-noises it:
 |---|---|
 | `planner_final_img2img` | Every stage: finished planner → first stage, then each finished stage → next stage |
 | `trajectory` with resolution stages | Each finished stage → next stage. The first stage still follows planner predictions and is unchanged. |
-| `trajectory` without resolution stages | None; `sesqui_wan21` is rejected before sampling |
+| `trajectory` without resolution stages | None; selection is valid but inactive with a warning; the original trajectory runs unchanged |
 
 Unchanged: planner, sigma schedules, start sigma, img2img forward noise and
 its seeds, patch-coupled noise, solver algorithms and history, model-call
 counts, Spectrum forecasting, output ports and the default behavior.
+An earlier preflight guard rejected `trajectory + sesqui_wan21` when no
+intermediate resolution stage existed. That guard now emits an explicit
+inactive-method warning while retaining the original trajectory execution,
+without loading unused weights or introducing any diffusion stage.
+With automatically planned or explicit intermediate stages, SesquiLSR
+continues to upscale completed latent handoffs. Blank `stage_megapixels`
+allows automatic stage planning based on the output/planner pixel-area
+ratio and `max_stage_upscale` cap.
 
 Latent space: Krea 2 uses the Wan 2.1 VAE and ComfyUI's `Wan21` latent
 format. ComfyUI's Wan VAE encoder returns the raw encoder mean, and the

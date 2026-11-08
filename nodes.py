@@ -351,7 +351,10 @@ class Krea2TurboFlowAlignedRegenerate:
                                "VAE latent; jumps above 2x per side use several latent-only passes, never extra "
                                "denoising steps. Applies to every planner_final_img2img stage and to trajectory "
                                "stages after the first; the trajectory mode's first stage follows planner "
-                               "predictions and is unchanged. A cleaner enlarged latent does not by itself prevent "
+                               "predictions and is unchanged. With no intermediate stages, SesquiLSR is "
+                               "inactive and the unchanged trajectory runs with an explicit warning. "
+                               "Empty stage_megapixels still allows automatic intermediate stages when "
+                               "max_stage_upscale is exceeded. A cleaner enlarged latent does not by itself prevent "
                                "the high-resolution model from changing details."}),
             },
         }
