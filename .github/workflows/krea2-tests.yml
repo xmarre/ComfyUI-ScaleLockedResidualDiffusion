@@ -5,6 +5,9 @@ on:
     paths:
       - "krea2_flow.py"
       - "slrd_runtime.py"
+      - "latent_upscale.py"
+      - "third_party/**"
+      - "tests/test_latent_upscale.py"
       - "slrd_core.py"
       - "nodes.py"
       - "diagnostic_load.py"
@@ -21,6 +24,9 @@ on:
     paths:
       - "krea2_flow.py"
       - "slrd_runtime.py"
+      - "latent_upscale.py"
+      - "third_party/**"
+      - "tests/test_latent_upscale.py"
       - "slrd_core.py"
       - "nodes.py"
       - "diagnostic_load.py"
@@ -48,10 +54,10 @@ jobs:
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
           python -m pip install pytest safetensors numpy
       - name: Compile changed Python
-        run: python -m py_compile krea2_flow.py nodes.py slrd_runtime.py slrd_core.py resolution.py diagnostic_load.py
+        run: python -m py_compile krea2_flow.py nodes.py slrd_runtime.py slrd_core.py resolution.py diagnostic_load.py latent_upscale.py
       - name: Validate nested-noise coupling
         working-directory: tests
-        run: python -m pytest -q --rootdir=. --confcutdir=. test_krea2_flow.py test_krea2_composition_lock.py test_krea2_controls.py test_diagnostic_load.py
+        run: python -m pytest -q --rootdir=. --confcutdir=. test_krea2_flow.py test_krea2_composition_lock.py test_krea2_controls.py test_diagnostic_load.py test_latent_upscale.py
 
   native-krea2-cpu:
     runs-on: ubuntu-latest

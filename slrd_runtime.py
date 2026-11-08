@@ -20,6 +20,11 @@ import comfy.utils
 import latent_preview
 
 from .krea2_flow import build_patch_coupled_noise
+from .latent_upscale import (
+    LATENT_UPSCALE_METHODS,
+    enlarge_completed_latent,
+    ensure_latent_upscaler,
+)
 
 from .slrd_core import (
     TrajectoryRecorder,
@@ -1183,6 +1188,21 @@ def sample_with_runtime(
     )
 
 
+def _enlarge_stage_source(model, source: torch.Tensor, hw, stage_samples: torch.Tensor, method: str) -> torch.Tensor:
+    """Clean start latent for the next stage from a completed output-space latent.
+
+    ``interpolate`` is the original expression, kept verbatim so it stays
+    bitwise identical. ``sesqui_wan21`` runs the learned upscaler on the
+    sampler's load device and leaves the result there for ``guider.sample``.
+    """
+    if method == "interpolate":
+        return resize_4d_tensor(
+            source.to(device=stage_samples.device, dtype=torch.float32), hw
+        ).to(dtype=stage_samples.dtype)
+    device = _resolve_sampler_device(model, source.device)
+    return enlarge_completed_latent(source, hw, method, device=device).to(dtype=stage_samples.dtype)
+
+
 def _stage_seed(detail_seed: int, stage_index: int) -> int:
     return (int(detail_seed) ^ ((stage_index + 1) * 0xD1B54A32D192ED03)) & 0xFFFFFFFFFFFFFFFF
 
@@ -1210,6 +1230,7 @@ def _run_resolution_ladder(
     sampler_options: Optional[dict] = None,
     pece_corrected_anchors: Optional[list] = None,
     diagnostics: Optional["Krea2HandoffDiagnostics"] = None,
+    latent_upscale_method: str = "interpolate",
 ) -> ScaleLockedSampleResult:
     """Refine through increasing resolutions, each stage finishing its image.
 
@@ -1295,9 +1316,7 @@ def _run_resolution_ladder(
         else:
             # Output-space latent: CFGGuider.inner_sample applies process_latent_in
             # and the flow noise scaling re-noises it to the release sigma.
-            start_latent = resize_4d_tensor(
-                finished.to(device=stage_samples.device, dtype=torch.float32), hw
-            ).to(dtype=stage_samples.dtype)
+            start_latent = _enlarge_stage_source(model, finished, hw, stage_samples, latent_upscale_method)
 
         if sampler_name in SNR_SOLVER_NAMES:
             sampler = _krea2_sampler_object(
@@ -1329,6 +1348,7 @@ def _run_resolution_ladder(
                 sigmas=effective_er_sde_sigmas(stage_sigmas, model) if sampler_name in SNR_SOLVER_NAMES else stage_sigmas,
                 noise=stage_noise, source=lowres_out["samples"] if finished is None else finished,
                 lock_sigma=config.full_lock_sigma,
+                enlarged_source=None if finished is None else start_latent,
             )
         try:
             finished = guider.sample(
@@ -1501,7 +1521,8 @@ class Krea2HandoffDiagnostics:
         return float((a - b).norm() / b.norm().clamp_min(1e-12))
 
     def wrap(self, callback, *, stage: int, stage_hw, sigmas: torch.Tensor, noise: torch.Tensor,
-             source: Optional[torch.Tensor], lock_sigma: Optional[float]):
+             source: Optional[torch.Tensor], lock_sigma: Optional[float],
+             enlarged_source: Optional[torch.Tensor] = None):
         if self.reference is None:
             raise RuntimeError("handoff diagnostics need the finished planner first")
         sigma_values = [float(v) for v in sigmas.detach().cpu().tolist()]
@@ -1510,8 +1531,12 @@ class Krea2HandoffDiagnostics:
         source_in = None
         if source is not None:
             with torch.no_grad():
-                resized_source = resize_4d_tensor(
-                    source.detach().to(device="cpu", dtype=torch.float32), tuple(stage_hw)
+                # Compare against the stage's actual clean start latent when the
+                # handoff enlarged it (interpolation or a learned upscaler).
+                resized_source = (
+                    enlarged_source.detach().to(device="cpu", dtype=torch.float32)
+                    if enlarged_source is not None else
+                    resize_4d_tensor(source.detach().to(device="cpu", dtype=torch.float32), tuple(stage_hw))
                 )
                 source_in = self.model.model.process_latent_in(resized_source)
                 if self.save:
@@ -1576,6 +1601,7 @@ def _run_planner_final_img2img(
     planner_detail_strength: float = 0.20,
     sampler_options: Optional[dict] = None,
     diagnostics: Optional[Krea2HandoffDiagnostics] = None,
+    latent_upscale_method: str = "interpolate",
 ) -> ScaleLockedSampleResult:
     """Img2img refinement of the finished planner image at each stage.
 
@@ -1651,10 +1677,9 @@ def _run_planner_final_img2img(
             hf_strength=nested_noise_strength,
             mode=noise_mode,
         )
-        # Output-space latent; CFGGuider.inner_sample applies process_latent_in.
-        start_latent = resize_4d_tensor(
-            source.to(device=stage_samples.device, dtype=torch.float32), hw
-        ).to(dtype=stage_samples.dtype)
+        # Completed output-space latent; CFGGuider.inner_sample applies
+        # process_latent_in and re-noises it to the start sigma.
+        start_latent = _enlarge_stage_source(model, source, hw, stage_samples, latent_upscale_method)
         if sampler_name in SNR_SOLVER_NAMES:
             sampler = _krea2_sampler_object(
                 sampler_name, sampler_options, model=model, low_shape=tuple(lowres_noise.shape),
@@ -1669,7 +1694,7 @@ def _run_planner_final_img2img(
         if diagnostics is not None:
             callback = diagnostics.wrap(
                 callback, stage=index, stage_hw=hw, sigmas=stage_sigmas, noise=stage_noise,
-                source=source, lock_sigma=None,
+                source=source, lock_sigma=None, enlarged_source=start_latent,
             )
         source = guider.sample(
             stage_noise,
@@ -1728,9 +1753,21 @@ def run_scale_locked_ksampler(
     handoff_diagnostics: str = "off",
     planner_fidelity_strength: float = 0.0,
     planner_detail_strength: float = 0.20,
+    latent_upscale_method: str = "interpolate",
 ) -> ScaleLockedSampleResult:
     if steps < 1:
         raise ValueError("steps must be >= 1")
+    if latent_upscale_method not in LATENT_UPSCALE_METHODS:
+        raise ValueError(f"latent_upscale_method must be one of {', '.join(LATENT_UPSCALE_METHODS)}")
+    if latent_upscale_method != "interpolate":
+        if regeneration_mode == "trajectory" and not stage_hw:
+            raise ValueError(
+                f"latent_upscale_method={latent_upscale_method} has nothing to enlarge: trajectory mode "
+                "without resolution stages never enlarges a completed latent. Use planner_final_img2img, "
+                "add resolution stages, or select interpolate."
+            )
+        # Verify the bundled weights before the planner pass.
+        ensure_latent_upscaler(latent_upscale_method)
     if regeneration_mode not in REGENERATION_MODES:
         raise ValueError(f"regeneration_mode must be one of {', '.join(REGENERATION_MODES)}")
     if handoff_diagnostics not in HANDOFF_DIAGNOSTIC_MODES:
@@ -1823,6 +1860,7 @@ def run_scale_locked_ksampler(
             planner_fidelity_strength=planner_fidelity_strength,
             planner_detail_strength=planner_detail_strength,
             sampler_options=sampler_options, diagnostics=diagnostics,
+            latent_upscale_method=latent_upscale_method,
         )
 
     if stage_hw:
@@ -1834,6 +1872,7 @@ def run_scale_locked_ksampler(
             stochastic_seed=planner_seed, nested_noise_strength=nested_noise_strength, noise_mode=noise_mode,
             config=config, stage_hw=tuple(stage_hw), sampler_options=sampler_options,
             pece_corrected_anchors=pece_corrections, diagnostics=diagnostics,
+            latent_upscale_method=latent_upscale_method,
         )
 
     runtime = ScaleLockedRuntimeContext(

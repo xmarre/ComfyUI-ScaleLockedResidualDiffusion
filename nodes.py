@@ -335,6 +335,15 @@ class Krea2TurboFlowAlignedRegenerate:
                     "tooltip": "INACTIVE compatibility widget from the disabled planner-fidelity experiment. "
                                "Retained only for saved workflow ordering. It has no effect while fidelity is 0. "
                                "Original trajectory and planner-final img2img modes remain available."}),
+                "latent_upscale_method": (["interpolate", "sesqui_wan21"], {"default": "interpolate",
+                    "tooltip": "How a completed lower-resolution latent is enlarged before the next stage re-noises "
+                               "and refines it. interpolate (default) keeps the previous behavior. sesqui_wan21 "
+                               "uses the pretrained SesquiLSR Wan 2.1 latent upscaler (bundled, MIT) on the clean "
+                               "VAE latent; jumps above 2x per side use several latent-only passes, never extra "
+                               "denoising steps. Applies to every planner_final_img2img stage and to trajectory "
+                               "stages after the first; the trajectory mode's first stage follows planner "
+                               "predictions and is unchanged. A cleaner enlarged latent does not by itself prevent "
+                               "the high-resolution model from changing details."}),
             },
         }
 
@@ -373,7 +382,10 @@ class Krea2TurboFlowAlignedRegenerate:
         handoff_diagnostics="off",
         planner_fidelity_strength=0.0,
         planner_detail_strength=0.20,
+        latent_upscale_method="interpolate",
     ):
+        if latent_upscale_method not in ("interpolate", "sesqui_wan21"):
+            raise ValueError("latent_upscale_method must be interpolate or sesqui_wan21")
         if regeneration_mode not in ("trajectory", "planner_final_img2img"):
             raise ValueError("regeneration_mode must be trajectory or planner_final_img2img")
         if handoff_diagnostics not in ("off", "log", "log_and_save_latents"):
@@ -578,6 +590,7 @@ class Krea2TurboFlowAlignedRegenerate:
                 handoff_diagnostics=handoff_diagnostics,
                 planner_fidelity_strength=float(planner_fidelity_strength),
                 planner_detail_strength=float(planner_detail_strength),
+                latent_upscale_method=latent_upscale_method,
             )
         return (result.output, result.lowres_planner, result.denoised_output)
 

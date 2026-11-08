@@ -101,7 +101,10 @@ def test_existing_widget_slots_and_explicit_defaults():
         "sa_spectrum_forecasts", "sa_planner_spectrum_forecasts",
         "regeneration_mode", "img2img_start_sigma", "handoff_diagnostics",
         "planner_fidelity_strength", "planner_detail_strength",
+        "latent_upscale_method",
     ]
+    assert schema["optional"]["latent_upscale_method"][0] == ["interpolate", "sesqui_wan21"]
+    assert schema["optional"]["latent_upscale_method"][1]["default"] == "interpolate"
     assert schema["optional"]["regeneration_mode"][0] == ["trajectory", "planner_final_img2img"]
     assert schema["optional"]["regeneration_mode"][1]["default"] == "trajectory"
     assert schema["optional"]["img2img_start_sigma"][1]["default"] == 0.65
@@ -349,4 +352,22 @@ def test_invalid_planner_detail_rejected_before_sampling(detail):
     with pytest.raises(ValueError, match="planner_detail_strength"):
         node.sample(*args, regeneration_mode="planner_final_img2img",
                     planner_fidelity_strength=0.0, planner_detail_strength=detail)
+    assert not calls
+
+
+
+def test_latent_upscale_method_defaults_to_interpolate_and_routes():
+    node, calls, args = _node()
+    node.sample(*args)
+    assert calls[-1]["latent_upscale_method"] == "interpolate"
+    node.sample(*args, regeneration_mode="planner_final_img2img", latent_upscale_method="sesqui_wan21",
+                stage_megapixels="2")
+    assert calls[-1]["latent_upscale_method"] == "sesqui_wan21"
+    assert calls[-1]["regeneration_mode"] == "planner_final_img2img"
+
+
+def test_invalid_latent_upscale_method_rejected_before_sampling():
+    node, calls, args = _node()
+    with pytest.raises(ValueError, match="latent_upscale_method must be"):
+        node.sample(*args, latent_upscale_method="bicubic")
     assert not calls

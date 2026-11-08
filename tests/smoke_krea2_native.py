@@ -1052,6 +1052,160 @@ def main():
                                   "reports": [{k: r[k] for k in ("outer_steps", "actual", "forecast",
                                                                   "denoiser_calls", "fallback")} for r in reports]}))
 
+    # ---- latent_upscale_method=sesqui_wan21: completed-latent handoffs use
+    # the pretrained SesquiLSR Wan21 upscaler. An independently loaded copy of
+    # the vendored upstream architecture and weights is the reference.
+    import hashlib
+    sesqui_dir = Path(__file__).resolve().parents[1] / "third_party" / "sesqui_lsr"
+    ref_spec = importlib.util.spec_from_file_location("sesqui_reference_upscaler", sesqui_dir / "upscaler.py")
+    ref_module = importlib.util.module_from_spec(ref_spec)
+    ref_spec.loader.exec_module(ref_module)
+    weights = sesqui_dir / "upscaler_Wan21.safetensors"
+    assert hashlib.sha256(weights.read_bytes()).hexdigest() == \
+        "d1b4c2c1d80b2af81e6bbfd38501ffb5adffb9f7c0ed2599555b837d0d2d015a"
+    reference_upscaler = ref_module.LatentUpscaler(in_channels=16)
+    reference_upscaler.load_state_dict(safetensors.torch.load_file(str(weights)))
+    reference_upscaler.eval()
+    latent_upscale = sys.modules[spec.name + ".latent_upscale"]
+
+    def sesqui_reference(source, hw):
+        x = source.detach().float().cpu()
+        temporal = x.ndim == 5
+        x = x.squeeze(2) if temporal else x
+        with torch.no_grad():
+            for hop in latent_upscale.sesqui_hops(x.shape[-2:], hw):
+                x = reference_upscaler(x, hop)
+        return x.unsqueeze(2) if temporal else x
+
+    def first_inputs(inputs, hw):
+        return next((x, t) for x, t in inputs if tuple(x.shape[-2:]) == hw)
+
+    for sampler_name in runtime.KREA2_SAMPLERS:
+        steps = 8
+        schedule = runtime.calculate_sigmas(model, scheduler="simple", steps=steps, denoise=1.0)
+        _, expected_sigmas = runtime.img2img_refinement_sigmas(schedule, img2img_sigma)
+        free = len(expected_sigmas) - 1
+        for stage_options, sizes in (({"max_stage_upscale": 0.0}, [(16, 20)]),
+                                     ({"stage_megapixels": "0.02"}, [(16, 20), (24, 28)])):
+            latent_hw = sizes[-1]
+            plain, _, plain_stages, _ = img2img(model, sampler_name, steps, latent_hw=latent_hw, **stage_options)
+            learned, _, stages, inputs = img2img(model, sampler_name, steps, latent_hw=latent_hw,
+                                                 capture_inputs=True, latent_upscale_method="sesqui_wan21",
+                                                 **stage_options)
+            planner = learned[1]["samples"]
+            assert torch.equal(planner, plain[1]["samples"]), sampler_name  # planner untouched
+            assert len(stages) == len(sizes)
+            for index, (stage, hw) in enumerate(zip(stages, sizes)):
+                source = planner if index == 0 else stages[index - 1]["out"]
+                expected = sesqui_reference(source, hw)
+                torch.testing.assert_close(stage["latent"].float().cpu(), expected, rtol=1e-5, atol=1e-5)
+                assert not torch.allclose(stage["latent"].float().cpu(),
+                                          runtime.resize_4d_tensor(source.float().cpu(), hw), atol=1e-3)
+                # Noise, sigma schedule and native initialization are unchanged.
+                assert torch.equal(stage["noise"], plain_stages[index]["noise"]), sampler_name
+                assert torch.equal(stage["sigmas"], plain_stages[index]["sigmas"]), sampler_name
+                first, timestep = first_inputs(inputs, hw)
+                sigma = stage["sigmas"][0]
+                expected_x = sigma * stage["noise"].float().cpu() + (1 - sigma) * base.process_latent_in(
+                    stage["latent"].float().cpu())
+                torch.testing.assert_close(first.reshape(expected_x.shape), expected_x, atol=1e-5, rtol=1e-5)
+            counts = {}
+            for x, _ in inputs:
+                counts[tuple(x.shape[-2:])] = counts.get(tuple(x.shape[-2:]), 0) + 1
+            expected_counts = {tuple(planner.shape[-2:]): solver_calls(sampler_name, steps)}
+            expected_counts.update({hw: solver_calls(sampler_name, free) for hw in sizes})
+            assert counts == expected_counts, (sampler_name, counts)
+            again = img2img(model, sampler_name, steps, latent_hw=latent_hw,
+                            latent_upscale_method="sesqui_wan21", **stage_options)[0]
+            for a, b in zip(learned, again):
+                assert torch.equal(a["samples"], b["samples"]), sampler_name
+            print(json.dumps({"case": "sesqui_img2img_native", "sampler": sampler_name, "options": stage_options,
+                              "model_calls": {f"{h}x{w}": n for (h, w), n in counts.items()}}))
+
+    # Trajectory ladder: the first stage follows planner predictions exactly
+    # as before; only the completed stage-to-stage handoff is learned.
+    for sampler_name in ("euler", "dpmpp_2m", "er_sde", "sa_solver_pece"):
+        plain, _, plain_stages, _ = img2img(model, sampler_name, 8, mode="trajectory", latent_hw=(24, 28),
+                                            stage_megapixels="0.02")
+        learned, _, stages, _ = img2img(model, sampler_name, 8, mode="trajectory", latent_hw=(24, 28),
+                                        stage_megapixels="0.02", latent_upscale_method="sesqui_wan21")
+        assert len(stages) == len(plain_stages) == 2
+        assert torch.equal(stages[0]["out"], plain_stages[0]["out"]), sampler_name
+        assert torch.equal(stages[0]["latent"], plain_stages[0]["latent"]), sampler_name
+        torch.testing.assert_close(stages[1]["latent"].float().cpu(),
+                                   sesqui_reference(stages[0]["out"], (24, 28)), rtol=1e-5, atol=1e-5)
+        assert torch.equal(stages[1]["sigmas"], plain_stages[1]["sigmas"])
+        assert torch.equal(stages[1]["noise"], plain_stages[1]["noise"])
+
+    # A direct jump above 2x per side uses two latent-only learned passes and
+    # still exactly one diffusion stage with the same model-call count.
+    result, _, stages, inputs = img2img(model, "euler", 8, latent_hw=(32, 36), capture_inputs=True,
+                                        max_stage_upscale=0.0, latent_upscale_method="sesqui_wan21")
+    planner_hw = tuple(result[1]["samples"].shape[-2:])
+    assert max(32 / planner_hw[0], 36 / planner_hw[1]) > 2.0, planner_hw
+    assert len(latent_upscale.sesqui_hops(planner_hw, (32, 36))) == 2
+    assert len(stages) == 1 and tuple(stages[0]["latent"].shape[-2:]) == (32, 36)
+    torch.testing.assert_close(stages[0]["latent"].float().cpu(),
+                               sesqui_reference(result[1]["samples"], (32, 36)), rtol=1e-5, atol=1e-5)
+    _, expected_sigmas = runtime.img2img_refinement_sigmas(
+        runtime.calculate_sigmas(model, scheduler="simple", steps=8, denoise=1.0), img2img_sigma)
+    assert sum(tuple(x.shape[-2:]) == (32, 36) for x, _ in inputs) == len(expected_sigmas) - 1
+
+    # Trajectory without stages never enlarges a completed latent: reject the
+    # learned method before the planner runs instead of silently ignoring it.
+    calls.clear()
+    hook = base.diffusion_model.register_forward_pre_hook(lambda module, args: calls.append(1))
+    try:
+        node.sample(model, positive, negative, {"samples": torch.zeros(1, 4, 16, 20)}, 42, .01, 0.0, 0.0,
+                    steps=8, max_stage_upscale=0.0, latent_upscale_method="sesqui_wan21")
+    except ValueError as exc:
+        assert "nothing to enlarge" in str(exc), exc
+    else:
+        raise AssertionError("trajectory without stages must reject sesqui_wan21")
+    finally:
+        hook.remove()
+    assert not calls
+
+    # Diagnostics measure against the actual learned start latent.
+    created.clear()
+    runtime.Krea2HandoffDiagnostics = CapturedDiagnostics
+    try:
+        img2img(model, "euler", 8, latent_hw=(24, 28), stage_megapixels="0.02",
+                latent_upscale_method="sesqui_wan21", handoff_diagnostics="log")
+    finally:
+        runtime.Krea2HandoffDiagnostics = original_diagnostics
+    firsts = [r for r in created[-1].records if r["step"] == 0]
+    assert len(firsts) == 2 and all(r["state_clean_vs_stage_source"] < 1e-4 for r in firsts), firsts
+
+    # Interrupts inside a learned-handoff stage leave no hooks or Spectrum
+    # state behind, and Spectrum keeps forecasting in every stage.
+    for label, selected in cases:
+        options = {"stage_megapixels": "0.02", "latent_hw": (24, 28), "latent_upscale_method": "sesqui_wan21"}
+        reference, ref_reports, _, _ = img2img(selected, "euler", 8, **options)
+        try:
+            img2img(selected, "euler", 8, fail=((24, 28), 1), **options)
+        except comfy.model_management.InterruptProcessingException:
+            pass
+        else:
+            raise AssertionError("interrupt was not raised")
+        assert not base.diffusion_model._forward_pre_hooks
+        repeated, rep_reports, _, _ = img2img(selected, "euler", 8, **options)
+        for a, b in zip(reference, repeated):
+            assert torch.equal(a["samples"], b["samples"]), label
+        if label == "spectrum":
+            assert ref_reports == rep_reports
+    if reports_context is not None:
+        for sampler_name in ("euler", "er_sde", "sa_solver", "sa_solver_pece"):
+            for mode in ("planner_final_img2img", "trajectory"):
+                _, reports, _, _ = img2img(aligned, sampler_name, 20, latent_hw=(24, 28), mode=mode,
+                                           stage_megapixels="0.02", latent_upscale_method="sesqui_wan21")
+                assert len(reports) == 3, reports
+                assert all(r["fallback"] is None for r in reports), reports
+                assert all(r["forecast"] > 0 for r in reports), (sampler_name, mode, reports)
+                print(json.dumps({"case": "sesqui_spectrum", "sampler": sampler_name, "mode": mode,
+                                  "reports": [{k: r[k] for k in ("outer_steps", "actual", "forecast", "fallback")}
+                                              for r in reports]}))
+
     try:
         node.sample(model, positive, negative, {"samples": torch.zeros(1, 4, 24, 28)},
                     42, .01, 0.0, 0.0, steps=2, composition_lock_sigma=0.0, stage_megapixels="0.02")
