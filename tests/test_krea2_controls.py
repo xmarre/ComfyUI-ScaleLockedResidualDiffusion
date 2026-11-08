@@ -80,6 +80,8 @@ def _node():
         "ScaleLockConfig": SimpleNamespace,
         "run_scale_locked_ksampler": run,
         "logger": SimpleNamespace(info=lambda *args: None, warning=lambda *args: None),
+        # resolution.MAX_MEGAPIXELS with ComfyUI's MAX_RESOLUTION of 16384.
+        "MAX_MEGAPIXELS": 256.0,
     }
     exec(compile(ast.Module(body=[cls], type_ignores=[]), str(ROOT / "nodes.py"),
                  "exec"), namespace)
@@ -104,6 +106,7 @@ def test_existing_widget_slots_and_explicit_defaults():
         "planner_fidelity_strength", "planner_detail_strength",
         "latent_upscale_method",
     ]
+    assert schema["required"]["planner_megapixels"][1]["max"] == 256.0
     assert schema["optional"]["latent_upscale_method"][0] == ["interpolate", "sesqui_wan21"]
     assert schema["optional"]["latent_upscale_method"][1]["default"] == "interpolate"
     assert schema["optional"]["regeneration_mode"][0] == ["trajectory", "planner_final_img2img", "planner_final_upscale_only", "planner_final_native_refine"]
