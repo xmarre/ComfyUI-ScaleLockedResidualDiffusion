@@ -305,14 +305,17 @@ class Krea2TurboFlowAlignedRegenerate:
                                "Off evaluates every planner step natively while preserving Spectrum acceleration "
                                "in the intermediate and final high-resolution stages. This is a quality comparison "
                                "for planner texture loss; the planner uses the same native noise and solver."}),
-                "regeneration_mode": (["trajectory", "planner_final_img2img"], {"default": "trajectory",
+                "regeneration_mode": (["trajectory", "planner_final_img2img", "planner_final_upscale_only"], {"default": "trajectory",
                     "tooltip": "trajectory (default, unchanged): the first high-resolution stage follows the planner's "
                                "denoising trajectory above composition_lock_sigma, then refines freely. "
                                "planner_final_img2img: every high-resolution stage starts from the finished image "
                                "below it (the completed planner for the first stage), resized and re-noised to "
                                "img2img_start_sigma, then denoised natively to zero. In this mode "
                                "composition_lock_sigma is not used, and coarse_lock_strength and mid_lock_strength "
-                               "must be 0."}),
+                               "must be 0. planner_final_upscale_only completes the same planner, enlarges its clean "
+                               "Wan VAE latent, and returns the enlarged latent without high-resolution denoising. "
+                               "Use sesqui_wan21 for learned latent scaling. No extra target diffusion texture is "
+                               "synthesized; high-resolution denoiser evaluations are exactly zero."}),
                 "img2img_start_sigma": ("FLOAT", {"default": 0.65, "min": 0.01, "max": 0.99, "step": 0.01,
                     "tooltip": "planner_final_img2img only: noise level the finished image is re-noised to before "
                                "each high-resolution stage. The first sigma of the native refinement suffix is "
@@ -386,11 +389,12 @@ class Krea2TurboFlowAlignedRegenerate:
     ):
         if latent_upscale_method not in ("interpolate", "sesqui_wan21"):
             raise ValueError("latent_upscale_method must be interpolate or sesqui_wan21")
-        if regeneration_mode not in ("trajectory", "planner_final_img2img"):
-            raise ValueError("regeneration_mode must be trajectory or planner_final_img2img")
+        if regeneration_mode not in ("trajectory", "planner_final_img2img", "planner_final_upscale_only"):
+            raise ValueError("regeneration_mode must be trajectory, planner_final_img2img or planner_final_upscale_only")
         if handoff_diagnostics not in ("off", "log", "log_and_save_latents"):
             raise ValueError("handoff_diagnostics must be off, log or log_and_save_latents")
         img2img = regeneration_mode == "planner_final_img2img"
+        upscale_only = regeneration_mode == "planner_final_upscale_only"
         if (isinstance(planner_fidelity_strength, bool)
                 or not isinstance(planner_fidelity_strength, (int, float))
                 or not math.isfinite(planner_fidelity_strength)
@@ -410,9 +414,10 @@ class Krea2TurboFlowAlignedRegenerate:
             if (isinstance(img2img_start_sigma, bool) or not isinstance(img2img_start_sigma, (int, float))
                     or not math.isfinite(img2img_start_sigma) or not 0.0 < img2img_start_sigma < 1.0):
                 raise ValueError("img2img_start_sigma must be a finite value strictly between 0 and 1")
+        if img2img or upscale_only:
             if coarse_lock_strength != 0.0 or mid_lock_strength != 0.0:
                 raise ValueError(
-                    "planner_final_img2img does not apply planner trajectory anchors; "
+                    "planner-final regeneration does not apply planner trajectory anchors; "
                     "set coarse_lock_strength and mid_lock_strength to 0"
                 )
         if not isinstance(cfg, (int, float)) or not math.isfinite(cfg) or not 0.0 <= cfg <= 100.0:

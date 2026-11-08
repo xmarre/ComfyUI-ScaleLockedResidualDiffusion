@@ -246,6 +246,19 @@ runtime and does not load weights independently.
     Each stage evaluates the model once per remaining step (SA-Solver PECE
     also evaluates its corrections), the same per-stage cost as the trajectory
     mode at an equal release sigma.
+  - **Planner-final learned upscale without target denoising**:
+    Select `regeneration_mode=planner_final_upscale_only` and
+    `latent_upscale_method=sesqui_wan21`. The sampler completes the planner,
+    enlarges its clean output-space Wan VAE latent to the requested canvas
+    (using the configured intermediate sizes, if any), and returns it directly.
+    It **does not re-noise** or run the 3552px target diffusion model. It makes
+    no target DiT calls, so it cannot obtain texture from high-resolution
+    regeneration; the high-resolution result is limited by the trained latent
+    upscaler and VAE decode. It is an optional preservation comparator and
+    usable artifact-avoidance mode, **not a proven cure for incorrect anatomy**.
+    `img2img_start_sigma` and `composition_lock_sigma` have no effect in
+    this mode. Both band lock strengths must be zero. The existing
+    `trajectory` and `planner_final_img2img` modes are unchanged.
   - **Retired planner-fidelity experiment**: the optional
     `planner_fidelity_strength` and `planner_detail_strength` widgets are
     retained at their existing positions to avoid remapping older saved

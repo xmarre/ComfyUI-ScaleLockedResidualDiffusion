@@ -1383,7 +1383,7 @@ def _run_resolution_ladder(
     return ScaleLockedSampleResult(output=out, lowres_planner=clean_latent(lowres_out), denoised_output=denoised)
 
 
-REGENERATION_MODES = ("trajectory", "planner_final_img2img")
+REGENERATION_MODES = ("trajectory", "planner_final_img2img", "planner_final_upscale_only")
 HANDOFF_DIAGNOSTIC_MODES = ("off", "log", "log_and_save_latents")
 
 
@@ -1577,6 +1577,51 @@ class Krea2HandoffDiagnostics:
 
         return observe
 
+
+
+def _run_planner_final_upscale_only(
+    *, model, highres_latent: dict, lowres_out: dict, stage_hw: tuple,
+    latent_upscale_method: str, diagnostics: Optional[Krea2HandoffDiagnostics] = None,
+) -> ScaleLockedSampleResult:
+    """Deliver the completed planner through latent-only enlargement.
+
+    This is a preservation comparator and a usable alternative when target
+    denoising hallucinates geometry. No target noise, sigmas, solver calls,
+    Spectrum sessions, or denoised predictions are created. It does not
+    synthesize the extra high-resolution texture a target diffusion pass can.
+    """
+    source = lowres_out["samples"]
+    target = highres_latent["samples"]
+    sizes = [tuple(map(int, hw)) for hw in stage_hw] + [tuple(map(int, target.shape[-2:]))]
+    previous = tuple(map(int, source.shape[-2:]))
+    for hw in sizes:
+        if hw[0] < previous[0] or hw[1] < previous[1] or hw == previous or hw[0] % 2 or hw[1] % 2:
+            raise ValueError("resolution stages must grow monotonically on the 16-pixel output grid")
+        previous = hw
+    if diagnostics is not None:
+        diagnostics.set_planner(source)
+    for index, hw in enumerate(sizes):
+        final = index == len(sizes) - 1
+        stage_latent = highres_latent if final else resize_latent_dict(highres_latent, hw)
+        source = _enlarge_stage_source(
+            model, source, hw, stage_latent["samples"], latent_upscale_method
+        )
+        if diagnostics is not None:
+            if diagnostics.save:
+                diagnostics._save(f"stage{index}_source_resized", source)
+            diagnostics.save_completed(index, source, final=final)
+    _LOGGER.info(
+        "Krea 2 planner_final_upscale_only: completed planner enlarged through %d latent-only "
+        "stage(s) with %s; target denoiser evaluations=0",
+        len(sizes), latent_upscale_method,
+    )
+    out = clean_latent(highres_latent)
+    out["samples"] = source.to(comfy.model_management.intermediate_device())
+    # No target denoiser runs, so the denoised_output port is the exact final
+    # enlarged latent rather than an undefined last-x0 estimate.
+    return ScaleLockedSampleResult(
+        output=out, lowres_planner=clean_latent(lowres_out), denoised_output=out
+    )
 
 
 def _run_planner_final_img2img(
@@ -1773,6 +1818,7 @@ def run_scale_locked_ksampler(
     if handoff_diagnostics not in HANDOFF_DIAGNOSTIC_MODES:
         raise ValueError(f"handoff_diagnostics must be one of {', '.join(HANDOFF_DIAGNOSTIC_MODES)}")
     img2img = regeneration_mode == "planner_final_img2img"
+    upscale_only = regeneration_mode == "planner_final_upscale_only"
     if (isinstance(planner_fidelity_strength, bool)
             or not isinstance(planner_fidelity_strength, (int, float))
             or not math.isfinite(planner_fidelity_strength)
@@ -1789,15 +1835,17 @@ def run_scale_locked_ksampler(
             or not math.isfinite(planner_detail_strength)
             or not 0.0 <= planner_detail_strength <= 1.0):
         raise ValueError("planner_detail_strength must be finite and within [0, 1]")
-    if img2img:
+    if img2img or upscale_only:
         if (config.lock_strength != 0.0 or config.mid_strength != 0.0 or config.spatial_mask is not None
                 or config.manifold_enabled):
             raise ValueError(
-                "planner_final_img2img does not apply planner trajectory anchors; "
+                "planner-final regeneration does not use trajectory anchors; "
                 "set coarse_lock_strength and mid_lock_strength to 0"
             )
         if denoise != 1.0 or not add_noise:
-            raise ValueError("planner_final_img2img requires a full planner pass with added noise")
+            raise ValueError("planner-final regeneration requires a full planner pass with added noise")
+        if upscale_only and isinstance(latent_image.get("noise_mask"), torch.Tensor):
+            raise ValueError("planner_final_upscale_only does not support latent noise masks")
 
     highres_latent = fix_latent_channels(model, latent_image)
     lowres_latent = make_lowres_latent(highres_latent, target_megapixels)
@@ -1849,6 +1897,12 @@ def run_scale_locked_ksampler(
 
     diagnostics = (None if handoff_diagnostics == "off" else
                    Krea2HandoffDiagnostics(model, handoff_diagnostics, regeneration_mode, int(seed)))
+    if upscale_only:
+        return _run_planner_final_upscale_only(
+            model=model, highres_latent=highres_latent, lowres_out=lowres_out,
+            stage_hw=tuple(stage_hw), latent_upscale_method=latent_upscale_method,
+            diagnostics=diagnostics,
+        )
     if img2img:
         return _run_planner_final_img2img(
             model=model, positive=positive, negative=negative, cfg=cfg,

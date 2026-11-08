@@ -110,3 +110,32 @@ identical to the previous head across 162 native cases.
 - Real Krea 2 checkpoint generations with `sesqui_wan21` have not been
   compared yet.
 - Latent noise masks remain unsupported in `planner_final_img2img`.
+
+
+## Planner-final upscale-only output mode
+
+A third `regeneration_mode=planner_final_upscale_only` is an opt-in way
+to return the completed planner after SesquiLSR enlargement, **without
+starting any additional high-resolution diffusion**. It was introduced
+after a real Krea 2 generation with `img2img_start_sigma=0.40`, 12 total
+planner steps and 3552px final resolution showed that the clean enlarged
+initial state matched its source (relative error 5.8e-8), while two native
+high-resolution SA-Solver predictions still diverged from that source by
+about 0.19 in relative latent L2. Those values describe whole latents,
+not the error of any specific anatomical feature.
+
+The mode returns the final enlarged LATENT in both `output` and
+`denoised_output`, and the untouched finished planner in `lowres_planner`.
+It executes each configured latent upscaling stage without denoiser calls;
+the number of high-resolution model evaluations is **zero**. Neither noise
+nor sigma-start controls nor learned-model lock projections are applied.
+Use the normal VAE to decode the result. The existing
+`planner_final_img2img` and `trajectory` modes retain their numerical
+behavior and remain the defaults.
+
+This mode isolates and removes the target-model regeneration as a possible
+source of new geometry. However, it also forgoes diffusion-generated
+high-resolution texture and could expose blur or reconstruction artifacts
+from latent upscaling/VAE decoding. Its visual effect with the user's real
+checkpoint has **not** been evaluated on a GPU; correct native execution
+alone does not establish improved anatomy.

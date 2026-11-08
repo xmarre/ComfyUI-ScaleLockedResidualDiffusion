@@ -841,6 +841,41 @@ def main():
                               "start_index": start, "start_sigma": float(expected_sigmas[0]),
                               "model_calls": {f"{h}x{w}": n for (h, w), n in counts.items()}}))
 
+    # Planner-final upscale-only bypasses all target DiT inference, unlike
+    # img2img. This is the lossless-with-respect-to-the-upscaler baseline for
+    # diagnosing anatomy drift in the final diffusion pass.
+    for method in ("interpolate", "sesqui_wan21"):
+        for options, latent_hw, hw_list in (
+            ({"max_stage_upscale": 0.0}, (16, 20), [(16, 20)]),
+            ({"stage_megapixels": "0.02"}, (24, 28), [(16, 20), (24, 28)]),
+        ):
+            result, _, target_stages, inputs = img2img(
+                model, "euler", 8, mode="planner_final_upscale_only",
+                latent_upscale_method=method, latent_hw=latent_hw,
+                capture_inputs=True, **options,
+            )
+            assert not target_stages  # native target guider never created
+            planner = result[1]["samples"]
+            assert tuple(result[0]["samples"].shape[-2:]) == tuple(latent_hw)
+            assert torch.equal(result[0]["samples"], result[2]["samples"])
+            assert all(tuple(x.shape[-2:]) == tuple(planner.shape[-2:]) for x, _ in inputs)
+            expected = planner
+            for hw in hw_list:
+                expected = runtime._enlarge_stage_source(
+                    model, expected, hw, result[0]["samples"], method)
+            torch.testing.assert_close(
+                result[0]["samples"], expected.to(result[0]["samples"].device),
+                rtol=0, atol=0,
+            )
+            repeated = img2img(model, "euler", 8, mode="planner_final_upscale_only",
+                              latent_upscale_method=method, latent_hw=latent_hw,
+                              **options)[0]
+            for left, right in zip(result, repeated):
+                assert torch.equal(left["samples"], right["samples"])
+            print(json.dumps({"case": "planner_final_upscale_only_native",
+                              "method": method, "options": options,
+                              "target_dit_evaluations": 0}))
+
     # The user's 20-step 0.30 vs 0.35 example must not alias to an identical
     # discrete start sigma (both previously snapped to 0.259758).
     for sampler_name in ("euler", "sa_solver"):

@@ -105,7 +105,7 @@ def test_existing_widget_slots_and_explicit_defaults():
     ]
     assert schema["optional"]["latent_upscale_method"][0] == ["interpolate", "sesqui_wan21"]
     assert schema["optional"]["latent_upscale_method"][1]["default"] == "interpolate"
-    assert schema["optional"]["regeneration_mode"][0] == ["trajectory", "planner_final_img2img"]
+    assert schema["optional"]["regeneration_mode"][0] == ["trajectory", "planner_final_img2img", "planner_final_upscale_only"]
     assert schema["optional"]["regeneration_mode"][1]["default"] == "trajectory"
     assert schema["optional"]["img2img_start_sigma"][1]["default"] == 0.65
     assert schema["optional"]["handoff_diagnostics"][0] == ["off", "log", "log_and_save_latents"]
@@ -370,4 +370,22 @@ def test_invalid_latent_upscale_method_rejected_before_sampling():
     node, calls, args = _node()
     with pytest.raises(ValueError, match="latent_upscale_method must be"):
         node.sample(*args, latent_upscale_method="bicubic")
+    assert not calls
+
+
+@pytest.mark.parametrize("method", ["interpolate", "sesqui_wan21"])
+def test_upscale_only_node_routes_without_target_refinement(method):
+    node, calls, args = _node()
+    node.sample(*args, regeneration_mode="planner_final_upscale_only",
+                latent_upscale_method=method, img2img_start_sigma=0.0)
+    assert calls[-1]["regeneration_mode"] == "planner_final_upscale_only"
+    assert calls[-1]["latent_upscale_method"] == method
+    assert calls[-1]["img2img_start_sigma"] is None
+
+
+@pytest.mark.parametrize("mode", ["planner_final_img2img", "planner_final_upscale_only"])
+def test_planner_final_modes_reject_nonzero_trajectory_band_strengths(mode):
+    node, calls, args = _node()
+    with pytest.raises(ValueError, match="set coarse_lock_strength and mid_lock_strength to 0"):
+        node.sample(*args, regeneration_mode=mode, coarse_lock_strength=0.5)
     assert not calls
