@@ -11,7 +11,7 @@ import comfy.samplers
 import comfy.model_base
 
 from .slrd_core import build_nested_noise, clone_latent, full_lock_prefix_length, init_scale_lock_state, latent_target_hw_from_megapixels, parse_stage_megapixels, plan_stage_megapixels, resize_4d_tensor, resize_mask
-from .resolution import DISPLAY_NAME as RESOLUTION_DISPLAY_NAME, NODE_ID as RESOLUTION_NODE_ID, ResolutionSelectorUncapped
+from .resolution import DISPLAY_NAME as RESOLUTION_DISPLAY_NAME, MAX_MEGAPIXELS, NODE_ID as RESOLUTION_NODE_ID, ResolutionSelectorUncapped
 from .diagnostic_load import SLRDLoadKrea2HandoffDiagnostics
 from .slrd_runtime import (
     LOCK_SCHEDULE_OPTIONS,
@@ -235,7 +235,10 @@ class Krea2TurboFlowAlignedRegenerate:
                 "negative": ("CONDITIONING",),
                 "latent_image": ("LATENT",),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
-                "planner_megapixels": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 4.0, "step": 0.05}),
+                "planner_megapixels": ("FLOAT", {"default": 1.0, "min": 0.25, "max": MAX_MEGAPIXELS, "step": 0.05,
+                    "tooltip": "Planner size in megapixels (1 MP = 1,000,000 pixels), preserving the output LATENT "
+                               "aspect ratio. Must be strictly smaller than the output LATENT in both dimensions. "
+                               "The maximum is a UI limit, not a guarantee of available VRAM."}),
                 "coarse_lock_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "Low-band pull toward the planner after the composition lock releases. "
                                "0 lets the high-resolution pass refine freely; nonzero values can double fine contours and soften detail."}),
