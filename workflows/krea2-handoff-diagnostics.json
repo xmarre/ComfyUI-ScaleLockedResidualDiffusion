@@ -1,6 +1,6 @@
 {
-  "last_node_id": 8,
-  "last_link_id": 9,
+  "last_node_id": 12,
+  "last_link_id": 15,
   "nodes": [
     {
       "id": 1,
@@ -16,7 +16,7 @@
       "flags": {},
       "order": 0,
       "mode": 0,
-      "title": "Load latest complete handoff diagnostics",
+      "title": "Load a COMPLETE diagnostic run (five outputs)",
       "inputs": [],
       "outputs": [
         {
@@ -42,6 +42,22 @@
             3
           ],
           "slot_index": 2
+        },
+        {
+          "name": "stage0_completed",
+          "type": "LATENT",
+          "links": [
+            10
+          ],
+          "slot_index": 3
+        },
+        {
+          "name": "final_output",
+          "type": "LATENT",
+          "links": [
+            11
+          ],
+          "slot_index": 4
         }
       ],
       "properties": {
@@ -65,7 +81,7 @@
       "flags": {},
       "order": 1,
       "mode": 0,
-      "title": "Krea 2 / Wan-compatible VAE",
+      "title": "Select the SAME VAE as the Krea 2 generation",
       "inputs": [],
       "outputs": [
         {
@@ -74,7 +90,9 @@
           "links": [
             4,
             5,
-            6
+            6,
+            12,
+            13
           ],
           "slot_index": 0
         }
@@ -295,6 +313,146 @@
         "Node name for S&R": "PreviewImage"
       },
       "widgets_values": []
+    },
+    {
+      "id": 9,
+      "type": "VAEDecode",
+      "title": "D — Completed first high-resolution stage",
+      "pos": [
+        680,
+        1040
+      ],
+      "size": [
+        285,
+        76
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 10
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 12
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            14
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAEDecode"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 10,
+      "type": "VAEDecode",
+      "title": "E — ACTUAL final sampled latent",
+      "pos": [
+        1150,
+        1040
+      ],
+      "size": [
+        285,
+        76
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 11
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 13
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            15
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAEDecode"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 11,
+      "type": "PreviewImage",
+      "title": "D — FIRST STAGE FINISHED",
+      "pos": [
+        680,
+        1225
+      ],
+      "size": [
+        400,
+        580
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 14
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 12,
+      "type": "PreviewImage",
+      "title": "E — ACTUAL SAMPLER FINAL OUTPUT",
+      "pos": [
+        1150,
+        1225
+      ],
+      "size": [
+        400,
+        580
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 15
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      },
+      "widgets_values": []
     }
   ],
   "links": [
@@ -369,13 +527,61 @@
       8,
       0,
       "IMAGE"
+    ],
+    [
+      10,
+      1,
+      3,
+      9,
+      0,
+      "LATENT"
+    ],
+    [
+      11,
+      1,
+      4,
+      10,
+      0,
+      "LATENT"
+    ],
+    [
+      12,
+      2,
+      0,
+      9,
+      1,
+      "VAE"
+    ],
+    [
+      13,
+      2,
+      0,
+      10,
+      1,
+      "VAE"
+    ],
+    [
+      14,
+      9,
+      0,
+      11,
+      0,
+      "IMAGE"
+    ],
+    [
+      15,
+      10,
+      0,
+      12,
+      0,
+      "IMAGE"
     ]
   ],
   "groups": [],
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.72,
+      "scale": 0.55,
       "offset": [
         50,
         190

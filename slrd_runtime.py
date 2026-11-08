@@ -1159,6 +1159,8 @@ def sample_with_runtime(
     finally:
         if restore_after:
             restore_original_predict_noise(guider)
+    if diagnostics is not None:
+        diagnostics.save_completed(0, samples, final=True)
     samples = samples.to(comfy.model_management.intermediate_device())
 
     out = clean_latent(runtime.highres_latent)
@@ -1341,6 +1343,8 @@ def _run_resolution_ladder(
             )
         finally:
             restore_original_predict_noise(guider)
+        if diagnostics is not None:
+            diagnostics.save_completed(index, finished, final=final)
         if final:
             x0_output = stage_x0
 
@@ -1479,6 +1483,18 @@ class Krea2HandoffDiagnostics:
             "latent_format_version_0": torch.tensor([]),
         }, path)
         self.saved.append(path)
+
+    def save_completed(self, stage: int, output_space: torch.Tensor, *, final: bool) -> None:
+        """Capture native completed stage output, not the last x0 callback.
+
+        These tensors match the latents returned by CFGGuider.sample, which
+        may differ from the last predicted x0 in multistep solvers. Persist
+        only when explicit diagnostic saving is enabled.
+        """
+        if self.save:
+            self._save(f"stage{stage}_completed", output_space)
+            if final:
+                self._save("final_output", output_space)
 
     @staticmethod
     def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -1665,6 +1681,8 @@ def _run_planner_final_img2img(
             disable_pbar=disable_pbar,
             seed=seed,
         )
+        if diagnostics is not None:
+            diagnostics.save_completed(index, source, final=final)
         if final:
             x0_output = stage_x0
 

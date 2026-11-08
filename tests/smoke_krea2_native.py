@@ -934,6 +934,12 @@ def main():
                     else:
                         assert any(r["locked"] for r in records) or sampler_name == "euler"
                     assert any(p.endswith("planner_final.latent") for p in diag.saved)
+                    assert any(p.endswith("stage0_completed.latent") for p in diag.saved)
+                    assert any(p.endswith("stage1_completed.latent") for p in diag.saved)
+                    final_saved = safetensors.torch.load_file(
+                        next(p for p in diag.saved if p.endswith("final_output.latent"))
+                    )["latent_tensor"]
+                    torch.testing.assert_close(final_saved, observed[0]["samples"].float())
                     print(json.dumps({"case": "handoff_diagnostics", "mode": mode, "sampler": sampler_name,
                                       "files": len(diag.saved),
                                       "first_records": [r for r in records if r["stage"] == 0][:2]}))

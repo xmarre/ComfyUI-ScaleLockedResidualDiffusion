@@ -287,21 +287,24 @@ runtime and does not load weights independently.
   `output/scale_locked_diagnostics/`. Load them with LoadLatent and VAE Decode
   to see the actual tensors that the live preview approximates. Nothing is
   decoded inside the sampler.
-- **Three-way diagnostic preview workflow:** Import
+- **Five-stage handoff diagnostic viewer:** Import
   [`workflows/krea2-handoff-diagnostics.json`](workflows/krea2-handoff-diagnostics.json)
-  into ComfyUI, after generating one run with
-  `handoff_diagnostics=log_and_save_latents`. The
-  `Scale-Locked Load Krea 2 Handoff Diagnostics` node automatically reads
-  the latest diagnostic run directly from ComfyUI's **output** directory
-  (the built-in `LoadLatent` only browses **input**). It returns the
-  finished planner, the resized **clean** first-stage source before denoising,
-  and the first high-resolution denoised prediction. Three connected
-  `VAEDecode` / `PreviewImage` pairs display them side by side. The
-  workflow's `VAELoader` defaults to `qwen_image_vae.safetensors`; select
-  the *same VAE* used for the generation if yours differs. The loader's
-  `run_folder` defaults to `latest`; enter a particular run directory
-  name to compare an older generation. No manual file copying is required
-  and no DiT evaluations occur in this viewer.
+  after one generation with `handoff_diagnostics=log_and_save_latents`.
+  The loader reads the latest **complete** run directly from ComfyUI's
+  output directory, without manual file copying. Five labeled VAEDecode /
+  PreviewImage pairs show: **A** the finished planner; **B** the clean
+  enlarged first-stage source *before denoising*; **C** first-stage initial
+  x0 prediction; **D** the completed first high-resolution stage; and
+  **E** the actual final sampler latent. The completed-stage and final
+  files come directly from the native sampler return values, not x0
+  callback estimates. The viewer adds no model calls.
+  It defaults to `run_folder=latest`, but accepts a specific run folder.
+  The `VAELoader`'s example filename does **not** establish which VAE was
+  used in the generation: select the same original VAE for all five
+  previews. Differences after VAE Decode can be caused by the decoder
+  if the wrong weights are selected. **These comparisons do not reproduce
+  downstream SPCA/HDR/other image postprocessors**; compare output E to
+  the sampler's direct VAE decode, not a processed final image.
 - The `output` is the high-resolution LATENT, `lowres_planner` is the planner
   LATENT, and `denoised_output` is the available final x0 preview LATENT.
 

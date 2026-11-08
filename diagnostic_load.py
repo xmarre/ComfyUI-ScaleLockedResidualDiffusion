@@ -1,8 +1,9 @@
-"""Load the finished Krea 2 planner and first handoff diagnostics from ComfyUI output.
+"""Read planner, first-stage handoff, and actual final Krea 2 latent from output.
 
-The three latents come from one single diagnostic generation and remain in
-saved ComfyUI output-space format. No model evaluation, resampling, or decode
-happens in this node. VAE Decode must use the VAE of the generation.
+All latents are saved from one diagnostic generation in ComfyUI output-space
+format. The completed-stage and final-output files are native sampler
+outputs, not intermediate x0 preview estimates. All decodes must use the
+same VAE as the generation. This node performs no denoiser calls.
 """
 
 from __future__ import annotations
@@ -14,9 +15,12 @@ import torch
 
 
 _DIAGNOSTIC_FILES = (
+    # Keep the first three outputs in place for imported workflow compatibility.
     "planner_final.latent",
     "stage0_source_resized.latent",
     "stage0_step000_x0.latent",
+    "stage0_completed.latent",
+    "final_output.latent",
 )
 _RUN_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,255}\Z")
 
@@ -42,9 +46,9 @@ def _resolve_diagnostic_run(run_folder: str) -> tuple[Path, tuple[Path, ...]]:
         ]
         if not complete:
             raise FileNotFoundError(
-                "No diagnostic run contains planner_final.latent, "
-                "stage0_source_resized.latent and stage0_step000_x0.latent. "
-                "Run the updated PR #16 with handoff_diagnostics=log_and_save_latents."
+                "No complete diagnostic run has planner, clean stage source, "
+                "first x0, completed first stage, and actual final output. "
+                "Run the updated PR #16 once with handoff_diagnostics=log_and_save_latents."
             )
         directory = max(complete, key=lambda d: ((d / _DIAGNOSTIC_FILES[0]).stat().st_mtime_ns, d.name))
     else:
@@ -61,17 +65,20 @@ def _resolve_diagnostic_run(run_folder: str) -> tuple[Path, tuple[Path, ...]]:
 
 
 class SLRDLoadKrea2HandoffDiagnostics:
-    """Directly load three latents from the same Scale-Locked output run."""
+    """Directly load comparable handoff and native final latents from one run."""
 
     CATEGORY = "sampling/scale_locked/diagnostics"
     FUNCTION = "load"
-    RETURN_TYPES = ("LATENT", "LATENT", "LATENT")
-    RETURN_NAMES = ("planner_final", "stage0_source_resized", "stage0_step000_x0")
+    RETURN_TYPES = ("LATENT", "LATENT", "LATENT", "LATENT", "LATENT")
+    RETURN_NAMES = (
+        "planner_final", "stage0_source_resized", "stage0_step000_x0",
+        "stage0_completed", "final_output",
+    )
     DESCRIPTION = (
-        "Load the finished low-resolution planner, clean resized first-stage "
-        "source and first high-resolution x0 from the newest completed Krea 2 "
-        "handoff diagnostic run in ComfyUI/output/scale_locked_diagnostics. "
-        "Decode them with the same Wan-compatible VAE used for sampling."
+        "Load the planner, resized source, first x0, completed first stage, "
+        "and ACTUAL final sampler latent from a single Krea 2 diagnostic run. "
+        "All outputs are raw output-space latents; use the VAE actually used "
+        "for the original generation, before downstream image postprocessing."
     )
 
     @classmethod
@@ -81,7 +88,8 @@ class SLRDLoadKrea2HandoffDiagnostics:
             "multiline": False,
             "tooltip": "'latest' automatically selects the newest diagnostic run with all three latents. "
                        "Or enter the run folder name to select an older one. "
-                       "Enable handoff_diagnostics=log_and_save_latents on the sampler first.",
+                       "After updating PR #16, run the sampler with handoff_diagnostics=log_and_save_latents "
+                       "to capture the completed first stage and actual final output.",
         })}}
 
     @classmethod

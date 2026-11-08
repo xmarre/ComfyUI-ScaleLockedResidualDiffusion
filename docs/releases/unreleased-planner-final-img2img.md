@@ -90,9 +90,12 @@ The diagnostics work in both modes and do not change sampling. They log,
 for each high-resolution step, how far the denoised prediction and the
 state's clean component are from the finished planner and from the stage's
 source. `log_and_save_latents` also writes `.latent` files under
-`output/scale_locked_diagnostics/`, for LoadLatent + VAE Decode. Use them to
-tell an expected noisy-sigma prediction or a mismatched starting state from
-a high-resolution prediction that drifts.
+`output/scale_locked_diagnostics/`, for LoadLatent + VAE Decode. It now also saves the native
+`stageN_completed.latent` at every finished stage and `final_output.latent`
+from the actual final sample, enabling a complete five-panel diagnostic
+comparison without mistaking an early x0 preview for the final output.
+Use the same VAE as the generation and compare the raw sampler VAE decode
+before any downstream postprocessing.
 
 ## Validation and limits
 

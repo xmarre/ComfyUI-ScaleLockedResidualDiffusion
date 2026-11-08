@@ -42,11 +42,11 @@ def test_latest_complete_and_explicit_run(tmp_path, monkeypatch):
     assert Loader.VALIDATE_INPUTS("latest") is True
 
     values = Loader().load("latest")
-    assert [int(x["samples"].flatten()[0]) for x in values] == [10, 11, 12]
-    assert [int(x["samples"].flatten()[0]) for x in Loader().load("earlier")] == [1, 2, 3]
+    assert [int(x["samples"].flatten()[0]) for x in values] == [10, 11, 12, 13, 14]
+    assert [int(x["samples"].flatten()[0]) for x in Loader().load("earlier")] == [1, 2, 3, 4, 5]
     signature = Loader.IS_CHANGED("latest")
     assert signature[0] == "latest_good"
-    assert len(signature[1]) == 3
+    assert len(signature[1]) == 5
     assert all(x["samples"].shape[2] == 1 for x in values)
 
 
