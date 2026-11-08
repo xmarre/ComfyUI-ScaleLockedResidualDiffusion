@@ -269,6 +269,65 @@ runtime and does not load weights independently.
     better than the trajectory mode is not yet established: compare both
     modes at the same seed, prompt, sizes, sampler and steps, with the
     `lowres_planner` output as the reference.
+- **Latent upscale method** (`latent_upscale_method`, optional, default
+  `interpolate`) chooses how a *completed* lower-resolution latent is
+  enlarged before the next stage re-noises and refines it.
+  - `interpolate` is the original bilinear latent resize. It stays bitwise
+    identical to earlier versions.
+  - `sesqui_wan21` uses the pretrained SesquiLSR Wan 2.1 latent upscaler
+    ([LoganBooker/SesquiLSR](https://github.com/LoganBooker/SesquiLSR),
+    MIT), bundled under `third_party/sesqui_lsr` with its license. Krea 2
+    uses the Wan 2.1 VAE, and ComfyUI hands Krea 2 LATENTs around as raw VAE
+    latents (the latent format's z-score is applied only inside
+    `process_latent_in`), which is the space these weights were trained on.
+    The upscaler only sees clean, completed latents: the finished planner and
+    finished stage outputs returned by the native sampler, never a noisy
+    sampler state or an internal model tensor.
+  - Where it applies: every `planner_final_img2img` stage (the finished
+    planner for the first stage, then each finished stage), and trajectory
+    stages after the first. The trajectory mode's first stage follows planner
+    predictions instead of enlarging a finished image, so it is unchanged;
+    `trajectory` without resolution stages therefore has nothing to enlarge
+    and rejects `sesqui_wan21` before sampling.
+  - Output sizes are exact. SesquiLSR is trained for 1x to 2x per axis; a
+    larger jump (for example a direct 1408 px to 3552 px handoff) is split
+    into the fewest latent-only passes that each stay within 2x. No diffusion
+    stage, sigma, noise or model call is added; solvers, Spectrum, seeds and
+    sampler noise are unchanged.
+  - The weights (SHA-256 `d1b4c2c1…2d015a`) are verified before the planner
+    runs and are never downloaded at runtime. The upscaler runs in fp32 on
+    the sampler's device, one image at a time, with one cached instance per
+    device.
+  - Measured before denoising, with the real Wan 2.1 VAE (ComfyUI
+    `wan_2.1_vae.safetensors`): 8 photos with hands, rings, bracelets and
+    faces, Lanczos-downsampled to 384 px, encoded, enlarged in latent space,
+    decoded, and compared with the original. Mean over the 8 photos (LPIPS
+    uses VGG; lower is better):
+
+    | Per-axis ratio | Method | LPIPS | PSNR dB | SSIM | Edge F1 |
+    |---|---|---|---|---|---|
+    | 1.83x | `interpolate` | 0.415 | 22.7 | 0.638 | 0.348 |
+    | 1.83x | `sesqui_wan21` | **0.197** | **30.3** | **0.875** | **0.866** |
+    | 2.00x | `interpolate` | 0.445 | 22.5 | 0.633 | 0.317 |
+    | 2.00x | `sesqui_wan21` | **0.224** | **29.9** | **0.862** | **0.832** |
+    | 2.50x (2 passes) | `interpolate` | 0.482 | 22.4 | 0.629 | 0.281 |
+    | 2.50x (2 passes) | `sesqui_wan21` | **0.311** | **28.5** | **0.818** | **0.752** |
+
+    `sesqui_wan21` was better on every metric for all 8 photos at every
+    ratio (1.5x too). Bilinear-enlarged latents decode with a latent-grid
+    pattern and smeared, doubled contours on fingers and eyes; the learned
+    result decodes close to the original. Direct jumps above 2x lose part of
+    the gain, so automatic stages of at most 2x per side (the default
+    `max_stage_upscale=4`) remain preferable. **This measures the clean
+    source handed to the high-resolution pass, not the final sampled image:**
+    whether the improvement survives denoising on a real Krea 2 checkpoint
+    has not been measured yet.
+  - Cost (CPU, 4 threads, fp32, one image): 2.8 s and +0.8 GiB peak memory
+    for 1408 px to 2240 px; 7.8 to 8.0 s and +1.8 GiB for 2240 px to 3552 px
+    or 2448x1632 to 4608x3072; 10.7 s and +1.9 GiB for a direct two-pass
+    1408 px to 3552 px jump. GPU time was not measured; GPU activation
+    memory is expected to be of the same order and is transient. No DiT
+    evaluations are added.
 - **Handoff diagnostics** (`handoff_diagnostics`, optional, default `off`)
   work in both modes and never change the sampled result. `log` reports, for
   every high-resolution step: the sigma, whether the step was
@@ -429,7 +488,10 @@ git clone <this-repo> ComfyUI/custom_nodes/ComfyUI-ScaleLockedResidualDiffusion
 
 Then restart ComfyUI.
 
-No extra Python dependencies are required beyond ComfyUI + PyTorch.
+No extra Python dependencies are required beyond ComfyUI + PyTorch. The
+SesquiLSR Wan 2.1 latent-upscaler weights used by
+`latent_upscale_method=sesqui_wan21` are included in this repository; no
+separate download or SesquiLSR custom node is needed.
 
 ## Suggested first settings for Flux.2 Klein 9B style use
 
@@ -491,4 +553,6 @@ What is not implemented yet:
 - `__init__.py` - node registration
 - `nodes.py` - ComfyUI node definitions, public guider node, and Impact hook/provider nodes
 - `slrd_runtime.py` - shared ComfyUI runtime for planner capture, nested noise, guider patching, and final sampling
+- `latent_upscale.py` - completed-latent enlargement backends (`interpolate`, `sesqui_wan21`)
+- `third_party/sesqui_lsr/` - vendored SesquiLSR architecture, Wan 2.1 weights, MIT license and provenance notice
 - `slrd_core.py` - algorithm core, nested noise, latent resizing, residual locking, trajectory helpers
