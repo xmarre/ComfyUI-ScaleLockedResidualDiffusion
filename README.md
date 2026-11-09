@@ -410,7 +410,8 @@ runtime and does not load weights independently.
     resolution. `sa_planner_spectrum_forecasts` has no effect (there is no
     separate planner). The `lowres_planner` output holds the denoised
     prediction at the last small-grid step, not a finished planner image.
-    Identical prompts, seeds and settings reproduce the result exactly.
+    Every random field is seeded, so identical settings reproduce the same
+    trajectory (bitwise only where the device kernels are deterministic).
   - **In other modes** a connected `spectral_calibration` never changes
     sampling. In `trajectory` mode it logs, for each handoff, the lowest
     release sigma at which frequencies above the source grid are still noise
