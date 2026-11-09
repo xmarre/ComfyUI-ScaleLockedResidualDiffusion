@@ -94,6 +94,45 @@ def _node():
     return node, calls, base_args
 
 
+def _calibration_node():
+    # Run the production calibration node with a strict model-format stub.
+    # Invalid inputs must fail before process_latent_in or the spectral fit.
+    source = ast.parse((ROOT / "nodes.py").read_text())
+    cls = next(n for n in source.body if isinstance(n, ast.ClassDef)
+               and n.name == "Krea2SpectralCalibration")
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("invalid calibration input reached model processing")
+
+    namespace = {
+        "torch": torch,
+        "CALIBRATION_TYPE": spectral.CALIBRATION_TYPE,
+        "build_calibration": unexpected,
+        "describe_calibration": unexpected,
+        "logger": SimpleNamespace(info=unexpected),
+    }
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), str(ROOT / "nodes.py"),
+                 "exec"), namespace)
+    model = SimpleNamespace(model=SimpleNamespace(
+        latent_format=SimpleNamespace(latent_channels=16),
+        process_latent_in=unexpected,
+    ))
+    return namespace[cls.name](), model
+
+
+@pytest.mark.parametrize("channels", [4, 16])
+def test_spectral_calibration_rejects_empty_generation_canvas(channels):
+    node, model = _calibration_node()
+    with pytest.raises(ValueError, match="empty latent canvas.*VAE Encode"):
+        node.calibrate(model, {"samples": torch.zeros(1, channels, 64, 80)})
+
+
+def test_spectral_calibration_reports_actual_and_expected_channels():
+    node, model = _calibration_node()
+    with pytest.raises(ValueError, match="expected 16 latent channels, received 4.*VAE Encode"):
+        node.calibrate(model, {"samples": torch.ones(1, 4, 64, 80)})
+
+
 def test_existing_widget_slots_and_explicit_defaults():
     node, calls, args = _node()
     schema = node.INPUT_TYPES()
