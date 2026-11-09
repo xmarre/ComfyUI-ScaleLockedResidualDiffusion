@@ -132,12 +132,15 @@ def expand_flow_state(
     *,
     seed: int,
     noise_scale: float = 1.0,
+    batch_inds=None,
 ) -> tuple[torch.Tensor, float]:
     """Spectrally expand a noisy flow state ``x`` (internal model space).
 
     ``x`` is ``B x C x h x w`` or a single-frame ``B x C x 1 x h x w``. The
     fresh high-frequency coefficients come from a CPU generator seeded with
-    ``seed`` (device independent, reproducible). Returns the expanded state
+    ``seed`` (device independent, reproducible). If ``batch_inds`` is supplied,
+    repeat indices receive identical high-frequency coefficients, following
+    ComfyUI's initial-noise batch-index semantics. Returns the expanded state
     in ``x.dtype`` on ``x.device`` and the aligned sigma. The computation runs
     in float32 (float64 for float64 input); no tensor larger than three target-sized latents is held.
     """
@@ -146,7 +149,10 @@ def expand_flow_state(
     if x.ndim == 5:
         if x.shape[2] != 1:
             raise ValueError("spectral expansion supports single-frame image latents only")
-        out, aligned = expand_flow_state(x.squeeze(2), target_hw, sigma, seed=seed, noise_scale=noise_scale)
+        out, aligned = expand_flow_state(
+            x.squeeze(2), target_hw, sigma, seed=seed,
+            noise_scale=noise_scale, batch_inds=batch_inds,
+        )
         return out.unsqueeze(2), aligned
     if x.ndim != 4:
         raise ValueError("flow state must be BxCxHxW or Bx Cx1xHxW")
@@ -160,9 +166,28 @@ def expand_flow_state(
     work = torch.float64 if x.dtype == torch.float64 else torch.float32
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(seed) & 0xFFFFFFFFFFFFFFFF)
-    coeffs = torch.randn(
-        tuple(x.shape[:2]) + (th, tw), generator=generator, device="cpu", dtype=torch.float32
-    ).to(device=x.device, dtype=work)
+    coeff_shape = tuple(x.shape[:2]) + (th, tw)
+    if batch_inds is None:
+        coeffs_cpu = torch.randn(
+            coeff_shape, generator=generator, device="cpu", dtype=torch.float32
+        )
+    else:
+        # Match comfy.sample.prepare_noise_inner: each noise index denotes one
+        # reproducible draw, even when indices are repeated or noncontiguous.
+        indices = [int(i) for i in batch_inds]
+        if len(indices) != x.shape[0] or any(i < 0 for i in indices):
+            raise ValueError("batch_inds must contain one nonnegative index per batch row")
+        selected = set(indices)
+        by_index = {}
+        for i in range(max(indices) + 1):
+            draw = torch.randn(
+                (1,) + coeff_shape[1:], generator=generator,
+                device="cpu", dtype=torch.float32,
+            )
+            if i in selected:
+                by_index[i] = draw
+        coeffs_cpu = torch.cat([by_index[i] for i in indices], dim=0)
+    coeffs = coeffs_cpu.to(device=x.device, dtype=work)
     coeffs.mul_(sigma * float(noise_scale))
     coeffs[..., :sh, :sw] = dct2(x.to(dtype=work))
     out = idct2(coeffs)
