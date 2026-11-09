@@ -2037,7 +2037,8 @@ def _run_spectral_progressive(
         else:
             sigma = float(sigmas[start])
             state, aligned = expand_flow_state(
-                state, hw, sigma, seed=_progressive_expansion_seed(seed, index - 1), noise_scale=noise_scale
+                state, hw, sigma, seed=_progressive_expansion_seed(seed, index - 1),
+                noise_scale=noise_scale, batch_inds=lowres_latent.get("batch_index"),
             )
             segment[0] = aligned
             _LOGGER.info(
