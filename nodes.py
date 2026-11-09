@@ -13,6 +13,7 @@ import comfy.model_base
 from .slrd_core import build_nested_noise, clone_latent, full_lock_prefix_length, init_scale_lock_state, latent_target_hw_from_megapixels, parse_stage_megapixels, plan_stage_megapixels, resize_4d_tensor, resize_mask
 from .resolution import DISPLAY_NAME as RESOLUTION_DISPLAY_NAME, NODE_ID as RESOLUTION_NODE_ID, ResolutionSelectorUncapped
 from .diagnostic_load import SLRDLoadKrea2HandoffDiagnostics
+from .spectral_progressive import CALIBRATION_TYPE, build_calibration, describe_calibration, parse_transition_sigmas
 from .slrd_runtime import (
     LOCK_SCHEDULE_OPTIONS,
     MID_SCHEDULE_OPTIONS,
@@ -306,7 +307,7 @@ class Krea2TurboFlowAlignedRegenerate:
                                "Off evaluates every planner step natively while preserving Spectrum acceleration "
                                "in the intermediate and final high-resolution stages. This is a quality comparison "
                                "for planner texture loss; the planner uses the same native noise and solver."}),
-                "regeneration_mode": (["trajectory", "planner_final_img2img", "planner_final_upscale_only", "planner_final_native_refine"], {"default": "trajectory",
+                "regeneration_mode": (["trajectory", "planner_final_img2img", "planner_final_upscale_only", "planner_final_native_refine", "spectral_progressive"], {"default": "trajectory",
                     "tooltip": "trajectory (default, unchanged): the first high-resolution stage follows the planner's "
                                "denoising trajectory above composition_lock_sigma, then refines freely. "
                                "planner_final_img2img: every high-resolution stage starts from the finished image "
@@ -321,7 +322,14 @@ class Krea2TurboFlowAlignedRegenerate:
                                "at most 2048 pixels per axis, then SesquiLSR-upscale the completed latent "
                                "to final dimensions WITHOUT diffusion above 2048. Requires sesqui_wan21; "
                                "stage_megapixels must be empty. This balances native-detail refinement "
-                               "against structural drift at unsupported target resolutions."}),
+                               "against structural drift at unsupported target resolutions. "
+                               "spectral_progressive (experimental): no separate planner pass. One denoising "
+                               "trajectory starts at the planner size and grows to each stage and the output size "
+                               "at transition points, spectrally expanding the noisy state with fresh "
+                               "high-frequency noise and the matching sigma alignment. Early steps run at the "
+                               "smaller sizes. Transitions come from progressive_transition_sigmas, a connected "
+                               "spectral_calibration, or (single transition only) composition_lock_sigma. Band "
+                               "lock strengths must be 0; multistep solver history restarts at each transition."}),
                 "img2img_start_sigma": ("FLOAT", {"default": 0.65, "min": 0.01, "max": 0.99, "step": 0.01,
                     "tooltip": "planner_final_img2img only: noise level the finished image is re-noised to before "
                                "each high-resolution stage. The first sigma of the native refinement suffix is "
@@ -356,6 +364,21 @@ class Krea2TurboFlowAlignedRegenerate:
                                "Empty stage_megapixels still allows automatic intermediate stages when "
                                "max_stage_upscale is exceeded. A cleaner enlarged latent does not by itself prevent "
                                "the high-resolution model from changing details."}),
+                "progressive_transition_sigmas": ("STRING", {"default": "", "multiline": False,
+                    "tooltip": "spectral_progressive only: one schedule sigma per resolution change, strictly "
+                               "decreasing, e.g. '0.85, 0.6' for planner -> stage -> output. Each transition "
+                               "happens at the first step whose sigma is at or below its value. Empty uses the "
+                               "connected spectral_calibration, or composition_lock_sigma for a single transition. "
+                               "Must be empty in other modes."}),
+                "spectral_tolerance": ("FLOAT", {"default": 0.01, "min": 0.0001, "max": 0.5, "step": 0.001,
+                    "tooltip": "Noise-dominance tolerance delta for spectral transition times (used with a "
+                               "spectral_calibration). Smaller values hand over to the larger grid earlier and "
+                               "keep fewer steps at small sizes."}),
+                "spectral_calibration": ("SLRD_SPECTRUM", {
+                    "tooltip": "Measured clean-latent power spectrum from the Krea 2 Spectral Calibration node. "
+                               "spectral_progressive derives its transition sigmas from it; trajectory mode only "
+                               "logs whether composition_lock_sigma hands over before frequencies the target "
+                               "cannot recover become informative. Sampling is otherwise unchanged."}),
             },
         }
 
@@ -395,12 +418,18 @@ class Krea2TurboFlowAlignedRegenerate:
         planner_fidelity_strength=0.0,
         planner_detail_strength=0.20,
         latent_upscale_method="interpolate",
+        progressive_transition_sigmas="",
+        spectral_tolerance=0.01,
+        spectral_calibration=None,
     ):
         if latent_upscale_method not in ("interpolate", "sesqui_wan21"):
             raise ValueError("latent_upscale_method must be interpolate or sesqui_wan21")
-        if regeneration_mode not in ("trajectory", "planner_final_img2img", "planner_final_upscale_only", "planner_final_native_refine"):
+        if regeneration_mode not in ("trajectory", "planner_final_img2img", "planner_final_upscale_only",
+                                     "planner_final_native_refine", "spectral_progressive"):
             raise ValueError("invalid regeneration_mode; select trajectory, planner_final_img2img, "
-                             "planner_final_upscale_only or planner_final_native_refine")
+                             "planner_final_upscale_only, planner_final_native_refine or spectral_progressive")
+        progressive = regeneration_mode == "spectral_progressive"
+        transition_sigmas = parse_transition_sigmas(progressive_transition_sigmas)
         if regeneration_mode == "planner_final_native_refine" and latent_upscale_method != "sesqui_wan21":
             raise ValueError("planner_final_native_refine requires latent_upscale_method=sesqui_wan21")
         if handoff_diagnostics not in ("off", "log", "log_and_save_latents"):
@@ -538,7 +567,7 @@ class Krea2TurboFlowAlignedRegenerate:
                     target_w * 8, target_h * 8,
                 )
         elif stage_hw:
-            if not upscale_only:
+            if not upscale_only and not progressive:
                 # ER-SDE shifts the initial CONST sigma away from 1.0 for finite
                 # log-SNR; lock/release planning must use the sigma actually seen
                 # by the native denoiser, not the nominal outer schedule.
@@ -630,8 +659,68 @@ class Krea2TurboFlowAlignedRegenerate:
                 planner_fidelity_strength=float(planner_fidelity_strength),
                 planner_detail_strength=float(planner_detail_strength),
                 latent_upscale_method=latent_upscale_method,
+                progressive_transition_sigmas=transition_sigmas,
+                spectral_calibration=spectral_calibration,
+                spectral_tolerance=float(spectral_tolerance),
             )
         return (result.output, result.lowres_planner, result.denoised_output)
+
+
+class Krea2SpectralCalibration:
+    """Measure the clean-latent power spectrum used for spectral transitions.
+
+    Reads completed latents only; no model evaluation. The fit is made in the
+    model's internal latent space, where sampler noise has unit variance.
+    """
+
+    CATEGORY = "sampling/scale_locked"
+    RETURN_TYPES = (CALIBRATION_TYPE, "STRING")
+    RETURN_NAMES = ("spectral_calibration", "report")
+    FUNCTION = "calibrate"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL", {"tooltip": "The Krea 2 model whose latent format the calibration is for."}),
+                "latent": ("LATENT", {"tooltip": "Clean, completed latents near the intended output size, e.g. "
+                                                 "a finished Krea 2 generation (LoadLatent) or VAE-encoded photos "
+                                                 "of the kind of content you generate. Not noise or empty latents."}),
+            },
+            "optional": {
+                "fit_low": ("FLOAT", {"default": 0.05, "min": 0.01, "max": 0.9, "step": 0.01,
+                    "tooltip": "Lowest fitted frequency as a fraction of Nyquist."}),
+                "fit_high": ("FLOAT", {"default": 0.9, "min": 0.05, "max": 1.0, "step": 0.01,
+                    "tooltip": "Highest fitted frequency as a fraction of Nyquist."}),
+            },
+        }
+
+    def calibrate(self, model, latent, fit_low=0.05, fit_high=0.9):
+        if not isinstance(latent, dict) or not isinstance(latent.get("samples"), torch.Tensor):
+            raise TypeError("Krea 2 spectral calibration requires a LATENT dictionary with tensor samples")
+        base = getattr(model, "model", None)
+        latent_format = getattr(base, "latent_format", None)
+        if latent_format is None:
+            raise ValueError("Krea 2 spectral calibration requires a diffusion MODEL")
+        samples = latent["samples"]
+        if samples.ndim == 5 and samples.shape[2] != 1:
+            raise ValueError("Krea 2 spectral calibration supports single-frame image latents only")
+        if samples.shape[1] != getattr(latent_format, "latent_channels", samples.shape[1]):
+            raise ValueError("calibration latents do not have this model's latent channel count")
+        if not bool(torch.count_nonzero(samples)):
+            raise ValueError("calibration latent is empty; connect clean, completed latents")
+        samples = samples.detach().to(device="cpu", dtype=torch.float32)
+        if samples.ndim == 4:
+            # Wan 2.1-format latent statistics broadcast over a temporal axis.
+            samples = samples.unsqueeze(2)
+        internal = base.process_latent_in(samples)
+        calibration = build_calibration(
+            internal, latent_format=type(latent_format).__name__,
+            fit_low=float(fit_low), fit_high=float(fit_high),
+        )
+        report = describe_calibration(calibration)
+        logger.info("Krea 2 spectral calibration: %s", report)
+        return (calibration, report)
 
 
 class ScaleLockedRuntimeContextBuilder:
@@ -2080,6 +2169,7 @@ NODE_CLASS_MAPPINGS = {
     "ScaleLockedNestedNoisePreview": ScaleLockedNestedNoisePreview,
     "ScaleLockedDetailerHookProvider": ScaleLockedDetailerHookProvider,
     "SLRDLoadKrea2HandoffDiagnostics": SLRDLoadKrea2HandoffDiagnostics,
+    "Krea2SpectralCalibration": Krea2SpectralCalibration,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2092,5 +2182,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ScaleLockedNestedNoisePreview": "Scale-Locked Nested Noise Preview",
     "ScaleLockedDetailerHookProvider": "Scale-Locked Detailer Hook Provider",
     "SLRDLoadKrea2HandoffDiagnostics": "Scale-Locked Load Krea 2 Handoff Diagnostics",
+    "Krea2SpectralCalibration": "Krea 2 Spectral Calibration (Scale-Locked)",
 }
 

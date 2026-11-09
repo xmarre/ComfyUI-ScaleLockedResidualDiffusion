@@ -1331,6 +1331,8 @@ def main():
         raise AssertionError("too few steps for the stages must be rejected before sampling")
 
     review_regressions(node, model, positive, negative, runtime, base, spec.name)
+    progressive_regressions(node, model, positive, negative, runtime, base, package,
+                            dict(cases).get("spectrum"), reports_context)
 
 
 def review_regressions(node, model, positive, negative, runtime, base, package_name):
@@ -1406,6 +1408,224 @@ def review_regressions(node, model, positive, negative, runtime, base, package_n
         assert bool(region.any())
         torch.testing.assert_close(correction.float()[region], kept[region], atol=2e-3, rtol=2e-3)
     print(json.dumps({"case": "sa_pece_masked_corrections", "checked": len(corrections)}))
+
+
+def progressive_regressions(node, model, positive, negative, runtime, base, package, spectrum_model, reports_context):
+    """spectral_progressive through genuine ComfyUI guiders, samplers and Krea 2 DiT calls."""
+    import torch
+    import comfy.model_management
+    spectral = sys.modules[package.__name__ + ".spectral_progressive"]
+
+    def run(selected, sampler_name, steps, *, latent_hw=(24, 28), fail=None, record=None, **extra):
+        if sampler_name in ("sa_solver", "sa_solver_pece"):
+            extra.setdefault("sa_spectrum_forecasts", True)
+        calls, reports = [], []
+        token = reports_context.set(reports) if reports_context is not None else None
+        original_preview = runtime.make_preview_callback
+
+        def preview(*a, **kw):
+            inner = original_preview(*a, **kw)
+
+            def callback(step, x0, x, total):
+                if record is not None:
+                    record.append((step, tuple(x.shape[-2:]), x.detach().clone()))
+                if fail is not None and tuple(x.shape[-2:]) == fail[0] and step == fail[1]:
+                    raise comfy.model_management.InterruptProcessingException()
+                inner(step, x0, x, total)
+            return callback
+
+        runtime.make_preview_callback = preview
+        hook = (base.diffusion_model.register_forward_pre_hook(
+            lambda module, args: calls.append(tuple(args[0].shape[-2:]))) if selected is model else None)
+        try:
+            with torch.inference_mode():
+                result = node.sample(selected, positive, negative, {"samples": torch.zeros(1, 4, *latent_hw)},
+                                     42, .01, 0.0, 0.0, steps=steps, sampler_name=sampler_name,
+                                     regeneration_mode="spectral_progressive", **extra)
+        finally:
+            runtime.make_preview_callback = original_preview
+            if hook is not None:
+                hook.remove()
+            if reports_context is not None:
+                reports_context.reset(token)
+        assert not base.diffusion_model._forward_pre_hooks
+        assert all(torch.isfinite(x["samples"]).all() for x in result), sampler_name
+        counts = {shape: calls.count(shape) for shape in set(calls)}
+        return result, counts, reports
+
+    def expected_split(steps, lock=0.80, sampler_name="euler"):
+        schedule = runtime.calculate_sigmas(model, scheduler="simple", steps=steps, denoise=1.0)
+        if sampler_name in runtime.SNR_SOLVER_NAMES:
+            schedule = runtime.effective_er_sde_sigmas(schedule, model)
+        return next(i for i, v in enumerate(schedule.tolist()) if v <= lock)
+
+    # Every offered solver: single transition at the composition-lock release.
+    planner_hw = None
+    for sampler_name in runtime.krea2_sampler_names():
+        steps = 8
+        k = expected_split(steps, sampler_name=sampler_name)
+        result, counts, _ = run(model, sampler_name, steps)
+        repeat, _, _ = run(model, sampler_name, steps)
+        for a, b in zip(result, repeat):
+            assert torch.equal(a["samples"], b["samples"]), sampler_name
+        planner_hw = tuple(result[1]["samples"].shape[-2:])
+        assert list(result[0]["samples"].shape) == [1, 16, 1, 24, 28]
+        if sampler_name == "sa_solver_pece":
+            # Each segment is a fresh PECE run: no correction on its first step.
+            expected = {planner_hw: 2 * k - 1, (24, 28): 2 * (steps - k) - 1}
+        else:
+            expected = {planner_hw: k, (24, 28): steps - k}
+        assert counts == expected, (sampler_name, counts, expected)
+        print(json.dumps({"case": "progressive_solver", "sampler": sampler_name, "split_step": k,
+                          "dit_calls": {f"{h}x{w}": c for (h, w), c in counts.items()}}))
+
+    # The first segment reproduces the planner prefix; the second segment
+    # starts from exactly the expanded, kappa-scaled state at the aligned sigma.
+    record = []
+    captured = {}
+    original_expand = runtime.expand_flow_state
+
+    def spy(x, hw, sigma, **kw):
+        out, aligned = original_expand(x, hw, sigma, **kw)
+        captured.update(source=x.detach().clone(), out=out.detach().clone(), sigma=sigma, aligned=aligned, kw=kw)
+        return out, aligned
+    runtime.expand_flow_state = spy
+    try:
+        run(model, "euler", 8, record=record)
+    finally:
+        runtime.expand_flow_state = original_expand
+    k = expected_split(8)
+    second = [x for step, hw, x in record if hw == (24, 28)]
+    assert len(second) == 8 - k
+    torch.testing.assert_close(second[0].float(), captured["out"].float(), atol=1e-5, rtol=1e-5)
+    r = spectral.area_ratio(planner_hw, (24, 28))
+    assert abs(captured["aligned"] - spectral.align_sigma(captured["sigma"], r)) < 1e-12
+    src = captured["source"].float().squeeze(2)
+    low = spectral.dct2(captured["out"].float().squeeze(2))[..., :planner_hw[0], :planner_hw[1]]
+    torch.testing.assert_close(low / spectral.kappa(captured["sigma"], r), spectral.dct2(src), atol=1e-4, rtol=1e-4)
+    trajectory_record = []
+    original_preview = runtime.make_preview_callback
+
+    def planner_preview(*a, **kw):
+        inner = original_preview(*a, **kw)
+
+        def callback(step, x0, x, total):
+            trajectory_record.append((step, tuple(x.shape[-2:]), x.detach().clone()))
+            inner(step, x0, x, total)
+        return callback
+    runtime.make_preview_callback = planner_preview
+    try:
+        with torch.inference_mode():
+            node.sample(model, positive, negative, {"samples": torch.zeros(1, 4, 24, 28)}, 42, .01, 0.0, 0.0, steps=8)
+    finally:
+        runtime.make_preview_callback = original_preview
+    planner_states = [x for step, hw, x in trajectory_record if hw == planner_hw][:k]
+    progressive_states = [x for step, hw, x in record if hw == planner_hw]
+    assert len(progressive_states) == k
+    for a, b in zip(planner_states, progressive_states):
+        assert torch.equal(a, b)
+    print(json.dumps({"case": "progressive_handoff_state", "split_step": k, "aligned_sigma": captured["aligned"]}))
+
+    # Three resolutions with manual transitions and with a measured calibration.
+    for options in ({"stage_megapixels": "0.02", "progressive_transition_sigmas": "0.9, 0.6"},):
+        result, counts, _ = run(model, "dpmpp_2m", 12, **options)
+        schedule = runtime.calculate_sigmas(model, scheduler="simple", steps=12, denoise=1.0).tolist()
+        s1 = next(i for i, v in enumerate(schedule) if v <= 0.9)
+        s2 = next(i for i, v in enumerate(schedule) if v <= 0.6)
+        assert counts == {planner_hw: s1,
+                          (16, 20): s2 - s1, (24, 28): 12 - s2}, counts
+        print(json.dumps({"case": "progressive_manual_stages", "dit_calls": {f"{h}x{w}": c for (h, w), c in counts.items()}}))
+
+    # Calibration from a synthetic power-law clean latent (no model calls).
+    g = torch.Generator().manual_seed(5)
+    fy = torch.fft.fftfreq(48, dtype=torch.float64).unsqueeze(1)
+    fx = torch.fft.fftfreq(56, dtype=torch.float64).unsqueeze(0)
+    radius = 48 * torch.sqrt(fy ** 2 + fx ** 2)
+    amp = torch.where(radius > 0, radius.clamp(min=1e-9) ** -1.1, torch.zeros_like(radius))
+    internal = torch.fft.ifft2(torch.fft.fft2(torch.randn(2, 16, 48, 56, generator=g, dtype=torch.float64), norm="ortho")
+                               * amp, norm="ortho").real.float() * 6.0
+    clean = base.process_latent_out(internal.unsqueeze(2))
+    calibrator = package.NODE_CLASS_MAPPINGS["Krea2SpectralCalibration"]()
+    calibration, report = calibrator.calibrate(model, {"samples": clean})
+    assert abs(calibration["beta"] - 2.2) < 0.15, report
+    assert calibration["latent_format"] == "Wan21" and calibration["grid"] == (48, 56)
+    # The 24x28 test canvas is within the 2x transfer range of a 48x56 fit.
+    sizes = [planner_hw, (24, 28)]
+    thresholds = spectral.spectral_transition_sigmas(sizes, calibration, 0.01)
+    schedule = runtime.calculate_sigmas(model, scheduler="simple", steps=16, denoise=1.0).tolist()
+    split = spectral.transition_steps(schedule, thresholds, sizes)[0]
+    result, counts, _ = run(model, "euler", 16, spectral_calibration=calibration, spectral_tolerance=0.01)
+    assert counts == {planner_hw: split, (24, 28): 16 - split}, (counts, thresholds)
+    print(json.dumps({"case": "progressive_spectral", "report": report, "thresholds": thresholds, "split_step": split}))
+
+    # Unsupported configurations fail before any model evaluation.
+    rejected = [
+        ({"coarse_lock_strength": 0.2}, "coarse_lock_strength"),
+        ({"latent_upscale_method": "sesqui_wan21"}, "interpolate"),
+        ({"handoff_diagnostics": "log_and_save_latents"}, "latents"),
+        ({"progressive_transition_sigmas": "0.9", "spectral_calibration": calibration}, "both"),
+        ({"stage_megapixels": "0.02"}, "intermediate"),
+        ({"progressive_transition_sigmas": "0.001"}, "never reached"),
+        ({"progressive_transition_sigmas": "0.9, 0.5"}, "transition sigma"),
+        ({"composition_lock_sigma": 1.0}, "composition_lock_sigma"),
+        ({"spectral_calibration": dict(calibration, latent_format="Flux")}, "latent format"),
+        ({"spectral_calibration": dict(calibration, grid=(160, 160), reference_length=160)}, "transferred"),
+    ]
+    for extra, needle in rejected:
+        calls = []
+        hook = base.diffusion_model.register_forward_pre_hook(lambda module, args: calls.append(1))
+        try:
+            kwargs = dict(steps=8, regeneration_mode="spectral_progressive")
+            if "coarse_lock_strength" in extra:
+                args = (model, positive, negative, {"samples": torch.zeros(1, 4, 24, 28)}, 42, .01, extra.pop("coarse_lock_strength"), 0.0)
+            else:
+                args = (model, positive, negative, {"samples": torch.zeros(1, 4, 24, 28)}, 42, .01, 0.0, 0.0)
+            node.sample(*args, **kwargs, **extra)
+        except ValueError as exc:
+            assert needle in str(exc), (needle, str(exc))
+        else:
+            raise AssertionError(f"spectral_progressive accepted {extra}")
+        finally:
+            hook.remove()
+        assert not calls, extra
+    mask_latent = {"samples": torch.zeros(1, 4, 24, 28), "noise_mask": torch.ones(1, 24, 28)}
+    try:
+        node.sample(model, positive, negative, mask_latent, 42, .01, 0.0, 0.0, steps=8,
+                    regeneration_mode="spectral_progressive")
+    except ValueError as exc:
+        assert "noise mask" in str(exc)
+    else:
+        raise AssertionError("noise masks must be rejected")
+    try:
+        node.sample(model, positive, negative, {"samples": torch.zeros(1, 4, 24, 28)}, 42, .01, 0.0, 0.0,
+                    steps=8, progressive_transition_sigmas="0.8")
+    except ValueError as exc:
+        assert "only used by" in str(exc)
+    else:
+        raise AssertionError("transition sigmas outside spectral_progressive must be rejected")
+
+    # Interruption in the second segment leaves no hooks or state behind.
+    reference, _, _ = run(model, "euler", 8)
+    try:
+        run(model, "euler", 8, fail=((24, 28), 1))
+    except comfy.model_management.InterruptProcessingException:
+        pass
+    else:
+        raise AssertionError("interrupt was not raised")
+    again, _, _ = run(model, "euler", 8)
+    for a, b in zip(reference, again):
+        assert torch.equal(a["samples"], b["samples"])
+
+    # Spectrum: one forecast session per resolution, never across a transition.
+    if spectrum_model is not None:
+        for sampler_name in ("euler", "er_sde", "sa_solver"):
+            k = expected_split(16, sampler_name=sampler_name)
+            _, _, reports = run(spectrum_model, sampler_name, 16)
+            assert [r["outer_steps"] for r in reports] == [k, 16 - k], reports
+            assert all(r["fallback"] is None for r in reports), reports
+            print(json.dumps({"case": "progressive_spectrum", "sampler": sampler_name,
+                              "reports": [{key: r[key] for key in ("outer_steps", "actual", "forecast", "fallback")}
+                                          for r in reports]}))
 
 
 if __name__ == "__main__":

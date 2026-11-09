@@ -20,6 +20,14 @@ import comfy.utils
 import latent_preview
 
 from .krea2_flow import build_patch_coupled_noise
+from .spectral_progressive import (
+    describe_calibration,
+    expand_flow_state,
+    handoff_activation_sigma,
+    spectral_transition_sigmas,
+    transition_steps,
+    validate_calibration,
+)
 from .latent_upscale import (
     LATENT_UPSCALE_METHODS,
     enlarge_completed_latent,
@@ -1448,7 +1456,8 @@ def _run_resolution_ladder(
     return ScaleLockedSampleResult(output=out, lowres_planner=clean_latent(lowres_out), denoised_output=denoised)
 
 
-REGENERATION_MODES = ("trajectory", "planner_final_img2img", "planner_final_upscale_only", "planner_final_native_refine")
+REGENERATION_MODES = ("trajectory", "planner_final_img2img", "planner_final_upscale_only", "planner_final_native_refine",
+                      "spectral_progressive")
 KREA2_NATIVE_MAX_AXIS_PX = 2048
 HANDOFF_DIAGNOSTIC_MODES = ("off", "log", "log_and_save_latents")
 
@@ -1930,6 +1939,186 @@ def _run_planner_final_img2img(
     return ScaleLockedSampleResult(output=out, lowres_planner=clean_latent(lowres_out), denoised_output=denoised)
 
 
+_PROGRESSIVE_EXPANSION_SEED = 0x5BD1E9955BD1E995
+
+
+def _progressive_expansion_seed(seed: int, transition_index: int) -> int:
+    """New high-frequency coefficients of each transition, separate from the
+    initial noise, stochastic solver increments and every other stage seed."""
+    return _stage_seed(int(seed) ^ _PROGRESSIVE_EXPANSION_SEED, transition_index)
+
+
+def _latent_format_identity(model) -> tuple[str, int]:
+    latent_format = getattr(getattr(model, "model", None), "latent_format", None)
+    return type(latent_format).__name__, int(getattr(latent_format, "latent_channels", 0) or 0)
+
+
+def plan_spectral_progressive(
+    *, schedule, sizes, transition_sigmas, calibration, delta: float,
+    composition_lock_sigma: Optional[float], latent_format: Optional[str] = None,
+    channels: Optional[int] = None,
+) -> tuple[list[float], list[int], str]:
+    """Transition thresholds and step indices, decided before any model call.
+
+    Exactly one source is used, and it is reported:
+
+    * ``manual``: explicit ``progressive_transition_sigmas``;
+    * ``spectral``: thresholds from a validated measured calibration (Eq. 9-10);
+    * ``composition_lock``: a single transition at the composition-lock release
+      (only for one transition; otherwise a source must be given).
+    """
+    sizes = [tuple(map(int, hw)) for hw in sizes]
+    if transition_sigmas and calibration is not None:
+        raise ValueError(
+            "spectral_progressive received both progressive_transition_sigmas and a "
+            "spectral_calibration; clear one of them"
+        )
+    if transition_sigmas:
+        thresholds, source = [float(v) for v in transition_sigmas], "manual"
+    elif calibration is not None:
+        validate_calibration(calibration, latent_format=latent_format, channels=channels)
+        thresholds, source = spectral_transition_sigmas(sizes, calibration, delta), "spectral"
+    else:
+        if len(sizes) != 2:
+            raise ValueError(
+                f"spectral_progressive with {len(sizes) - 2} intermediate stage(s) needs one transition "
+                "per resolution change: set progressive_transition_sigmas or connect a spectral_calibration"
+            )
+        if composition_lock_sigma is None or not 0.0 < float(composition_lock_sigma) < 1.0:
+            raise ValueError(
+                "spectral_progressive transitions at composition_lock_sigma when no other schedule is "
+                "given; it must lie strictly between 0 and 1"
+            )
+        thresholds, source = [float(composition_lock_sigma)], "composition_lock"
+    return thresholds, transition_steps(schedule, thresholds, sizes), source
+
+
+def _run_spectral_progressive(
+    *, model, positive, negative, cfg, sampler_name: str, sigmas: torch.Tensor,
+    highres_latent: dict, lowres_latent: dict, stage_hw: tuple, seed: int,
+    sampler_options: Optional[dict], steps_at: list[int], thresholds: list[float], source: str,
+) -> ScaleLockedSampleResult:
+    """One denoising trajectory that grows its grid at the planned steps.
+
+    The first segment is exactly the planner's prefix (same noise, sampler and
+    stochastic seeds). At each transition the *noisy state* is spectrally
+    expanded, rescaled and moved to its aligned sigma; no denoised prediction
+    is used as a start image and no earlier image is re-noised. Each segment
+    is a separate native sampler call at its own shape, so ComfyUI loads the
+    model for the true latent size, Spectrum forecasts never cross a
+    resolution change, and multistep or PECE history restarts at first order
+    (it cannot be carried across a change of grid). Stochastic increments
+    keep the patch-coupled per-step seeds of the other modes.
+    """
+    target = highres_latent["samples"]
+    sizes = ([tuple(map(int, lowres_latent["samples"].shape[-2:]))]
+             + [tuple(map(int, hw)) for hw in stage_hw] + [tuple(map(int, target.shape[-2:]))])
+    device = _resolve_sampler_device(model, target.device)
+    low = lowres_latent["samples"].to(device=device, dtype=target.dtype, non_blocking=True)
+    noise = prepare_noise(low, seed=int(seed), batch_inds=lowres_latent.get("batch_index", None)).to(
+        device=device, dtype=target.dtype, non_blocking=True
+    )
+    noise_scale = float(getattr(_model_sampling_obj(model), "noise_scale", 1.0))
+    total = len(sigmas) - 1
+    bounds = [0] + list(steps_at) + [total]
+    shapes = tuple(tuple(noise.shape[:-2]) + hw for hw in sizes[1:])
+    disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+    state = None
+    lowres_x0 = None
+    final_x0: dict = {}
+    calls = []
+    out = None
+    for index, hw in enumerate(sizes):
+        start, end = bounds[index], bounds[index + 1]
+        final = index == len(sizes) - 1
+        segment = sigmas[start:end + 1].clone()
+        if index == 0:
+            segment_noise, segment_latent = noise, low
+        else:
+            sigma = float(sigmas[start])
+            state, aligned = expand_flow_state(
+                state, hw, sigma, seed=_progressive_expansion_seed(seed, index - 1), noise_scale=noise_scale
+            )
+            segment[0] = aligned
+            _LOGGER.info(
+                "Krea 2 spectral_progressive transition %d at step %d: %sx%s -> %sx%s, "
+                "sigma %.6f -> aligned %.6f (threshold %.6f, %s schedule)",
+                index, start, sizes[index - 1][1] * 8, sizes[index - 1][0] * 8, hw[1] * 8, hw[0] * 8,
+                sigma, aligned, thresholds[index - 1], source,
+            )
+            # Empty latent plus noise = state / (sigma * s) makes ComfyUI's
+            # flow noise scaling reproduce the expanded state exactly.
+            segment_noise = state.to(torch.float32) / (aligned * noise_scale)
+            state = None
+            segment_latent = torch.zeros_like(segment_noise)
+        sampler = _krea2_sampler_object(
+            sampler_name, sampler_options, model=model, low_shape=tuple(noise.shape),
+            stage_shapes=shapes, stage_index=index - 1, seed=int(seed), start_step=start,
+            sigmas=segment, noise_like=segment_noise,
+        )
+        guider = create_cfg_guider(model, positive, negative, cfg)
+        counter = [0]
+        predict_native = guider.predict_noise
+
+        def _counted(self, x, timestep, model_options=None, seed=None, _native=predict_native, _counter=counter):
+            _counter[0] += 1
+            return _native(x, timestep, model_options=model_options, seed=seed)
+
+        guider.predict_noise = types.MethodType(_counted, guider)
+        x0_holder: dict = {}
+        callback = make_preview_callback(model, len(segment) - 1, x0_holder)
+        out = guider.sample(
+            segment_noise, segment_latent, sampler, segment, denoise_mask=None,
+            callback=callback, disable_pbar=disable_pbar, seed=int(seed),
+        )
+        calls.append((hw, end - start, counter[0]))
+        del segment_noise, segment_latent
+        if index == 0 and "x0" in x0_holder:
+            lowres_x0 = x0_holder["x0"]
+        if final:
+            final_x0 = x0_holder
+        else:
+            # ComfyUI returns process_latent_out(x / (1 - sigma_end)); invert the
+            # affine latent format to recover the internal noisy state exactly.
+            sigma_end = float(sigmas[end])
+            state = (1.0 - sigma_end) * model.model.process_latent_in(
+                out.to(device=device, dtype=torch.float32)
+            )
+            out = None
+    _LOGGER.info(
+        "Krea 2 spectral_progressive: %s",
+        "; ".join(f"{w * 8}x{h * 8}: {n} steps, {c} denoiser calls" for (h, w), n, c in calls),
+    )
+    samples = out.to(comfy.model_management.intermediate_device())
+    result = clean_latent(highres_latent)
+    result["samples"] = samples
+    planner = clean_latent(lowres_latent)
+    if lowres_x0 is not None:
+        planner["samples"] = model.model.process_latent_out(lowres_x0.detach().to(torch.float32)).cpu()
+    denoised = result
+    if "x0" in final_x0:
+        denoised = clean_latent(highres_latent)
+        denoised["samples"] = model.model.process_latent_out(final_x0["x0"].detach().to(torch.float32)).cpu()
+    return ScaleLockedSampleResult(output=result, lowres_planner=planner, denoised_output=denoised)
+
+
+def _log_trajectory_spectral_advisory(calibration, delta, lock_sigma, sizes) -> None:
+    """Report, without changing sampling, the lowest release sigma at which the
+    frequencies each trajectory handoff cannot carry are still noise dominated."""
+    for src, dst in zip(sizes[:-1], sizes[1:]):
+        bound = handoff_activation_sigma(src, dst, calibration, delta)
+        message = (
+            "Krea 2 trajectory spectral check %sx%s -> %sx%s: frequencies above the source grid become "
+            "informative below sigma %.4f (delta %.3g); composition_lock_sigma is %.4f"
+        )
+        args = (src[1] * 8, src[0] * 8, dst[1] * 8, dst[0] * 8, bound, delta, lock_sigma)
+        if lock_sigma < bound:
+            _LOGGER.warning(message + ", so the target starts after detail it cannot recover has formed "
+                            "(risk of defocus); sampling is unchanged", *args)
+        else:
+            _LOGGER.info(message, *args)
+
+
 def run_scale_locked_ksampler(
     *,
     model,
@@ -1958,6 +2147,9 @@ def run_scale_locked_ksampler(
     planner_fidelity_strength: float = 0.0,
     planner_detail_strength: float = 0.20,
     latent_upscale_method: str = "interpolate",
+    progressive_transition_sigmas: Optional[list] = None,
+    spectral_calibration: Optional[dict] = None,
+    spectral_tolerance: float = 0.01,
 ) -> ScaleLockedSampleResult:
     if steps < 1:
         raise ValueError("steps must be >= 1")
@@ -1967,6 +2159,30 @@ def run_scale_locked_ksampler(
         raise ValueError("planner_final_native_refine requires latent_upscale_method=sesqui_wan21")
     if regeneration_mode not in REGENERATION_MODES:
         raise ValueError(f"regeneration_mode must be one of {', '.join(REGENERATION_MODES)}")
+    progressive = regeneration_mode == "spectral_progressive"
+    if (isinstance(spectral_tolerance, bool) or not isinstance(spectral_tolerance, (int, float))
+            or not math.isfinite(spectral_tolerance) or not 0.0 < spectral_tolerance < 1.0):
+        raise ValueError("spectral_tolerance must lie strictly between 0 and 1")
+    if progressive:
+        if latent_upscale_method != "interpolate":
+            raise ValueError("spectral_progressive expands the noisy state spectrally and never enlarges a "
+                             "completed latent; set latent_upscale_method=interpolate")
+        if handoff_diagnostics == "log_and_save_latents":
+            raise ValueError("spectral_progressive has no planner handoff latents to save; "
+                             "use handoff_diagnostics=off or log")
+        if (config.lock_strength != 0.0 or config.mid_strength != 0.0 or config.spatial_mask is not None
+                or config.manifold_enabled):
+            raise ValueError("spectral_progressive does not use planner trajectory anchors; "
+                             "set coarse_lock_strength and mid_lock_strength to 0")
+        if denoise != 1.0 or not add_noise:
+            raise ValueError("spectral_progressive requires a full denoising pass with added noise")
+        if isinstance(latent_image.get("noise_mask"), torch.Tensor):
+            raise ValueError("spectral_progressive does not support latent noise masks")
+        if not isinstance(_model_sampling_obj(model), comfy.model_sampling.CONST):
+            raise ValueError("spectral_progressive requires flow-matching (CONST) model sampling")
+    elif progressive_transition_sigmas:
+        raise ValueError("progressive_transition_sigmas is only used by regeneration_mode=spectral_progressive; "
+                         "clear it")
     # A trajectory's first target stage is driven by intermediate planner x0
     # predictions, not an enlarged completed latent. In a one-stage trajectory
     # there is no clean-latent handoff for SesquiLSR. Preserve the original
@@ -2038,6 +2254,43 @@ def run_scale_locked_ksampler(
     if sigmas.numel() == 0:
         out = clean_latent(highres_latent)
         return ScaleLockedSampleResult(output=out, lowres_planner=clean_latent(lowres_latent), denoised_output=out)
+
+    if progressive:
+        latent_format, channels = _latent_format_identity(model)
+        plan_schedule = (effective_er_sde_sigmas(sigmas, model) if sampler_name in SNR_SOLVER_NAMES else sigmas)
+        sizes = ([tuple(map(int, lowres_latent["samples"].shape[-2:]))] + [tuple(map(int, hw)) for hw in stage_hw]
+                 + [tuple(map(int, highres_latent["samples"].shape[-2:]))])
+        thresholds, steps_at, source = plan_spectral_progressive(
+            schedule=[float(v) for v in plan_schedule.tolist()], sizes=sizes,
+            transition_sigmas=progressive_transition_sigmas, calibration=spectral_calibration,
+            delta=float(spectral_tolerance), composition_lock_sigma=config.full_lock_sigma,
+            latent_format=latent_format, channels=channels,
+        )
+        if source == "spectral":
+            _LOGGER.info("Krea 2 spectral calibration: %s; tolerance %.3g; thresholds %s",
+                         describe_calibration(spectral_calibration), float(spectral_tolerance),
+                         ", ".join(f"{v:.4f}" for v in thresholds))
+        return _run_spectral_progressive(
+            model=model, positive=positive, negative=negative, cfg=cfg, sampler_name=sampler_name,
+            sigmas=sigmas, highres_latent=highres_latent, lowres_latent=lowres_latent,
+            stage_hw=tuple(stage_hw), seed=int(seed), sampler_options=sampler_options,
+            steps_at=steps_at, thresholds=thresholds, source=source,
+        )
+    if spectral_calibration is not None:
+        # Outside spectral_progressive the calibration is advisory only: an
+        # unusable calibration is reported but never alters or blocks sampling.
+        if regeneration_mode == "trajectory" and config.full_lock_sigma is not None:
+            sizes = ([tuple(map(int, lowres_latent["samples"].shape[-2:]))] + [tuple(map(int, hw)) for hw in stage_hw]
+                     + [tuple(map(int, highres_latent["samples"].shape[-2:]))])
+            try:
+                latent_format, channels = _latent_format_identity(model)
+                validate_calibration(spectral_calibration, latent_format=latent_format, channels=channels)
+                _log_trajectory_spectral_advisory(spectral_calibration, float(spectral_tolerance),
+                                                  float(config.full_lock_sigma), sizes)
+            except ValueError as exc:
+                _LOGGER.warning("Krea 2 trajectory spectral check skipped: %s", exc)
+        else:
+            _LOGGER.info("Krea 2 %s: spectral_calibration is not used by this mode", regeneration_mode)
 
     if img2img:
         # Reject unusable configurations before spending the planner pass.

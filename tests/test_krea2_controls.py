@@ -7,6 +7,7 @@ verified without introducing a second implementation of the node.
 from __future__ import annotations
 
 import ast
+import importlib.util
 from contextlib import nullcontext
 import math
 from pathlib import Path
@@ -17,6 +18,9 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
+_SPECTRAL_SPEC = importlib.util.spec_from_file_location("slrd_controls_spectral", ROOT / "spectral_progressive.py")
+spectral = importlib.util.module_from_spec(_SPECTRAL_SPEC)
+_SPECTRAL_SPEC.loader.exec_module(spectral)
 SAMPLERS = ("euler", "dpmpp_2m", "res_multistep", "deis", "ipndm", "ipndm_v", "gradient_estimation", "er_sde", "sa_solver", "sa_solver_pece")
 
 
@@ -79,6 +83,7 @@ def _node():
         "sa_native_only_scope": lambda enabled: nullcontext(),
         "ScaleLockConfig": SimpleNamespace,
         "run_scale_locked_ksampler": run,
+        "parse_transition_sigmas": spectral.parse_transition_sigmas,
         "logger": SimpleNamespace(info=lambda *args: None, warning=lambda *args: None),
     }
     exec(compile(ast.Module(body=[cls], type_ignores=[]), str(ROOT / "nodes.py"),
@@ -103,10 +108,14 @@ def test_existing_widget_slots_and_explicit_defaults():
         "regeneration_mode", "img2img_start_sigma", "handoff_diagnostics",
         "planner_fidelity_strength", "planner_detail_strength",
         "latent_upscale_method",
+        "progressive_transition_sigmas", "spectral_tolerance", "spectral_calibration",
     ]
     assert schema["optional"]["latent_upscale_method"][0] == ["interpolate", "sesqui_wan21"]
     assert schema["optional"]["latent_upscale_method"][1]["default"] == "interpolate"
-    assert schema["optional"]["regeneration_mode"][0] == ["trajectory", "planner_final_img2img", "planner_final_upscale_only", "planner_final_native_refine"]
+    assert schema["optional"]["regeneration_mode"][0] == ["trajectory", "planner_final_img2img", "planner_final_upscale_only", "planner_final_native_refine", "spectral_progressive"]
+    assert schema["optional"]["progressive_transition_sigmas"][1]["default"] == ""
+    assert schema["optional"]["spectral_tolerance"][1]["default"] == 0.01
+    assert schema["optional"]["spectral_calibration"][0] == "SLRD_SPECTRUM"
     assert schema["optional"]["regeneration_mode"][1]["default"] == "trajectory"
     assert schema["optional"]["img2img_start_sigma"][1]["default"] == 0.65
     assert schema["optional"]["handoff_diagnostics"][0] == ["off", "log", "log_and_save_latents"]
