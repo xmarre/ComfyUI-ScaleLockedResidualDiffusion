@@ -458,3 +458,43 @@ def test_staged_trajectory_rejects_lock_without_a_locked_prefix():
     assert not calls
     node.sample(*args, composition_lock_sigma=1.0, max_stage_upscale=0.0)
     assert calls[-1]["stage_hw"] == ()
+
+
+def test_saved_workflows_keep_defaults_and_disable_progressive_inputs():
+    node, calls, args = _node()
+    node.sample(*args)
+    call = calls[-1]
+    assert call["regeneration_mode"] == "trajectory"
+    assert call["progressive_transition_sigmas"] == []
+    assert call["spectral_calibration"] is None
+    assert call["spectral_tolerance"] == 0.01
+
+
+def test_spectral_progressive_routes_parsed_sigmas_and_calibration():
+    node, calls, args = _node()
+    calibration = {"type": "SLRD_SPECTRUM"}
+    node.sample(*args, regeneration_mode="spectral_progressive", stage_megapixels="2",
+                progressive_transition_sigmas="0.9, 0.6", spectral_tolerance=0.02)
+    assert calls[-1]["regeneration_mode"] == "spectral_progressive"
+    assert calls[-1]["progressive_transition_sigmas"] == [0.9, 0.6]
+    assert calls[-1]["spectral_tolerance"] == 0.02
+    node.sample(*args, regeneration_mode="spectral_progressive", spectral_calibration=calibration)
+    assert calls[-1]["spectral_calibration"] is calibration
+    assert calls[-1]["progressive_transition_sigmas"] == []
+
+
+def test_spectral_progressive_staged_run_skips_trajectory_release_validation():
+    # Staged trajectory runs require a locked prefix; progressive runs plan
+    # their own transitions and must not inherit that rejection.
+    node, calls, args = _node()
+    node.sample(*args, regeneration_mode="spectral_progressive", stage_megapixels="2",
+                composition_lock_sigma=1.0, progressive_transition_sigmas="0.9, 0.6")
+    assert calls[-1]["regeneration_mode"] == "spectral_progressive"
+
+
+@pytest.mark.parametrize("text", ["0.5, 0.7", "1.2", "x"])
+def test_invalid_progressive_transition_sigmas_rejected_before_sampling(text):
+    node, calls, args = _node()
+    with pytest.raises(ValueError, match="progressive_transition_sigmas"):
+        node.sample(*args, regeneration_mode="spectral_progressive", progressive_transition_sigmas=text)
+    assert not calls
