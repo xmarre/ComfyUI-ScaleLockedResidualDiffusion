@@ -428,3 +428,24 @@ def test_native_refine_rejects_trajectory_band_locks(index):
         node.sample(*args, regeneration_mode="planner_final_native_refine",
                     latent_upscale_method="sesqui_wan21")
     assert not calls
+
+
+def test_staged_upscale_only_ignores_composition_lock():
+    # planner_final_upscale_only never uses the composition lock, so a lock
+    # value that would leave no released step must not reject staged runs.
+    node, calls, args = _node()
+    node.sample(*args, regeneration_mode="planner_final_upscale_only",
+                composition_lock_sigma=0.0, stage_megapixels="2")
+    assert calls[-1]["regeneration_mode"] == "planner_final_upscale_only"
+    assert calls[-1]["stage_hw"]
+
+
+def test_staged_trajectory_rejects_lock_without_a_locked_prefix():
+    # At composition_lock_sigma=1.0 later stages would restart at sigma 1
+    # and discard the enlarged previous stage.
+    node, calls, args = _node()
+    with pytest.raises(ValueError, match="below the first schedule sigma"):
+        node.sample(*args, composition_lock_sigma=1.0, stage_megapixels="2")
+    assert not calls
+    node.sample(*args, composition_lock_sigma=1.0, max_stage_upscale=0.0)
+    assert calls[-1]["stage_hw"] == ()

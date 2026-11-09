@@ -387,8 +387,12 @@ runtime and does not load weights independently.
   after one generation with `handoff_diagnostics=log_and_save_latents`.
   The loader reads the latest **complete** run directly from ComfyUI's
   output directory, without manual file copying. Five labeled VAEDecode /
-  PreviewImage pairs show: **A** the finished planner; **B** the clean
-  enlarged first-stage source *before denoising*; **C** first-stage initial
+  PreviewImage pairs show: **A** the finished planner; **B** the finished
+  planner enlarged to the first-stage size. In the planner-final modes this
+  is the clean latent the first stage re-noises and starts from. In
+  `trajectory` mode it is only a reference: the first stage starts from noise
+  and follows the planner's intermediate predictions, so artifacts in B do
+  not come from the trajectory handoff. **C** first-stage initial
   x0 prediction; **D** the completed first high-resolution stage; and
   **E** the actual final sampler latent. The completed-stage and final
   files come directly from the native sampler return values, not x0

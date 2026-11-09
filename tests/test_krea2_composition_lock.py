@@ -594,3 +594,12 @@ def test_img2img_continuous_start_obeys_original_exact_points():
 def test_img2img_start_index_rejects_start_at_first_sigma():
     with pytest.raises(ValueError, match="first schedule sigma"):
         runtime.img2img_start_index([0.9, 0.5, 0.0], 0.95)
+
+
+def test_img2img_stage_sde_increments_are_separate_from_planner_and_forward_noise():
+    seed = 892748339710310
+    planner = seed
+    for index in range(3):
+        sde = runtime._img2img_sde_seed(seed, index)
+        assert sde not in (planner, runtime._img2img_root_seed(seed, index), runtime._stage_seed(seed, index))
+    assert len({runtime._img2img_sde_seed(seed, i) for i in range(3)}) == 3

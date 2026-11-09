@@ -160,7 +160,7 @@
       "flags": {},
       "order": 3,
       "mode": 0,
-      "title": "B — Resized source, BEFORE denoising",
+      "title": "B — Enlarged finished planner (img2img start; trajectory: reference only)",
       "inputs": [
         {
           "name": "samples",
@@ -272,7 +272,7 @@
       "flags": {},
       "order": 6,
       "mode": 0,
-      "title": "B — RESIZED CLEAN LATENT",
+      "title": "B — ENLARGED FINISHED PLANNER (trajectory: reference, not the start)",
       "inputs": [
         {
           "name": "images",

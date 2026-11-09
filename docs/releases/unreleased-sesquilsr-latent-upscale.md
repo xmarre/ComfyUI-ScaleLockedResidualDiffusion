@@ -99,6 +99,13 @@ Cost on CPU (4 threads, fp32, one image): 2.8 s / +0.8 GiB peak memory for
 1408 px → 3552 px jump. GPU time was not measured. No DiT evaluations are
 added.
 
+GPU memory: the upscaler runs between diffusion passes while the DiT may still
+be loaded. If it runs out of GPU memory, ComfyUI is asked to unload its
+managed models from that device (they reload for the next sampling pass) and
+the enlargement is retried once. If memory is still insufficient, the
+enlargement runs on the CPU and a warning is logged, instead of the
+generation aborting.
+
 Structural checks: the lightweight suite runs the real weights for exact
 sizes, BCHW/BC1HW layouts, batches, multi-pass splits, determinism, equality
 with direct upstream inference, and rejection of missing or corrupted

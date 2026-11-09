@@ -2,24 +2,20 @@
 
 ## New optional controls on `Krea 2 Turbo Flow-Aligned Regenerate [Experimental]`
 
-The three controls are appended after the existing optional inputs. Saved
+Five controls are appended after the existing optional inputs. Saved
 workflows keep their widget values and the existing behavior.
 
-- `regeneration_mode`: `trajectory` (default) or `planner_final_img2img`.
-- `img2img_start_sigma`: start noise level for `planner_final_img2img`
-  (default 0.65).
+- `regeneration_mode`: `trajectory` (default), `planner_final_img2img`,
+  `planner_final_upscale_only` or `planner_final_native_refine`.
+- `img2img_start_sigma`: start noise level for `planner_final_img2img` and
+  the refinement of `planner_final_native_refine` (default 0.65).
 - `handoff_diagnostics`: `off` (default), `log` or `log_and_save_latents`.
-- `planner_fidelity_strength`: 0 (disabled, default) to 1,
-  opt-in in `planner_final_img2img` only, constraining target
-  predictions and completed stages to preserve the finished planner's
-  downsampled latent image.
-- `planner_detail_strength`: default 0.20, range 0–1. Active only with
-  nonzero planner fidelity. Caps source-relative high-resolution nullspace
-  innovation to the selected fraction at every target prediction and at
-  completion of each stage. Zero preserves source detail, one reproduces
-  the earlier unconstrained-detail projection.
+- `planner_fidelity_strength`: inactive compatibility control. It must stay 0;
+  a nonzero value is rejected before sampling (see below).
+- `planner_detail_strength`: inactive compatibility control, kept only for
+  saved-workflow widget order. It has no effect.
 
-## The two regeneration modes
+## The regeneration modes
 
 **`trajectory` (unchanged).** Above `composition_lock_sigma`, the first
 high-resolution stage uses the planner's intermediate denoised predictions in
@@ -28,6 +24,17 @@ Below that sigma it refines freely. Later resolution stages re-noise the
 finished image of the stage below to the lock-release sigma. Outputs are
 bitwise identical to the previous version for every sampler, with and without
 resolution stages and Spectrum.
+
+**`planner_final_upscale_only` (new).** The planner runs to completion and
+its clean latent is enlarged to the output size with `latent_upscale_method`,
+through any intermediate stages. No high-resolution denoising runs, so the
+target pass makes zero model evaluations and adds no new texture.
+
+**`planner_final_native_refine` (new).** The planner runs to completion, one
+img2img refinement runs at most 2048 pixels per axis, and the refined latent
+is enlarged to the output size with SesquiLSR, with no diffusion above 2048
+pixels. Requires `latent_upscale_method=sesqui_wan21`; `stage_megapixels`
+must be empty.
 
 **`planner_final_img2img` (new).** The planner runs to completion. Every
 high-resolution stage then starts from a finished image:
@@ -49,7 +56,9 @@ high-resolution stage then starts from a finished image:
    solver steps. Both the effective sigma and step count are logged.
 4. The selected native solver runs that schedule suffix to zero from a fresh
    start. ER-SDE and SA-Solver keep their patch-coupled stochastic increments,
-   which are indexed by the absolute schedule step.
+   indexed by the absolute schedule step, but draw them from a per-stage seed
+   separate from the planner's and from the stage's forward noise, so they are
+   independent of the noise that produced the finished source.
 
 In this mode, `composition_lock_sigma` is not used, and nonzero
 `coarse_lock_strength` or `mid_lock_strength` is rejected. Lower start sigmas

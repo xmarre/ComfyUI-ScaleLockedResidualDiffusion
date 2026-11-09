@@ -1,6 +1,7 @@
 """Directly loading Scale-Locked Krea 2 diagnostics from output is safe and cache-aware."""
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,18 +37,45 @@ def test_latest_complete_and_explicit_run(tmp_path, monkeypatch):
         "folder_paths",
         SimpleNamespace(get_output_directory=lambda: str(tmp_path)),
     )
-    write_run(tmp_path, "earlier", 1)
-    write_run(tmp_path, "latest_good", 10)
-    write_run(tmp_path, "incomplete", 100, all_three=False)
+    # Names sort opposite to age: "latest" must follow planner modification
+    # time, not lexical order.
+    earlier = write_run(tmp_path, "z_earlier", 1)
+    newer = write_run(tmp_path, "a_latest_good", 10)
+    incomplete = write_run(tmp_path, "incomplete", 100, all_three=False)
+    planner = module._DIAGNOSTIC_FILES[0]
+    os.utime(earlier / planner, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(newer / planner, ns=(2_000_000_000, 2_000_000_000))
+    os.utime(incomplete / planner, ns=(3_000_000_000, 3_000_000_000))
     assert Loader.VALIDATE_INPUTS("latest") is True
 
     values = Loader().load("latest")
     assert [int(x["samples"].flatten()[0]) for x in values] == [10, 11, 12, 13, 14]
-    assert [int(x["samples"].flatten()[0]) for x in Loader().load("earlier")] == [1, 2, 3, 4, 5]
+    assert [int(x["samples"].flatten()[0]) for x in Loader().load("z_earlier")] == [1, 2, 3, 4, 5]
     signature = Loader.IS_CHANGED("latest")
-    assert signature[0] == "latest_good"
+    assert signature[0] == "a_latest_good"
     assert len(signature[1]) == 5
     assert all(x["samples"].shape[2] == 1 for x in values)
+
+
+def test_selected_run_signature_tracks_every_file(tmp_path, monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "folder_paths",
+        SimpleNamespace(get_output_directory=lambda: str(tmp_path)),
+    )
+    folder = write_run(tmp_path, "selected", 1)
+    for index, filename in enumerate(module._DIAGNOSTIC_FILES):
+        before = Loader.IS_CHANGED("selected")
+        samples = torch.full((1, 16, 1, 9 + index, 9 + index), 50.0)
+        safetensors.torch.save_file(
+            {"latent_tensor": samples, "latent_format_version_0": torch.empty(0)},
+            str(folder / filename),
+        )
+        stamp = 5_000_000_000 + index
+        os.utime(folder / filename, ns=(stamp, stamp))
+        after = Loader.IS_CHANGED("selected")
+        assert after != before, filename
+        assert after[1][index] != before[1][index]
 
 
 @pytest.mark.parametrize("name", ["../escape", "/tmp/escape", ".", "..", "foo/bar", "foo\\bar"])

@@ -920,7 +920,15 @@ def _run_lowres_planner(
                 raise RuntimeError("SA-PECE planner unexpectedly evaluated a step more than twice")
             result = predict_native(x, timestep, model_options=model_options, seed=seed)
             if calls_per_step[index] == 2:
-                pece_corrections[index] = result.detach().to(
+                corrected = result
+                if isinstance(noise_mask, torch.Tensor):
+                    # Predictor anchors come from the sampler callback, after
+                    # KSamplerX0Inpaint's mask blend. Apply the same blend so
+                    # corrected anchors match them outside the denoised region.
+                    corrected = _blend_like_inpaint(
+                        self, corrected, timestep, noise_mask, latent_samples, sigmas, model_options or {}
+                    )
+                pece_corrections[index] = corrected.detach().to(
                     device="cpu", dtype=_store_dtype_for(latent_samples)
                 ).contiguous().clone()
             return result
@@ -955,6 +963,27 @@ def _run_lowres_planner(
                for i in range(len(calls_per_step))):
             raise RuntimeError("SA-PECE corrected planner prediction is missing")
     return out, recorder.x0_steps, planner_sigmas, planner_noise, pece_corrections
+
+
+def _blend_like_inpaint(guider, denoised, timestep, noise_mask, latent_samples, sigmas, model_options):
+    """Mirror KSamplerX0Inpaint's output blend for a denoised prediction.
+
+    CFGGuider.sample prepares the mask for the latent shape and moves the
+    latent through process_latent_in unless it is empty; KSamplerX0Inpaint
+    then applies any denoise_mask_function and blends
+    ``out * mask + latent_image * (1 - mask)``.
+    """
+    import comfy.sampler_helpers
+    mask = comfy.sampler_helpers.prepare_mask(noise_mask, tuple(latent_samples.shape), denoised.device)
+    if "denoise_mask_function" in model_options:
+        mask = model_options["denoise_mask_function"](
+            timestep, mask, extra_options={"model": guider, "sigmas": sigmas}
+        )
+    latent_image = latent_samples.to(device=denoised.device)
+    if torch.count_nonzero(latent_image) > 0:
+        latent_image = guider.inner_model.process_latent_in(latent_image)
+    mask = mask.to(device=denoised.device, dtype=denoised.dtype)
+    return denoised * mask + latent_image.to(dtype=denoised.dtype) * (1.0 - mask)
 
 
 def _build_highres_noise(
@@ -1103,6 +1132,33 @@ def _full_lock_handoff(runtime: ScaleLockedRuntimeContext, config: ScaleLockConf
     return locked_steps, clean
 
 
+def _record_fully_locked_diagnostics(diagnostics, runtime, sigmas, completed) -> None:
+    """Handoff diagnostics for a target pass whose every step is locked.
+
+    No callback runs, so record the step-0 prediction the lock consumed (the
+    resized first planner anchor) and its noisy input, then the completed
+    output. The sampled result is not touched.
+    """
+    target = runtime.highres_latent["samples"]
+    hw = tuple(target.shape[-2:])
+    diagnostics.set_planner(runtime.lowres_out["samples"])
+    observe = diagnostics.wrap(
+        lambda *args: None, stage=0, stage_hw=hw, sigmas=sigmas,
+        noise=runtime.highres_noise, source=runtime.lowres_out["samples"],
+        lock_sigma=None,
+    )
+    with torch.no_grad():
+        initial = target.to(dtype=torch.float32)
+        if torch.count_nonzero(initial) > 0:
+            initial = runtime.model.model.process_latent_in(initial)
+        sigma0 = float(sigmas[0])
+        noise_scale = float(getattr(_model_sampling_obj(runtime.model), "noise_scale", 1.0))
+        x = sigma0 * noise_scale * runtime.highres_noise.to(initial) + (1.0 - sigma0) * initial
+        x0 = resize_4d_tensor(runtime.anchors_x0[0].to(device=initial.device, dtype=torch.float32), hw)
+    observe(0, x0, x, len(sigmas) - 1)
+    diagnostics.save_completed(0, completed, final=True)
+
+
 def sample_with_runtime(
     *,
     guider,
@@ -1129,6 +1185,8 @@ def sample_with_runtime(
             out["samples"] = runtime.model.model.process_latent_out(clean).to(
                 comfy.model_management.intermediate_device()
             )
+            if diagnostics is not None:
+                _record_fully_locked_diagnostics(diagnostics, runtime, sigmas, out["samples"])
             return ScaleLockedSampleResult(
                 output=out, lowres_planner=clean_latent(runtime.lowres_out), denoised_output=out
             )
@@ -1265,6 +1323,13 @@ def _run_resolution_ladder(
     release = full_lock_prefix_length(sigma_values, config.full_lock_sigma)
     if release >= total_steps:
         raise ValueError("resolution stages need at least one step after the composition lock")
+    if release == 0:
+        # Later stages restart at sigma[release]; at the first schedule sigma
+        # (pure noise) they would discard the enlarged previous stage.
+        raise ValueError(
+            "resolution stages need composition_lock_sigma below the first schedule sigma, "
+            "so later stages re-noise the enlarged image instead of restarting from noise"
+        )
     sizes = [tuple(map(int, hw)) for hw in stage_hw] + [tuple(map(int, target.shape[-2:]))]
     previous = tuple(map(int, lowres_latent["samples"].shape[-2:]))
     for hw in sizes:
@@ -1393,6 +1458,11 @@ def _img2img_root_seed(seed: int, stage_index: int) -> int:
     return _stage_seed(int(seed) ^ 0xA24BAED4963EE407, stage_index)
 
 
+def _img2img_sde_seed(seed: int, stage_index: int) -> int:
+    """Separate each img2img stage's SDE increments from the planner's and its forward noise."""
+    return _stage_seed(int(seed) ^ 0x3C6EF372FE94F82B, stage_index)
+
+
 def img2img_start_index(sigma_values, start_sigma: float) -> int:
     """Index of the first native sigma at or below the requested img2img start.
 
@@ -1499,10 +1569,14 @@ class Krea2HandoffDiagnostics:
         import os
         import safetensors.torch
         path = os.path.join(self._output_dir(), name + ".latent")
+        # Publish atomically: a loader sharing this output directory must
+        # never select a partially written file.
+        partial = path + ".partial"
         safetensors.torch.save_file({
             "latent_tensor": output_space.detach().to(device="cpu", dtype=torch.float32).contiguous(),
             "latent_format_version_0": torch.tensor([]),
-        }, path)
+        }, partial)
+        os.replace(partial, path)
         self.saved.append(path)
 
     def save_completed(self, stage: int, output_space: torch.Tensor, *, final: bool) -> None:
@@ -1610,6 +1684,10 @@ def _run_planner_final_upscale_only(
         if diagnostics is not None:
             if diagnostics.save:
                 diagnostics._save(f"stage{index}_source_resized", source)
+                # No denoiser runs: the stage's only prediction is the enlarged
+                # latent itself, as for the denoised_output port below. Saving
+                # it keeps the run loadable by the five-panel viewer.
+                diagnostics._save(f"stage{index}_step000_x0", source)
             diagnostics.save_completed(index, source, final=final)
     _LOGGER.info(
         "Krea 2 planner_final_upscale_only: completed planner enlarged through %d latent-only "
@@ -1804,9 +1882,12 @@ def _run_planner_final_img2img(
         # process_latent_in and re-noises it to the start sigma.
         start_latent = _enlarge_stage_source(model, source, hw, stage_samples, latent_upscale_method)
         if sampler_name in SNR_SOLVER_NAMES:
+            # Stochastic increments must also be independent of the noise
+            # that produced the clean source: the planner (or previous stage)
+            # consumed the increments keyed by stochastic_seed at these steps.
             sampler = _krea2_sampler_object(
                 sampler_name, sampler_options, model=model, low_shape=tuple(lowres_noise.shape),
-                stage_shapes=shapes, stage_index=index, seed=stochastic_seed,
+                stage_shapes=shapes, stage_index=index, seed=_img2img_sde_seed(stochastic_seed, index),
                 start_step=start, sigmas=stage_sigmas, noise_like=stage_noise,
             )
         else:

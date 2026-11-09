@@ -3,6 +3,7 @@ name: Krea 2 flow regeneration numerical tests
 on:
   pull_request:
     paths:
+      - "__init__.py"
       - "krea2_flow.py"
       - "slrd_runtime.py"
       - "latent_upscale.py"
@@ -22,6 +23,7 @@ on:
   push:
     branches: [main]
     paths:
+      - "__init__.py"
       - "krea2_flow.py"
       - "slrd_runtime.py"
       - "latent_upscale.py"

@@ -1330,6 +1330,83 @@ def main():
     else:
         raise AssertionError("too few steps for the stages must be rejected before sampling")
 
+    review_regressions(node, model, positive, negative, runtime, base, spec.name)
+
+
+def review_regressions(node, model, positive, negative, runtime, base, package_name):
+    """Diagnostics on zero-DiT paths, and SA-PECE corrected anchors under a noise mask."""
+    import folder_paths
+    import safetensors.torch
+    import torch
+    import tempfile
+    loader = sys.modules[package_name + ".diagnostic_load"]
+    previous_output = folder_paths.get_output_directory()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder_paths.set_output_directory(tmp)
+            # Every target step locked (Euler, no stages, no mask): the target
+            # pass returns before sampling and must still save a loadable run.
+            common = dict(steps=8, sampler_name="euler", max_stage_upscale=0.0, composition_lock_sigma=0.0)
+            with torch.inference_mode():
+                plain = node.sample(model, positive, negative, {"samples": torch.zeros(1, 4, 16, 20)},
+                                    42, .01, 0.0, 0.0, **common)
+                observed = node.sample(model, positive, negative, {"samples": torch.zeros(1, 4, 16, 20)},
+                                       42, .01, 0.0, 0.0, handoff_diagnostics="log_and_save_latents", **common)
+            assert torch.equal(plain[0]["samples"], observed[0]["samples"])
+            directory, paths = loader._resolve_diagnostic_run("latest")
+            final = safetensors.torch.load_file(str(paths[-1]))["latent_tensor"]
+            torch.testing.assert_close(final, observed[0]["samples"].float())
+            print(json.dumps({"case": "fully_locked_diagnostics", "run": directory.name}))
+            # Upscale-only makes no target prediction; its run must still load.
+            with torch.inference_mode():
+                enlarged = node.sample(model, positive, negative, {"samples": torch.zeros(1, 4, 24, 28)},
+                                       42, .01, 0.0, 0.0, steps=8, sampler_name="euler",
+                                       regeneration_mode="planner_final_upscale_only", stage_megapixels="0.02",
+                                       composition_lock_sigma=0.0, handoff_diagnostics="log_and_save_latents")
+            upscaled_dir, upscaled_paths = loader._resolve_diagnostic_run("latest")
+            assert upscaled_dir != directory
+            torch.testing.assert_close(safetensors.torch.load_file(str(upscaled_paths[-1]))["latent_tensor"],
+                                       enlarged[0]["samples"].float())
+            assert not any(p.name.endswith(".partial") for p in upscaled_dir.iterdir())
+            print(json.dumps({"case": "upscale_only_diagnostics", "run": upscaled_dir.name}))
+    finally:
+        folder_paths.set_output_directory(previous_output)
+
+    # SA-PECE planner with a partial latent noise mask: corrected anchors must
+    # carry KSamplerX0Inpaint's blend, i.e. equal the latent where mask == 0.
+    captured = {}
+    original_planner = runtime._run_lowres_planner
+
+    def capture_planner(**kwargs):
+        result = original_planner(**kwargs)
+        captured["latent"] = kwargs["lowres_latent"]
+        captured["corrections"] = result[4]
+        return result
+
+    torch.manual_seed(5)
+    latent = torch.randn(1, 16, 16, 20) * 0.5
+    mask = torch.ones(1, 16, 20)
+    mask[..., :, :10] = 0.0
+    runtime._run_lowres_planner = capture_planner
+    try:
+        with torch.inference_mode():
+            node.sample(model, positive, negative, {"samples": latent, "noise_mask": mask},
+                        42, .01, 0.3, 0.0, steps=8, sampler_name="sa_solver_pece", max_stage_upscale=0.0,
+                        sa_spectrum_forecasts=False)
+    finally:
+        runtime._run_lowres_planner = original_planner
+    low = captured["latent"]
+    import comfy.utils
+    low_mask = comfy.utils.reshape_mask(low["noise_mask"], tuple(low["samples"].shape))
+    kept = base.process_latent_in(low["samples"].float())
+    corrections = [c for c in captured["corrections"] if c is not None]
+    assert corrections
+    for correction in corrections:
+        region = low_mask < 0.5
+        assert bool(region.any())
+        torch.testing.assert_close(correction.float()[region], kept[region], atol=2e-3, rtol=2e-3)
+    print(json.dumps({"case": "sa_pece_masked_corrections", "checked": len(corrections)}))
+
 
 if __name__ == "__main__":
     main()

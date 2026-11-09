@@ -194,3 +194,39 @@ def test_concurrent_first_use_constructs_one_model(monkeypatch):
         results = list(pool.map(lambda _: load(), range(8)))
     assert constructions == [lu.SESQUI_WAN21_CHANNELS]
     assert all(model is results[0] for model in results)
+
+
+@pytest.mark.parametrize("failures, expect_cpu", [(1, False), (2, True)])
+def test_gpu_oom_frees_comfy_memory_then_retries_or_falls_back_to_cpu(monkeypatch, failures, expect_cpu):
+    # A large handoff can exhaust GPU memory while the DiT is still loaded.
+    # The backend frees ComfyUI-managed models and retries once, then runs on
+    # the CPU instead of aborting the generation.
+    devices, freed = [], []
+    oom = getattr(torch, "OutOfMemoryError", torch.cuda.OutOfMemoryError)
+
+    def fake_run(x, hops, device):
+        devices.append(device.type)
+        if device.type != "cpu" and devices.count(device.type) <= failures:
+            raise oom("simulated")
+        return torch.zeros((x.shape[0], x.shape[1]) + tuple(hops[-1]), device=device)
+
+    monkeypatch.setattr(lu, "_run_hops", fake_run)
+    monkeypatch.setattr(lu, "_free_device_memory", lambda device: freed.append(device.type))
+    out = lu.enlarge_completed_latent(_latent(1, 16, 8, 8), (12, 12), "sesqui_wan21",
+                                      device=torch.device("meta"))
+    assert out.shape == (1, 16, 12, 12) and out.device.type == "meta"
+    assert freed == ["meta"] * failures
+    assert devices == (["meta", "meta", "cpu"] if expect_cpu else ["meta", "meta"])
+
+
+def test_cpu_oom_is_not_retried(monkeypatch):
+    oom = getattr(torch, "OutOfMemoryError", torch.cuda.OutOfMemoryError)
+
+    def fake_run(x, hops, device):
+        raise oom("simulated")
+
+    monkeypatch.setattr(lu, "_run_hops", fake_run)
+    monkeypatch.setattr(lu, "_free_device_memory", lambda device: pytest.fail("no retry on CPU"))
+    with pytest.raises(oom):
+        lu.enlarge_completed_latent(_latent(1, 16, 8, 8), (12, 12), "sesqui_wan21",
+                                    device=torch.device("cpu"))

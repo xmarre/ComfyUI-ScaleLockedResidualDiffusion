@@ -152,8 +152,35 @@ def enlarge_completed_latent(source: torch.Tensor, hw, method: str, *, device=No
         out = x.to(device=device or x.device, dtype=torch.float32)
         return out.unsqueeze(2) if temporal else out
     device = torch.device(device) if device is not None else x.device
-    model = _model_for(device)
     hops = sesqui_hops(x.shape[-2:], hw)
+    try:
+        out = _run_hops(x, hops, device)
+    except _OOM_ERRORS:
+        if device.type == "cpu":
+            raise
+        # The DiT can still occupy the GPU at the handoff. Let ComfyUI unload
+        # its managed models (they reload for the next sampling pass) and
+        # retry once; if memory is still short, run on the CPU instead.
+        _free_device_memory(device)
+        try:
+            out = _run_hops(x, hops, device)
+        except _OOM_ERRORS:
+            _free_device_memory(device)
+            import logging
+            logging.getLogger(__name__).warning(
+                "SesquiLSR: out of memory on %s for a %dx%d latent; enlarging on the CPU instead",
+                device, hw[0], hw[1],
+            )
+            out = _run_hops(x, hops, torch.device("cpu")).to(device)
+    return out.unsqueeze(2) if temporal else out
+
+
+_OOM_ERRORS = tuple({getattr(torch, "OutOfMemoryError", torch.cuda.OutOfMemoryError),
+                     torch.cuda.OutOfMemoryError})
+
+
+def _run_hops(x: torch.Tensor, hops, device: torch.device) -> torch.Tensor:
+    model = _model_for(device)
     results = []
     with torch.no_grad():
         # One image at a time bounds activation memory at large canvases.
@@ -161,5 +188,14 @@ def enlarge_completed_latent(source: torch.Tensor, hw, method: str, *, device=No
             for hop in hops:
                 item = model(item, hop)
             results.append(item)
-    out = torch.cat(results, dim=0)
-    return out.unsqueeze(2) if temporal else out
+    return torch.cat(results, dim=0)
+
+
+def _free_device_memory(device: torch.device) -> None:
+    """Ask ComfyUI to unload managed models from ``device`` and release cached blocks."""
+    try:
+        import comfy.model_management as mm
+    except ImportError:
+        return
+    mm.free_memory(1e30, device)
+    mm.soft_empty_cache()

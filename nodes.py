@@ -538,15 +538,23 @@ class Krea2TurboFlowAlignedRegenerate:
                     target_w * 8, target_h * 8,
                 )
         elif stage_hw:
-            # ER-SDE shifts the initial CONST sigma away from 1.0 for finite
-            # log-SNR; lock/release planning must use the sigma actually seen
-            # by the native denoiser, not the nominal outer schedule.
-            lock_schedule = (
-                effective_er_sde_sigmas(torch.tensor(schedule, dtype=torch.float64), model).tolist()
-                if sampler_name in ("er_sde", "sa_solver", "sa_solver_pece") else schedule
-            )
-            if full_lock_prefix_length(lock_schedule, composition_lock_sigma) >= len(schedule) - 1:
-                raise ValueError("resolution stages need at least one step after the composition lock; raise steps or composition_lock_sigma")
+            if not upscale_only:
+                # ER-SDE shifts the initial CONST sigma away from 1.0 for finite
+                # log-SNR; lock/release planning must use the sigma actually seen
+                # by the native denoiser, not the nominal outer schedule.
+                # planner_final_upscale_only never uses the composition lock.
+                lock_schedule = (
+                    effective_er_sde_sigmas(torch.tensor(schedule, dtype=torch.float64), model).tolist()
+                    if sampler_name in ("er_sde", "sa_solver", "sa_solver_pece") else schedule
+                )
+                release = full_lock_prefix_length(lock_schedule, composition_lock_sigma)
+                if release >= len(schedule) - 1:
+                    raise ValueError("resolution stages need at least one step after the composition lock; raise steps or composition_lock_sigma")
+                if release == 0:
+                    raise ValueError(
+                        "resolution stages need composition_lock_sigma below the first schedule sigma; "
+                        "at 1.0 later stages would restart from noise and discard the enlarged image"
+                    )
             logger.info(
                 "Krea 2 resolution stages: planner %sx%s -> %s -> output %sx%s",
                 low_w * 8, low_h * 8, " -> ".join(f"{w * 8}x{h * 8}" for h, w in stage_hw), target_w * 8, target_h * 8,
