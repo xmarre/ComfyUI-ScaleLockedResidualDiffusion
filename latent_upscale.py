@@ -153,30 +153,38 @@ def enlarge_completed_latent(source: torch.Tensor, hw, method: str, *, device=No
         return out.unsqueeze(2) if temporal else out
     device = torch.device(device) if device is not None else x.device
     hops = sesqui_hops(x.shape[-2:], hw)
-    try:
+    if device.type == "cpu":
+        # Preserve the original CPU failure, including its traceback.
         out = _run_hops(x, hops, device)
-    except _OOM_ERRORS:
-        if device.type == "cpu":
-            raise
-        # The DiT can still occupy the GPU at the handoff. Let ComfyUI unload
-        # its managed models (they reload for the next sampling pass) and
-        # retry once; if memory is still short, run on the CPU instead.
-        _free_device_memory(device)
-        try:
-            out = _run_hops(x, hops, device)
-        except _OOM_ERRORS:
+    else:
+        out = _run_hops_or_oom(x, hops, device)
+        if out is None:
+            # Complete the failed invocation's exception handler before
+            # freeing memory or retrying: its traceback may retain the
+            # model's intermediate GPU tensors.
             _free_device_memory(device)
-            import logging
-            logging.getLogger(__name__).warning(
-                "SesquiLSR: out of memory on %s for a %dx%d latent; enlarging on the CPU instead",
-                device, hw[0], hw[1],
-            )
-            out = _run_hops(x, hops, torch.device("cpu")).to(device)
+            out = _run_hops_or_oom(x, hops, device)
+            if out is None:
+                _free_device_memory(device)
+                import logging
+                logging.getLogger(__name__).warning(
+                    "SesquiLSR: out of memory on %s for a %dx%d latent; enlarging on the CPU instead",
+                    device, hw[0], hw[1],
+                )
+                out = _run_hops(x, hops, torch.device("cpu")).to(device)
     return out.unsqueeze(2) if temporal else out
 
 
 _OOM_ERRORS = tuple({getattr(torch, "OutOfMemoryError", torch.cuda.OutOfMemoryError),
                      torch.cuda.OutOfMemoryError})
+
+
+def _run_hops_or_oom(x: torch.Tensor, hops, device: torch.device) -> torch.Tensor | None:
+    """End the failed call's traceback lifetime before retrying on any device."""
+    try:
+        return _run_hops(x, hops, device)
+    except _OOM_ERRORS:
+        return None
 
 
 def _run_hops(x: torch.Tensor, hops, device: torch.device) -> torch.Tensor:
