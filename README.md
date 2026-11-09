@@ -298,6 +298,125 @@ runtime and does not load weights independently.
     better than the trajectory mode is not yet established: compare both
     modes at the same seed, prompt, sizes, sampler and steps, with the
     `lowres_planner` output as the reference.
+- **Spectral progressive sampling** (`regeneration_mode=spectral_progressive`,
+  experimental). An optional fifth mode that runs **one** denoising trajectory
+  instead of a planner pass plus high-resolution passes. It starts at the
+  planner size and grows to each intermediate stage and then to the output
+  size during sampling, so early, noise-dominated steps run on smaller grids.
+  It implements the spectral noise expansion and transition scheduling of
+  *Spectral Progressive Diffusion* (Xiao et al., 2026,
+  [arXiv:2605.18736](https://arxiv.org/abs/2605.18736); official MIT
+  reference implementation [howardhx/speed](https://github.com/howardhx/speed)).
+  The implementation here is independent; no third-party code is included.
+  - **Transition.** At each transition the sampler's *noisy state*, not a
+    denoised prediction, is carried to the larger grid. Its orthonormal 2-D
+    DCT coefficients are kept, every new higher-frequency coefficient receives
+    fresh Gaussian noise of the current noise level, the state is rescaled by
+    `kappa = r / (1 + (r - 1) sigma)` and sampling continues at the aligned
+    noise level `sigma~ = kappa * sigma`, with `r` the square root of the
+    actual latent-area ratio. With `x = (1 - sigma) x0 + sigma * noise`,
+    this gives a state of exactly the same form at `sigma~`: the noise is
+    exactly white Gaussian of variance `sigma~^2`, and the low-frequency image
+    content keeps its amplitude. Only the image content above the smaller
+    grid's resolution is missing, which is why transitions must happen while
+    those frequencies are still dominated by noise. The expansion runs on
+    the sampler device in float32 with separable `n x n` DCT bases (under
+    0.1 s on CPU for a 2048 px to 4096 px transition); it adds no denoiser
+    evaluations.
+  - **Why this does not repeat the rejected staggered ladder.** The rejected
+    ladder started later stages from mid-schedule *denoised predictions*,
+    which are blurry averages, at a lower noise level, so the blur was
+    rendered as defocus and speckle. Here no prediction is ever used as an
+    image: the true noisy state continues on the larger grid, and the time
+    alignment makes its noise level consistent with its content. The two
+    remaining requirements are the transition schedule (frequencies that the
+    smaller grid cannot carry must still be noise dominated) and the latent
+    content of the small grid behaving like a low-pass version of the large
+    one; the second is an assumption, not a guarantee.
+  - **Transition schedule.** Exactly one source is used and logged:
+    `progressive_transition_sigmas` (one value per resolution change,
+    strictly decreasing; each transition happens at the first step whose
+    sigma is at or below its value); otherwise a connected
+    `spectral_calibration` (below); otherwise, for a single transition only,
+    `composition_lock_sigma`, i.e. the same step at which `trajectory` mode
+    releases its composition lock. Transitions that would leave a resolution
+    without a step, or are never reached, are rejected before sampling;
+    nothing is silently re-planned.
+  - **Spectral scheduling.** The `Krea 2 Spectral Calibration (Scale-Locked)`
+    node fits a radial power law `P(w) = A * w^-beta` to clean latents in
+    the model's internal latent space (where sampler noise has unit variance),
+    using an orthonormal FFT, with `w` in cycles per image along the shorter
+    side. It runs no model. Use finished latents near the intended output
+    size, e.g. a completed Krea 2 generation loaded with LoadLatent, or
+    VAE-encoded photos of the content you generate. With tolerance
+    `spectral_tolerance` (`delta`, default 0.01), a frequency stops being
+    noise dominated at `1 / (1 + sqrt(delta / (P (1 + P - delta))))`; each
+    stage hands over at the first schedule sigma at or below that value for
+    the lowest frequency it cannot represent. As in the reference
+    implementation, this uses the output grid's spectrum against the stage's
+    own sigma, which hands over earlier (more conservatively) than a
+    full-resolution-equivalent criterion would. Calibrations are rejected
+    before sampling when the fit is poor (R² below 0.9, exponent outside
+    0.5–5, fewer than 8 frequency bins), when they belong to another latent
+    format or channel count, or when the output's shorter side differs from
+    the calibration's by more than 2x. Within that range the amplitude is
+    rescaled by the squared side ratio (per-pixel latent variance does not
+    depend on resolution); outside it, recalibrate. Preset coefficients
+    measured for other models are deliberately not offered: their latent
+    normalizations differ and they do not transfer to Krea 2.
+  - **Measured Krea 2 spectrum (schedule evidence, not image quality).**
+    Twelve DIV2K photographs, center-cropped to 1024x1024 and encoded with
+    Krea 2's VAE, fit `A = 41.1`, `beta = 1.99` (R² 0.989). Individual photos
+    ranged from `A = 17` to `105` and `beta = 1.70` to `2.37`, so content
+    strongly affects the schedule; calibrate on representative content. On
+    ComfyUI's `simple` schedule for Krea 2 (shift 1.15), a 1024 px to 2048 px
+    transition with that calibration falls at:
+
+    | `delta` | threshold | 8 steps (low / full) | 52 steps (low / full) |
+    |---|---|---|---|
+    | 0.001 | 0.868 | 3 / 5 | 17 / 35 |
+    | 0.01 | 0.675 | 5 / 3 | 32 / 20 |
+    | 0.05 | 0.476 | 7 / 1 | 41 / 11 |
+    | `composition_lock_sigma` 0.80 | 0.80 | 4 / 4 | 23 / 29 |
+
+    These are measured spectra applied to the documented criterion; whether a
+    given split preserves Krea 2 image quality has not been measured.
+  - **Cost.** Each low-resolution step costs a DiT evaluation on the smaller
+    grid instead of the output grid, and no planner pass or repeated
+    high-resolution pass is run. With a 1024 px stage for a 2048 px output
+    and the 0.80 split above, 4 of 8 (Turbo) or 23 of 52 (Raw) evaluations
+    run on a quarter of the tokens. Wall-clock speedup and peak memory on GPU
+    have not been measured.
+  - **Solvers.** All ten offered solvers are supported. Every resolution is a
+    separate native sampler call at its own latent size, so ComfyUI reserves
+    memory for the true size, and multistep history (DPM++ 2M, DEIS, iPNDM,
+    RES Multistep, Gradient Estimation, ER-SDE, SA-Solver) and SA-Solver PECE
+    corrections restart at first order after each transition; derivatives of
+    a smaller grid cannot be reused on a larger one. ER-SDE and SA-Solver
+    keep their seeded, patch-coupled per-step stochastic increments; the new
+    high-frequency coefficients of each transition use their own seeds,
+    separate from the initial noise and from solver increments. The first
+    segment is identical to the planner's first steps in the other modes
+    (same noise, seeds and solver), so its composition starts the same way.
+  - **Spectrum.** Each resolution is its own Spectrum session; a forecast
+    never uses features from a different grid. Warm-up therefore repeats
+    after every transition, which reduces forecast savings.
+  - **Requirements and limits.** `coarse_lock_strength` and
+    `mid_lock_strength` must be 0, `latent_upscale_method` must be
+    `interpolate` (nothing completed is enlarged), latent noise masks and
+    `handoff_diagnostics=log_and_save_latents` are rejected; all of this is
+    checked before any model call. `log` diagnostics are accepted; the mode
+    always logs its transitions, aligned sigmas and denoiser calls per
+    resolution. `sa_planner_spectrum_forecasts` has no effect (there is no
+    separate planner). The `lowres_planner` output holds the denoised
+    prediction at the last small-grid step, not a finished planner image.
+    Identical prompts, seeds and settings reproduce the result exactly.
+  - **In other modes** a connected `spectral_calibration` never changes
+    sampling. In `trajectory` mode it logs, for each handoff, the lowest
+    release sigma at which frequencies above the source grid are still noise
+    dominated, and warns when `composition_lock_sigma` is below it (risk of
+    defocus). `progressive_transition_sigmas` must be empty outside
+    `spectral_progressive`.
 - **Latent upscale method** (`latent_upscale_method`, optional, default
   `interpolate`) chooses how a *completed* lower-resolution latent is
   enlarged before the next stage re-noises and refines it.
@@ -494,6 +613,15 @@ This has been validated for import/compile in this repo, but not against a live 
 
 Utility/debug node to inspect the nested-noise construction separately.
 
+### 7. Krea 2 Spectral Calibration (Scale-Locked)
+
+Fits the clean-latent power spectrum used by `spectral_progressive` transition
+scheduling. Inputs: the Krea 2 `MODEL` (for its latent format) and clean,
+completed `LATENT`s near the intended output size; optional fit band
+`fit_low`/`fit_high` (fractions of Nyquist, default 0.05–0.9). Outputs an
+`SLRD_SPECTRUM` for the Krea 2 node's `spectral_calibration` input and a text
+report. It evaluates no model.
+
 ## Suggested modular workflow
 
 For standard ComfyUI custom sampling:
@@ -593,6 +721,7 @@ What is not implemented yet:
 - `__init__.py` - node registration
 - `nodes.py` - ComfyUI node definitions, public guider node, and Impact hook/provider nodes
 - `slrd_runtime.py` - shared ComfyUI runtime for planner capture, nested noise, guider patching, and final sampling
+- `spectral_progressive.py` - spectral noise expansion, time alignment, transition scheduling and spectrum calibration
 - `latent_upscale.py` - completed-latent enlargement backends (`interpolate`, `sesqui_wan21`)
 - `third_party/sesqui_lsr/` - vendored SesquiLSR architecture, Wan 2.1 weights, MIT license and provenance notice
 - `slrd_core.py` - algorithm core, nested noise, latent resizing, residual locking, trajectory helpers
