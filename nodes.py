@@ -684,8 +684,9 @@ class Krea2SpectralCalibration:
             "required": {
                 "model": ("MODEL", {"tooltip": "The Krea 2 model whose latent format the calibration is for."}),
                 "latent": ("LATENT", {"tooltip": "Clean, completed latents near the intended output size, e.g. "
-                                                 "a finished Krea 2 generation (LoadLatent) or VAE-encoded photos "
-                                                 "of the kind of content you generate. Not noise or empty latents."}),
+                                                 "a finished Krea 2 generation (LoadLatent) or a representative "
+                                                 "photograph via Load Image -> VAE Encode with the Krea 2/Qwen Image VAE. "
+                                                 "Do not connect the Empty Latent or shared target canvas."}),
             },
             "optional": {
                 "fit_low": ("FLOAT", {"default": 0.05, "min": 0.01, "max": 0.9, "step": 0.01,
@@ -703,12 +704,24 @@ class Krea2SpectralCalibration:
         if latent_format is None:
             raise ValueError("Krea 2 spectral calibration requires a diffusion MODEL")
         samples = latent["samples"]
-        if samples.ndim == 5 and samples.shape[2] != 1:
-            raise ValueError("Krea 2 spectral calibration supports single-frame image latents only")
-        if samples.shape[1] != getattr(latent_format, "latent_channels", samples.shape[1]):
-            raise ValueError("calibration latents do not have this model's latent channel count")
+        if samples.ndim not in (4, 5) or (samples.ndim == 5 and samples.shape[2] != 1):
+            raise ValueError("Krea 2 spectral calibration requires a 4-D or single-frame 5-D image latent")
+        # Check the actual content first: EmptyLatentImage normally supplies a
+        # four-channel zero canvas that Krea 2 expands only for generation. It
+        # contains no image spectrum and must never be used for calibration.
         if not bool(torch.count_nonzero(samples)):
-            raise ValueError("calibration latent is empty; connect clean, completed latents")
+            raise ValueError(
+                "Krea 2 spectral calibration cannot use an empty latent canvas (e.g. Empty Latent / "
+                "Shared target latent). Connect a completed Krea 2 latent, or Load Image -> VAE Encode "
+                "with the Krea 2/Qwen Image VAE; do not connect the generation canvas."
+            )
+        expected_channels = int(getattr(latent_format, "latent_channels", samples.shape[1]))
+        if samples.shape[1] != expected_channels:
+            raise ValueError(
+                f"Krea 2 spectral calibration expected {expected_channels} latent channels, "
+                f"received {samples.shape[1]}. Connect a completed Krea 2 latent, or Load Image -> "
+                "VAE Encode with the Krea 2/Qwen Image VAE; the generation canvas is not calibration data."
+            )
         samples = samples.detach().to(device="cpu", dtype=torch.float32)
         if samples.ndim == 4:
             # Wan 2.1-format latent statistics broadcast over a temporal axis.
