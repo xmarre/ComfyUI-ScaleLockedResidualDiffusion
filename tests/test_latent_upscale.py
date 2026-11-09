@@ -219,6 +219,40 @@ def test_gpu_oom_frees_comfy_memory_then_retries_or_falls_back_to_cpu(monkeypatc
     assert devices == (["meta", "meta", "cpu"] if expect_cpu else ["meta", "meta"])
 
 
+
+@pytest.mark.parametrize("failures", [1, 2])
+def test_oom_traceback_releases_failed_hop_tensors_before_recovery(monkeypatch, failures):
+    """Retry and CPU fallback must not hold tensors from failed GPU frames."""
+    import gc
+    import weakref
+
+    oom = lu._OOM_ERRORS[0]
+    failed_allocations = []
+    devices = []
+
+    def run_hops(x, hops, device):
+        devices.append(device.type)
+        # A failed CUDA model forward can leave intermediate tensors reachable
+        # from its traceback frame until that exception handler has exited.
+        if device.type != "cpu" and devices.count(device.type) <= failures:
+            intermediate = torch.ones(8)
+            failed_allocations.append(weakref.ref(intermediate))
+            raise oom("simulated OOM with live intermediate")
+        gc.collect()
+        assert all(ref() is None for ref in failed_allocations), (
+            "failed GPU forward tensors still retained by an OOM traceback"
+        )
+        return torch.zeros((x.shape[0], x.shape[1]) + tuple(hops[-1]), device=device)
+
+    monkeypatch.setattr(lu, "_run_hops", run_hops)
+    monkeypatch.setattr(lu, "_free_device_memory", lambda device: None)
+    result = lu.enlarge_completed_latent(_latent(1, 16, 8, 8), (12, 12),
+                                         "sesqui_wan21", device=torch.device("meta"))
+    assert result.shape == (1, 16, 12, 12)
+    assert devices == (["meta", "meta", "cpu"] if failures == 2 else ["meta", "meta"])
+
+
+
 def test_cpu_oom_is_not_retried(monkeypatch):
     oom = getattr(torch, "OutOfMemoryError", torch.cuda.OutOfMemoryError)
 
