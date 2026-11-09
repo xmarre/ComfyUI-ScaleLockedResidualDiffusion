@@ -1546,6 +1546,18 @@ def progressive_regressions(node, model, positive, negative, runtime, base, pack
                                * amp, norm="ortho").real.float() * 6.0
     clean = base.process_latent_out(internal.unsqueeze(2))
     calibrator = package.NODE_CLASS_MAPPINGS["Krea2SpectralCalibration"]()
+    # Native EmptyLatentImage supplies four zero channels. Calibration must
+    # reject this canvas with wiring guidance rather than treating it as data.
+    for wrong, message in (
+        (torch.zeros(1, 4, 48, 56), "empty latent canvas"),
+        (torch.ones(1, 4, 48, 56), "expected 16 latent channels, received 4"),
+    ):
+        try:
+            calibrator.calibrate(model, {"samples": wrong})
+        except ValueError as exc:
+            assert message in str(exc) and "VAE Encode" in str(exc), str(exc)
+        else:
+            raise AssertionError("calibration accepted an invalid generation canvas")
     calibration, report = calibrator.calibrate(model, {"samples": clean})
     assert abs(calibration["beta"] - 2.2) < 0.15, report
     assert calibration["latent_format"] == "Wan21" and calibration["grid"] == (48, 56)
