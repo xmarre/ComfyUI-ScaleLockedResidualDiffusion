@@ -64,7 +64,11 @@ space with an orthonormal FFT (`w` in cycles per image along the shorter side;
 DC excluded; fit band configurable). It runs no model. Calibrations are
 rejected when the fit is poor (R² < 0.9, exponent outside 0.5–5, fewer than
 8 bins), when the latent format or channel count differs, or when the output's
-shorter side differs from the calibration's by more than 2x. Within that
+shorter side differs from the calibration's by more than 2x. Connect a completed
+Krea 2 LATENT (e.g. LoadLatent), or Load Image -> VAE Encode with Krea 2's Qwen
+Image VAE. Do **not** connect the Empty Latent/Shared target latent used to set
+generation dimensions: it contains no image content and is often a four-channel
+placeholder. An empty canvas or wrong channel count is rejected before the fit. Within that
 range the amplitude is scaled by the squared side ratio.
 
 Measured on 12 DIV2K photographs (1024x1024 crops) encoded with Krea 2's VAE:
