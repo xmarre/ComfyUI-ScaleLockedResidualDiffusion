@@ -48,7 +48,7 @@ def _resolve_diagnostic_run(run_folder: str) -> tuple[Path, tuple[Path, ...]]:
             raise FileNotFoundError(
                 "No complete diagnostic run has planner, clean stage source, "
                 "first x0, completed first stage, and actual final output. "
-                "Run the updated PR #16 once with handoff_diagnostics=log_and_save_latents."
+                "Run Krea 2 sampling with handoff_diagnostics=log_and_save_latents."
             )
         directory = max(complete, key=lambda d: ((d / _DIAGNOSTIC_FILES[0]).stat().st_mtime_ns, d.name))
     else:
@@ -86,9 +86,9 @@ class SLRDLoadKrea2HandoffDiagnostics:
         return {"required": {"run_folder": ("STRING", {
             "default": "latest",
             "multiline": False,
-            "tooltip": "'latest' automatically selects the newest diagnostic run with all three latents. "
+            "tooltip": "'latest' selects the newest diagnostic run with all five required latents. "
                        "Or enter the run folder name to select an older one. "
-                       "After updating PR #16, run the sampler with handoff_diagnostics=log_and_save_latents "
+                       "Run the Krea 2 sampler with handoff_diagnostics=log_and_save_latents "
                        "to capture the completed first stage and actual final output.",
         })}}
 
