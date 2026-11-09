@@ -69,6 +69,28 @@ def test_expansion_is_deterministic_and_seed_separated():
     assert not torch.allclose(a, c)
 
 
+def test_expansion_keeps_duplicate_comfy_batch_index_noise_identical():
+    # ComfyUI's prepare_noise reuses exactly the same noise draw for rows
+    # sharing batch_index. The high-frequency expansion must preserve it.
+    x = torch.randn(1, 16, 24, 36).repeat(3, 1, 1, 1)
+    out, aligned = sp.expand_flow_state(
+        x, (48, 72), 0.63, seed=1234, batch_inds=[2, 2, 5]
+    )
+    assert aligned > 0.63
+    assert torch.equal(out[0], out[1])
+    assert not torch.equal(out[0], out[2])
+
+
+def test_expansion_batch_indices_preserve_existing_sequential_draws_and_validate_shape():
+    x = torch.randn(3, 16, 20, 30)
+    original, _ = sp.expand_flow_state(x, (40, 60), 0.55, seed=88)
+    indexed, _ = sp.expand_flow_state(x, (40, 60), 0.55, seed=88, batch_inds=[0, 1, 2])
+    assert torch.equal(original, indexed)
+    for invalid in ([0, 1], [-1, 0, 1]):
+        with pytest.raises(ValueError, match="batch_inds"):
+            sp.expand_flow_state(x, (40, 60), 0.55, seed=88, batch_inds=invalid)
+
+
 def test_expansion_retains_low_band_exactly_and_projection_recovers_source():
     x = torch.randn(1, 4, 30, 44, dtype=torch.float64)
     sigma = 0.55
