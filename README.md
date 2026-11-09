@@ -348,7 +348,12 @@ runtime and does not load weights independently.
     using an orthonormal FFT, with `w` in cycles per image along the shorter
     side. It runs no model. Use finished latents near the intended output
     size, e.g. a completed Krea 2 generation loaded with LoadLatent, or
-    VAE-encoded photos of the content you generate. With tolerance
+    a representative photo via Load Image -> VAE Encode (using the Krea 2/Qwen
+    Image VAE). **Do not feed the shared Empty Latent/target canvas into the
+    calibration node:** it is a zero-filled generation placeholder, commonly
+    with 4 channels, whereas Krea 2 calibration needs a clean, populated
+    16-channel image latent. The node rejects empty or mismatched inputs with
+    wiring guidance. With tolerance
     `spectral_tolerance` (`delta`, default 0.01), a frequency stops being
     noise dominated at `1 / (1 + sqrt(delta / (P (1 + P - delta))))`; each
     stage hands over at the first schedule sigma at or below that value for
