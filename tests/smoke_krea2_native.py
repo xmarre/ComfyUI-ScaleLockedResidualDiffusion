@@ -51,6 +51,10 @@ def main():
     sys.modules[spec.name] = package
     spec.loader.exec_module(package)
     node = package.NODE_CLASS_MAPPINGS["Krea2TurboFlowAlignedRegenerate"]()
+    planner_spec = node.INPUT_TYPES()["required"]["planner_megapixels"][1]
+    assert planner_spec["max"] == sys.modules[spec.name + ".resolution"].MAX_MEGAPIXELS > 4.0
+    assert planner_spec["default"] == 1.0 and planner_spec["min"] == 0.25
+    assert "1,000,000 pixels" in planner_spec["tooltip"]
     positive = [[torch.randn(1, 3, 32), {}]]
     negative = [[torch.zeros(1, 3, 32), {}]]
     cases = [("native", model)]
