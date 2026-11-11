@@ -76,16 +76,18 @@ class _Guider:
         return self._model_prediction(x, timestep)
 
 
-def _locked_guider(model_prediction, anchors, planner_sigmas, highres, full_lock_sigma, spatial_mask=None):
+def _locked_guider(model_prediction, anchors, planner_sigmas, highres, full_lock_sigma, spatial_mask=None,
+                   skip_locked_model_calls=False, noise_mask=None):
     guider = _Guider(model_prediction)
     config = _config(full_lock_sigma)
     config.spatial_mask = spatial_mask
     context = runtime.ScaleLockedRuntimeContext(
-        model=None, highres_latent={"samples": highres}, lowres_latent=None,
+        model=None, highres_latent={"samples": highres, **({"noise_mask": noise_mask} if noise_mask is not None else {})}, lowres_latent=None,
         lowres_out=None, sigmas=None, anchors_x0=anchors,
         planner_sigmas=planner_sigmas, highres_noise=None, noise_seed=0,
     )
-    return runtime.apply_scale_lock_to_guider(guider, context, config)
+    return runtime.apply_scale_lock_to_guider(guider, context, config,
+                                              skip_locked_model_calls=skip_locked_model_calls)
 
 
 def _planner(low_shape, sigmas, seed=5):
@@ -236,6 +238,128 @@ def test_locked_prediction_does_not_alias_stored_anchor_and_respects_mask():
     assert torch.allclose(out[..., 5:], torch.full_like(out[..., 5:], 3.0), atol=1e-12, rtol=0.0)
 
 
+def _dpmpp_2m(x, sigmas, predict):
+    # ComfyUI k_diffusion.sampling.sample_dpmpp_2m update, verbatim.
+    sigma_fn = lambda t: t.neg().exp()
+    t_fn = lambda sigma: sigma.log().neg()
+    old_denoised = None
+    for i in range(len(sigmas) - 1):
+        denoised = predict(x, sigmas[i])
+        t, t_next = t_fn(sigmas[i]), t_fn(sigmas[i + 1])
+        h = t_next - t
+        if old_denoised is None or sigmas[i + 1] == 0:
+            x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised
+        else:
+            h_last = t - t_fn(sigmas[i - 1])
+            r = h_last / h
+            denoised_d = (1 + 1 / (2 * r)) * denoised - (1 / (2 * r)) * old_denoised
+            x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised_d
+        old_denoised = denoised
+    return x
+
+
+def _ipndm(x, sigmas, predict, max_order=4):
+    # ComfyUI k_diffusion.sampling.sample_ipndm update, verbatim.
+    buffer_model = []
+    for i in range(len(sigmas) - 1):
+        t_cur, t_next = sigmas[i], sigmas[i + 1]
+        denoised = predict(x, t_cur)
+        d_cur = (x - denoised) / t_cur
+        order = min(max_order, i + 1)
+        if t_next == 0:
+            x_next = denoised
+        elif order == 1:
+            x_next = x + (t_next - t_cur) * d_cur
+        elif order == 2:
+            x_next = x + (t_next - t_cur) * (3 * d_cur - buffer_model[-1]) / 2
+        elif order == 3:
+            x_next = x + (t_next - t_cur) * (23 * d_cur - 16 * buffer_model[-1] + 5 * buffer_model[-2]) / 12
+        else:
+            x_next = x + (t_next - t_cur) * (55 * d_cur - 59 * buffer_model[-1] + 37 * buffer_model[-2] - 9 * buffer_model[-3]) / 24
+        if len(buffer_model) == max_order - 1:
+            buffer_model = buffer_model[1:] + [d_cur]
+        else:
+            buffer_model.append(d_cur)
+        x = x_next
+    return x
+
+
+@pytest.mark.parametrize("solver", [_euler, _dpmpp_2m, _ipndm])
+@pytest.mark.parametrize("steps, release", [(8, 0.8), (12, 0.8), (18, 0.8), (6, 0.0), (8, 1.0)])
+def test_skipped_locked_evaluations_preserve_native_multistep_trajectory(solver, steps, release):
+    """Answering locked steps from the planner equals evaluating and discarding.
+
+    The solver runs every step either way, so its multistep history across the
+    lock release is identical; only the discarded target evaluations vanish.
+    """
+    sigmas = _flow_sigmas(steps)
+    low_shape, high_shape = (1, 16, 8, 10), (1, 16, 14, 18)
+    _, anchors, _ = _planner(low_shape, sigmas)
+    planner_sigmas = [float(s) for s in sigmas[:-1]]
+    locked = core.full_lock_prefix_length([float(s) for s in sigmas], release)
+
+    def target_model(x, sigma):
+        return torch.roll(x, shifts=2, dims=-1) * 0.4 + torch.sin(x) * float(sigma)
+
+    noise = torch.randn(high_shape, generator=torch.Generator().manual_seed(11), dtype=torch.float64)
+    reference = _locked_guider(target_model, anchors, planner_sigmas, noise, release)
+    fast = _locked_guider(target_model, anchors, planner_sigmas, noise, release, skip_locked_model_calls=True)
+    expected = solver(noise.clone(), sigmas, reference.predict_noise)
+    actual = solver(noise.clone(), sigmas, fast.predict_noise)
+    assert torch.equal(actual, expected)
+    assert reference.calls == steps
+    assert fast.calls == steps - locked
+
+
+def test_skipped_locked_evaluation_still_runs_model_for_masked_lock():
+    sigmas = _flow_sigmas(4)
+    shape = (1, 16, 8, 10)
+    _, anchors, _ = _planner(shape, sigmas)
+    planner_sigmas = [float(s) for s in sigmas[:-1]]
+    mask = torch.zeros((1, 1, 8, 10), dtype=torch.float64)
+    mask[..., :, :5] = 1.0
+    x = torch.zeros(shape, dtype=torch.float64)
+
+    def model(x, sigma):
+        return torch.full_like(x, 3.0)
+
+    masked = _locked_guider(model, anchors, planner_sigmas, x, 0.5, spatial_mask=mask, skip_locked_model_calls=True)
+    out = masked.predict_noise(x, sigmas[0])
+    assert masked.calls == 1
+    assert torch.allclose(out[..., 5:], torch.full_like(out[..., 5:], 3.0), atol=1e-12, rtol=0.0)
+
+    unmasked = _locked_guider(model, anchors, planner_sigmas, x, 0.5, skip_locked_model_calls=True)
+    out = unmasked.predict_noise(x, sigmas[0])
+    assert unmasked.calls == 0
+    assert torch.equal(out, anchors[0]) and out.data_ptr() != anchors[0].data_ptr()
+
+
+def test_sampler_noise_mask_prevents_locked_model_call_shortcut():
+    """A latent noise_mask must use the evaluated path, independent of the
+    scale-lock's separate spatial_mask, as promised by the node interface."""
+    sigmas = _flow_sigmas(4)
+    shape = (1, 16, 8, 10)
+    _, anchors, _ = _planner(shape, sigmas)
+    planner_sigmas = [float(s) for s in sigmas[:-1]]
+    latent = torch.zeros(shape, dtype=torch.float64)
+    denoise_mask = torch.ones((1, 1, 8, 10), dtype=torch.float64)
+    model = lambda x, sigma: torch.full_like(x, 3.0)
+
+    masked = _locked_guider(
+        model, anchors, planner_sigmas, latent, 0.5,
+        skip_locked_model_calls=True, noise_mask=denoise_mask)
+    result = masked.predict_noise(latent, sigmas[0])
+    assert masked.calls == 1
+    assert torch.equal(result, anchors[0])  # The full lock still wins.
+    assert result.data_ptr() != anchors[0].data_ptr()
+
+    plain = _locked_guider(
+        model, anchors, planner_sigmas, latent, 0.5,
+        skip_locked_model_calls=True)
+    assert torch.equal(plain.predict_noise(latent, sigmas[0]), anchors[0])
+    assert plain.calls == 0
+
+
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.1])
 def test_invalid_threshold_rejected(value):
     with pytest.raises(ValueError, match="full_lock_sigma"):
@@ -270,3 +394,212 @@ def test_stage_megapixels_parsing():
         core.parse_stage_megapixels("4, big")
     with pytest.raises(ValueError, match="positive"):
         core.parse_stage_megapixels("4, -1")
+
+
+
+@pytest.mark.parametrize("mode, eta, expected_mode", [
+    ("ER-SDE", 1.0, "ER-SDE"),
+    ("Reverse-time SDE", 0.7, "Reverse-time SDE"),
+    ("ODE", 1.0, "ODE"),
+    ("ER-SDE", 0.0, "ODE"),
+])
+def test_er_sde_modes_match_comfyui_noise_scaling(mode, eta, expected_mode):
+    options = runtime.krea2_er_sde_options(mode, 3, eta, 1.0)
+    assert options["max_stage"] == 3
+    assert options["noise_scaler"].solver_type == expected_mode
+    if expected_mode == "ODE":
+        assert options["s_noise"] == 0.0
+    x = torch.tensor([0.1, 0.5, 0.9], dtype=torch.float64)
+    if expected_mode == "ODE":
+        expected = x
+    elif expected_mode == "Reverse-time SDE":
+        expected = x ** (eta + 1.0)
+    else:
+        expected = x * ((x ** 0.3).exp() + 10.0) ** eta
+    torch.testing.assert_close(options["noise_scaler"](x), expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("params", [
+    ("bad", 3, 1., 1.),
+    ("ER-SDE", True, 1., 1.),
+    ("ER-SDE", 0, 1., 1.),
+    ("ER-SDE", 4, 1., 1.),
+    ("ER-SDE", 3, float("nan"), 1.),
+    ("ER-SDE", 3, -1., 1.),
+    ("ER-SDE", 3, 1., float("inf")),
+    ("ER-SDE", 3, 1., -1.),
+])
+def test_er_sde_controls_fail_before_native_sampling(params):
+    with pytest.raises(ValueError, match="ER-SDE"):
+        runtime.krea2_er_sde_options(*params)
+
+
+def _assert_patch_phase_sum(coarse, fine):
+    """Independent phase groups obey the exact Gaussian refinement contract."""
+    for py in range(2):
+        for px in range(2):
+            parent = coarse[..., py::2, px::2].float()
+            child = fine[..., py::2, px::2].float()
+            sh, sw = parent.shape[-2:]
+            th, tw = child.shape[-2:]
+            ys = torch.arange(th) * sh // th
+            xs = torch.arange(tw) * sw // tw
+            for i in range(sh):
+                for j in range(sw):
+                    group = child[..., ys == i, :][..., xs == j]
+                    normalized = group.sum(dim=(-2, -1)) / math.sqrt(group.shape[-2] * group.shape[-1])
+                    torch.testing.assert_close(normalized, parent[..., i, j], atol=2e-5, rtol=2e-5)
+
+
+def test_er_sde_stochastic_increments_are_reproducible_and_nested_across_stages():
+    # No model or external ComfyUI code is involved; exercise the same callable
+    # that the production Krea 2 node injects into native sample_er_sde.
+    low = (1, 16, 1, 8, 10)
+    middle = (1, 16, 1, 12, 14)
+    high = (1, 16, 1, 16, 20)
+    sigmas = torch.tensor([.9999, .8, .5, .2, 0.])
+    def noise(stage, start=0, schedule=sigmas):
+        return runtime.Krea2PatchCoupledERSDENoise(
+            low, (middle, high), stage, 42, start, schedule,
+            torch.device("cpu"), torch.float32,
+        )
+    planner, intermediate, target = noise(-1), noise(0), noise(1)
+    base = planner(sigmas[0], sigmas[1])
+    coarse_stage = intermediate(sigmas[0], sigmas[1])
+    target_stage = target(sigmas[0], sigmas[1])
+    assert base.shape == low and coarse_stage.shape == middle and target_stage.shape == high
+    _assert_patch_phase_sum(base, coarse_stage)
+    _assert_patch_phase_sum(coarse_stage, target_stage)
+    assert torch.equal(base, noise(-1)(sigmas[0], sigmas[1]))
+    assert torch.equal(target_stage, noise(1)(sigmas[0], sigmas[1]))
+    second = target(sigmas[1], sigmas[2])
+    assert not torch.equal(target_stage, second)
+    with pytest.raises(RuntimeError, match="out of native sigma order"):
+        target(sigmas[0], sigmas[1])
+
+
+def test_er_sde_later_stage_restarts_from_release_step_noise():
+    shape = (1, 16, 1, 8, 10)
+    bigger = (1, 16, 1, 12, 14)
+    sigmas = torch.tensor([.9999, .8, .5, .2, 0.])
+    full = runtime.Krea2PatchCoupledERSDENoise(
+        shape, (bigger,), 0, 71, 0, sigmas, "cpu", torch.float32
+    )
+    full(sigmas[0], sigmas[1])
+    full(sigmas[1], sigmas[2])
+    expected = full(sigmas[2], sigmas[3])
+    restarted = runtime.Krea2PatchCoupledERSDENoise(
+        shape, (bigger,), 0, 71, 2, sigmas[2:], "cpu", torch.float32
+    )
+    assert torch.equal(expected, restarted(sigmas[2], sigmas[3]))
+
+
+
+def test_sa_stochastic_noise_is_patch_coupled_even_when_sde_skips_steps():
+    low = (1, 16, 1, 8, 10)
+    high = (1, 16, 1, 16, 20)
+    sigmas = torch.tensor([.9999, .85, .65, .45, .25, 0.0])
+    planner = runtime.Krea2PatchCoupledSANoise(
+        low, (high,), -1, 77, 0, sigmas, "cpu", torch.float32
+    )
+    target = runtime.Krea2PatchCoupledSANoise(
+        low, (high,), 0, 77, 0, sigmas, "cpu", torch.float32
+    )
+    coarse = planner(sigmas[2], sigmas[3])
+    fine = target(sigmas[2], sigmas[3])
+    assert coarse.shape == low and fine.shape == high
+    # Every patch-phase coarse component survives Gaussian refinement.
+    _assert_patch_phase_sum(coarse, fine)
+    torch.testing.assert_close(
+        target(sigmas[4], sigmas[5]),
+        runtime.Krea2PatchCoupledSANoise(
+            low, (high,), 0, 77, 4, sigmas[4:], "cpu", torch.float32
+        )(sigmas[4], sigmas[5]),
+        atol=0, rtol=0,
+    )
+    with pytest.raises(RuntimeError, match="out of sigma order"):
+        target(sigmas[1], sigmas[2])
+
+
+def test_sa_pece_uses_corrected_planner_anchor_on_second_same_sigma_call():
+    sigmas = [0.9, 0.7, 0.5]
+    reference = [torch.ones(1, 2, 6, 8) * i for i in (1, 2, 3)]
+    corrected = [None, torch.ones(1, 2, 6, 8) * 17, torch.ones(1, 2, 6, 8) * 29]
+    model_calls = []
+
+    def predict(x, timestep):
+        model_calls.append(float(timestep))
+        return torch.zeros_like(x)
+
+    context = runtime.ScaleLockedRuntimeContext(
+        model=None, highres_latent={"samples": torch.zeros(1, 2, 6, 8)},
+        lowres_latent=None, lowres_out=None, sigmas=None,
+        anchors_x0=reference, planner_sigmas=sigmas, highres_noise=None,
+        noise_seed=0, pece_corrected_anchors=corrected,
+    )
+    guider = runtime.apply_scale_lock_to_guider(
+        _Guider(predict), context, _config(0.0), skip_locked_model_calls=True
+    )
+    x = torch.zeros(1, 2, 6, 8)
+    torch.testing.assert_close(guider.predict_noise(x, torch.tensor(.9)), reference[0])
+    torch.testing.assert_close(guider.predict_noise(x, torch.tensor(.7)), reference[1])
+    torch.testing.assert_close(guider.predict_noise(x, torch.tensor(.7)), corrected[1])
+    assert model_calls == []
+    assert guider._slrd_anchors_x0_cpu[1] is reference[1]
+    with pytest.raises(RuntimeError, match="more than two"):
+        guider.predict_noise(x, torch.tensor(.7))
+
+
+
+def test_img2img_start_index_uses_exact_native_schedule_suffix():
+    sigmas = _flow_sigmas(14).tolist()
+    index = runtime.img2img_start_index(sigmas, 0.65)
+    # First schedule sigma at or below the request; the schedule is not rescaled.
+    assert sigmas[index] <= 0.65 < sigmas[index - 1]
+    assert index == core.full_lock_prefix_length(sigmas, 0.65)
+    exact = sigmas[9]
+    assert runtime.img2img_start_index(sigmas, exact) == 9
+    assert runtime.img2img_start_index(sigmas, math.nextafter(exact, 0.0)) == 10
+
+
+@pytest.mark.parametrize("value, message", [
+    (0.0, "strictly between"), (1.0, "strictly between"), (float("nan"), "strictly between"),
+    (True, "strictly between"), (1e-6, "no refinement step"),
+])
+def test_img2img_start_index_rejects_unusable_values(value, message):
+    with pytest.raises(ValueError, match=message):
+        runtime.img2img_start_index(_flow_sigmas(14).tolist(), value)
+
+
+@pytest.mark.parametrize("requested", [0.30, 0.35])
+def test_img2img_continuous_start_replaces_only_first_suffix_sigma(requested):
+    sigmas = _flow_sigmas(20).float()
+    index, suffix = runtime.img2img_refinement_sigmas(sigmas, requested)
+    assert index == 18  # both values formerly snapped to sigma 0.259758
+    assert suffix.shape == sigmas[index:].shape
+    assert float(suffix[0]) == pytest.approx(requested, abs=1e-7)
+    assert torch.equal(suffix[1:], sigmas[index + 1:])
+    assert torch.equal(sigmas, _flow_sigmas(20).float())  # no in-place modification
+    assert torch.all(suffix[:-1] > suffix[1:])
+
+
+def test_img2img_continuous_start_obeys_original_exact_points():
+    sigmas = _flow_sigmas(14).float()
+    requested = float(sigmas[9])
+    index, suffix = runtime.img2img_refinement_sigmas(sigmas, requested)
+    assert index == 9
+    assert torch.equal(suffix, sigmas[9:])
+
+
+def test_img2img_start_index_rejects_start_at_first_sigma():
+    with pytest.raises(ValueError, match="first schedule sigma"):
+        runtime.img2img_start_index([0.9, 0.5, 0.0], 0.95)
+
+
+def test_img2img_stage_sde_increments_are_separate_from_planner_and_forward_noise():
+    seed = 892748339710310
+    planner = seed
+    for index in range(3):
+        sde = runtime._img2img_sde_seed(seed, index)
+        assert sde not in (planner, runtime._img2img_root_seed(seed, index), runtime._stage_seed(seed, index))
+    assert len({runtime._img2img_sde_seed(seed, i) for i in range(3)}) == 3
