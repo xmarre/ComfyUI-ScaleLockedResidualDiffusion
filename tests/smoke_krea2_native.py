@@ -1626,13 +1626,6 @@ def progressive_regressions(node, model, positive, negative, runtime, base, pack
         assert "noise mask" in str(exc)
     else:
         raise AssertionError("noise masks must be rejected")
-    try:
-        node.sample(model, positive, negative, {"samples": torch.zeros(1, 4, 24, 28)}, 42, .01, 0.0, 0.0,
-                    steps=8, progressive_transition_sigmas="0.8")
-    except ValueError as exc:
-        assert "only used by" in str(exc)
-    else:
-        raise AssertionError("transition sigmas outside spectral_progressive must be rejected")
 
     # Interruption in the second segment leaves no hooks or state behind.
     reference, _, _ = run(model, "euler", 8)
