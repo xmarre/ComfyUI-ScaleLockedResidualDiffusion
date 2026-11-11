@@ -85,6 +85,8 @@ def _node():
         "run_scale_locked_ksampler": run,
         "parse_transition_sigmas": spectral.parse_transition_sigmas,
         "logger": SimpleNamespace(info=lambda *args: None, warning=lambda *args: None),
+        # resolution.MAX_MEGAPIXELS on the native 16384-pixel canvas.
+        "MAX_MEGAPIXELS": 256.0,
     }
     exec(compile(ast.Module(body=[cls], type_ignores=[]), str(ROOT / "nodes.py"),
                  "exec"), namespace)
@@ -160,6 +162,8 @@ def test_existing_widget_slots_and_explicit_defaults():
     assert schema["optional"]["composition_lock_sigma"][1]["default"] == 0.65
     assert schema["optional"]["max_stage_upscale"][1]["default"] == 4.0
     assert schema["required"]["planner_megapixels"][1]["default"] == 1.0
+    assert schema["required"]["planner_megapixels"][1]["max"] == 256.0
+    assert "4096x4096" in schema["required"]["planner_megapixels"][1]["tooltip"]
     assert schema["optional"]["img2img_start_sigma"][1]["default"] == 0.65
     assert schema["optional"]["handoff_diagnostics"][0] == ["off", "log", "log_and_save_latents"]
     assert schema["optional"]["handoff_diagnostics"][1]["default"] == "off"
