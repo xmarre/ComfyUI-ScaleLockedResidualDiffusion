@@ -3,24 +3,46 @@ name: Krea 2 flow regeneration numerical tests
 on:
   pull_request:
     paths:
+      - "__init__.py"
       - "krea2_flow.py"
+      - "spectral_progressive.py"
+      - "tests/test_spectral_progressive.py"
       - "slrd_runtime.py"
+      - "latent_upscale.py"
+      - "third_party/**"
+      - "tests/test_latent_upscale.py"
       - "slrd_core.py"
       - "nodes.py"
+      - "diagnostic_load.py"
+      - "tests/test_diagnostic_load.py"
+      - "workflows/krea2-handoff-diagnostics.json"
       - "resolution.py"
       - "tests/test_krea2_flow.py"
       - "tests/test_krea2_composition_lock.py"
+      - "tests/test_krea2_controls.py"
+      - "tests/smoke_krea2_native.py"
       - ".github/workflows/krea2-tests.yml"
   push:
     branches: [main]
     paths:
+      - "__init__.py"
       - "krea2_flow.py"
+      - "spectral_progressive.py"
+      - "tests/test_spectral_progressive.py"
       - "slrd_runtime.py"
+      - "latent_upscale.py"
+      - "third_party/**"
+      - "tests/test_latent_upscale.py"
       - "slrd_core.py"
       - "nodes.py"
+      - "diagnostic_load.py"
+      - "tests/test_diagnostic_load.py"
+      - "workflows/krea2-handoff-diagnostics.json"
       - "resolution.py"
       - "tests/test_krea2_flow.py"
       - "tests/test_krea2_composition_lock.py"
+      - "tests/test_krea2_controls.py"
+      - "tests/smoke_krea2_native.py"
       - ".github/workflows/krea2-tests.yml"
 
 jobs:
@@ -36,9 +58,40 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install pytest
+          python -m pip install pytest safetensors numpy scipy
       - name: Compile changed Python
-        run: python -m py_compile krea2_flow.py nodes.py slrd_runtime.py slrd_core.py resolution.py
+        run: python -m py_compile krea2_flow.py spectral_progressive.py nodes.py slrd_runtime.py slrd_core.py resolution.py diagnostic_load.py latent_upscale.py
       - name: Validate nested-noise coupling
         working-directory: tests
-        run: python -m pytest -q --rootdir=. --confcutdir=. test_krea2_flow.py test_krea2_composition_lock.py
+        run: python -m pytest -q --rootdir=. --confcutdir=. test_krea2_flow.py test_krea2_composition_lock.py test_krea2_controls.py test_diagnostic_load.py test_latent_upscale.py test_spectral_progressive.py
+
+  native-krea2-cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/checkout@v4
+        with:
+          repository: Comfy-Org/ComfyUI
+          ref: 7ad7adb38f6cbb6c2b0713d3bd44c3fb2b9c8ebe
+          path: _comfy
+      - uses: actions/checkout@v4
+        with:
+          repository: xmarre/ComfyUI-Spectrum-Krea2
+          ref: 6c59143c9f34d21bdbac695b37a9e9b50175f786
+          path: _spectrum
+      - name: Check out audited KJNodes preview wrapper
+        uses: actions/checkout@v4
+        with:
+          repository: kijai/ComfyUI-KJNodes
+          ref: ab72eda7ffad6280422d71ab7d54d3fb87c0ba18
+          path: _kj
+      - name: Install real ComfyUI CPU test dependencies
+        run: |
+          python -m pip install torch==2.15.0 torchvision==0.29.2 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e '_spectrum/.[test]' torchsde==0.2.6 scipy safetensors Pillow tqdm psutil pyyaml sentencepiece transformers==5.22.1 requests comfy-kitchen==0.2.40 comfy-aimdo==0.6.0
+      - name: Exercise native Krea 2 samplers and Spectrum integration
+        run: python tests/smoke_krea2_native.py --comfy-root _comfy --spectrum-root _spectrum --kj-root _kj
