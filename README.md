@@ -288,8 +288,10 @@ runtime and does not load weights independently.
     rule: a pass refines freely from `composition_lock_sigma` only on a grid
     inside the model's 2048-pixel-per-axis range. With empty
     `stage_megapixels` the first stage becomes the largest in-range size of
-    the output aspect ratio, and every pass above the range restarts from a
-    completed latent at an automatically selected sigma. For outputs inside
+    the output aspect ratio that respects positive `max_stage_upscale` limits
+    from the planner. A value of 0 disables the area cap but still inserts an
+    in-range stage. Every pass above the range restarts from a completed
+    latent at an automatically selected sigma. For outputs inside
     the range it is identical to `trajectory_auto`. See
     [Automatic trajectory refinement](docs/krea2-auto-refinement.md#native-range-first-refinement).
   - `planner_final_img2img` runs the planner to completion and treats its
