@@ -341,7 +341,9 @@ class Krea2TurboFlowAlignedRegenerate:
                                "lock strengths must be 0; multistep solver history restarts at each transition. "
                                "latent_upscale_method is inactive in this mode and its saved value is ignored. "
                                "trajectory_auto (experimental): keep the first trajectory refinement and choose "
-                               "native restart steps automatically for later completed-latent handoffs."}),
+                               "native restart steps automatically for later completed-latent handoffs. "
+                               "trajectory_auto_observe: same sampling as trajectory_auto, with local structural "
+                               "comparison of unlocked predictions and completed stages in the log."}),
                 "img2img_start_sigma": ("FLOAT", {"default": 0.65, "min": 0.01, "max": 0.99, "step": 0.01,
                     "tooltip": "planner_final_img2img only: noise level the finished image is re-noised to before "
                                "each high-resolution stage. The first sigma of the native refinement suffix is "
