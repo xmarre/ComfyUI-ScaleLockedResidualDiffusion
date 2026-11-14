@@ -284,13 +284,14 @@ runtime and does not load weights independently.
     high-resolution pass it produces the same result as `trajectory`.
     See [Automatic trajectory refinement](docs/krea2-auto-refinement.md)
     for the selection rule and a matched-seed comparison procedure.
-  - `trajectory_auto_observe` runs the same automatic refinement and logs local
-    structure at the first unlocked refinement and each later handoff. See
-    [Krea 2 structure screening](docs/krea2-structure-screening.md) for the
-    metrics and decoded comparison procedure.
-  - `trajectory_auto_correct` (experimental) can choose the penultimate
-    clean prediction at a stage boundary if the native completion adds
-    a localized structure and the earlier candidate passes detail checks.
+  - `trajectory_auto_native` (experimental) is `trajectory_auto` with one more
+    rule: a pass refines freely from `composition_lock_sigma` only on a grid
+    inside the model's 2048-pixel-per-axis range. With empty
+    `stage_megapixels` the first stage becomes the largest in-range size of
+    the output aspect ratio, and every pass above the range restarts from a
+    completed latent at an automatically selected sigma. For outputs inside
+    the range it is identical to `trajectory_auto`. See
+    [Automatic trajectory refinement](docs/krea2-auto-refinement.md#native-range-first-refinement).
   - `planner_final_img2img` runs the planner to completion and treats its
     finished latent as an image to refine. Each high-resolution stage resizes
     the finished latent of the stage below (the planner for the first stage),

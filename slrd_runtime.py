@@ -3,7 +3,6 @@ from __future__ import annotations
 import contextvars
 import copy
 from contextlib import contextmanager
-import json
 import logging
 import math
 import sys

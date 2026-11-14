@@ -438,72 +438,134 @@ def main():
     assert measured_scales == [1.25]
     assert learned[0]["samples"].shape[-2:] == (24, 28)
 
-    # Observe real solver callbacks at a size large enough to score both
-    # scales. Neither prediction values nor Spectrum call receipts may change.
+    # trajectory_auto_native. The tiny model's grids are far below the real
+    # 2048 px limit, so the limit itself is scaled down to place the same
+    # planner/stage/output grids on either side of it. Everything else is the
+    # node's real path: stage planning, the ladder, native solvers, Spectrum.
+    native_solvers = ("euler", "dpmpp_2m", "er_sde", "sa_solver", "sa_solver_pece")
+
+    def native_run(selected, solver, count, limit_px=None, mode="trajectory_auto_native", **options):
+        decisions, forwards = [], []
+        real_decide = runtime.choose_refinement_restart
+        real_noise_scaling = selected.model.model_sampling.noise_scaling
+
+        def capture_decision(schedule, release, source, *rest):
+            decision = real_decide(schedule, release, source, *rest)
+            decisions.append((tuple(source.shape[-2:]), decision))
+            return decision
+
+        def capture_forward(sigma, noise, latent_image, max_denoise=False):
+            value = real_noise_scaling(sigma, noise, latent_image, max_denoise)
+            forwards.append((tuple(noise.shape[-2:]), float(sigma), latent_image.detach().clone(),
+                             noise.detach().clone(), value.detach().clone()))
+            return value
+
+        patches = [patch.object(runtime, "choose_refinement_restart", capture_decision),
+                   patch.object(selected.model.model_sampling, "noise_scaling", capture_forward)]
+        if limit_px is not None:
+            patches.append(patch.object(runtime, "KREA2_NATIVE_MAX_AXIS_PX", limit_px))
+        for item in patches:
+            item.start()
+        try:
+            result, reports, counts = controls(
+                selected, solver, "simple", 1.0, 16, count, regeneration_mode=mode,
+                er_sde_max_stage=1, **options)
+        finally:
+            for item in reversed(patches):
+                item.stop()
+        return result, reports, counts, decisions, forwards
+
+    def same(a, b):
+        return all(torch.equal(x["samples"], y["samples"]) for x, y in zip(a, b))
+
+    schedule16 = runtime.calculate_sigmas(model, scheduler="simple", steps=16, denoise=1.0)
+    release16 = runtime.full_lock_prefix_length(schedule16.tolist(), default_lock)
+    two_stage = {"latent": torch.zeros(1, 4, 24, 28), "stage_megapixels": "0.02"}
     for label, selected in cases:
-        for solver in ("euler", "dpmpp_2m", "er_sde", "sa_solver", "sa_solver_pece"):
-            captured = []
-            observer_info = runtime._LOGGER.info
+        count = label == "native"
+        for solver in native_solvers:
+            # Every grid inside the range: exactly trajectory_auto.
+            auto, auto_reports, auto_counts, auto_decisions, _ = native_run(
+                selected, solver, count, mode="trajectory_auto", **two_stage)
+            inside, reports, counts, decisions, _ = native_run(selected, solver, count, **two_stage)
+            assert same(auto, inside) and reports == auto_reports and counts == auto_counts, (label, solver)
+            assert [hw for hw, _ in decisions] == [hw for hw, _ in auto_decisions] == [(16, 20)]
 
-            def capture_structure(message, *args, **kwargs):
-                if message == "Krea 2 structure screening: %s":
-                    captured.append(json.loads(args[0]))
-                return observer_info(message, *args, **kwargs)
+            # A 160 px limit: planner 12x14 and an 18x20 grid are inside, the
+            # 24x28 output is outside. Automatic planning makes 18x20 the
+            # trajectory-driven first stage; only the output restarts automatically.
+            planned, reports, counts, decisions, forwards = native_run(
+                selected, solver, count, limit_px=160, latent=torch.zeros(1, 4, 24, 28), max_stage_upscale=0.)
+            assert [hw for hw, _ in decisions] == [(18, 20)], (label, solver, decisions)
+            final_start = decisions[0][1].index
+            assert release16 <= final_start < 16
+            assert same(planned[1:2], auto[1:2])  # the planner pass is untouched
+            last = [f for f in forwards if f[0] == (24, 28)]
+            assert len(last) == 1 and last[0][1] == float(schedule16[final_start])
+            if count:
+                assert counts == {
+                    (12, 14): solver_calls(solver, 16),
+                    (18, 20): target_calls(solver, 16, release16),
+                    (24, 28): solver_calls(solver, 16 - final_start),
+                }, (solver, counts)
+            else:
+                assert len(reports) == 3 and reports[-1]["outer_steps"] == 16 - final_start, reports
+                assert all(r["fallback"] is None for r in reports), reports
 
-            def observe_run(mode, *, ladder=True):
-                reports = []
-                token = reports_context.set(reports) if reports_context is not None else None
-                try:
-                    with torch.inference_mode():
-                        out = node.sample(
-                            selected, positive, negative, {"samples": torch.zeros(1, 4, 42, 50)},
-                            42, .04, 0., 0., steps=16, sampler_name=solver, er_sde_max_stage=1,
-                            max_stage_upscale=0., stage_megapixels="0.08" if ladder else "",
-                            regeneration_mode=mode, sa_spectrum_forecasts=True,
-                        )
-                    return out, reports
-                finally:
-                    if token is not None:
-                        reports_context.reset(token)
-
-            reference, before = observe_run("trajectory_auto")
-            with patch.object(runtime._LOGGER, "info", capture_structure):
-                observed, after = observe_run("trajectory_auto_observe")
-            assert before == after, (label, solver)
-            assert all(torch.equal(a["samples"], b["samples"]) for a, b in zip(reference, observed))
-            assert [r["stage"] for r in captured] == [0, 1]
-            first, later = (r["images"][0]["candidates"] for r in captured)
-            assert [x["kind"] for x in first] == ["prediction"] * 5 + ["completed"], first
-            assert later[0]["kind"] == "enlarged_source" and later[-1]["kind"] == "completed", later
-            assert 2 <= len(later) - 2 <= 5
-            assert all(c["sigma"] <= default_lock for c in first if c["kind"] == "prediction")
-            if label == "spectrum":
-                assert all(r["fallback"] is None for r in after), after
-                assert after[-1]["outer_steps"] == len(later) - 2
-            captured.clear()
-
-            def capture_correction(message, *args, **kwargs):
-                if message == "Krea 2 structure correction: %s":
-                    captured.append(json.loads(args[0]))
-                return observer_info(message, *args, **kwargs)
-
-            # Tiny random weights provide no labeled geometry. Test the
-            # neutral selector path without depending on their image quality.
-            with patch.object(runtime._LOGGER, "info", capture_correction), patch.object(
-                runtime, "select_structure_candidate", return_value=([], [])
+            # A 112 px limit: only the planner is inside. No pass refines from
+            # the composition-lock release; each one restarts from the finished
+            # latent below it at the measured sigma, with the exact native
+            # forward corruption of that latent.
+            for options, sizes in (
+                ({"max_stage_upscale": 0.}, [(16, 20)]),
+                (two_stage, [(16, 20), (24, 28)]),
             ):
-                neutral, neutral_reports = observe_run("trajectory_auto_correct")
-            assert before == neutral_reports
-            assert all(torch.equal(a["samples"], b["samples"]) for a, b in zip(reference, neutral))
-            assert len(captured) == 2 and all(not c["selected"] for c in captured)
-            if solver == "er_sde":
-                captured.clear()
-                with patch.object(runtime._LOGGER, "info", capture_structure):
-                    single, after = observe_run("trajectory_auto_observe", ladder=False)
-                plain, before = observe_run("trajectory_auto", ladder=False)
-                assert before == after
-                assert all(torch.equal(a["samples"], b["samples"]) for a, b in zip(plain, single))
-                assert len(captured) == 1 and captured[0]["images"][0]["candidates"][0]["sigma"] <= default_lock
+                completed, reports, counts, decisions, forwards = native_run(
+                    selected, solver, count, limit_px=112, **options)
+                sources = [(12, 14)] + sizes[:-1]
+                assert [hw for hw, _ in decisions] == sources, (label, solver, decisions)
+                starts = [decision.index for _, decision in decisions]
+                assert all(release16 <= start < 16 for start in starts), starts
+                assert same(completed[1:2], auto[1:2])
+                planner_out = completed[1]["samples"]
+                target = [f for f in forwards if f[0] != (12, 14)]
+                assert [f[0] for f in target] == sizes and [f[1] for f in target] == [
+                    float(schedule16[start]) for start in starts]
+                scale = getattr(selected.model.model_sampling, "noise_scale", 1.0)
+                for _, sigma, clean, noise, value in target:
+                    torch.testing.assert_close(value, (1 - sigma) * clean + sigma * (scale * noise))
+                expected = selected.model.process_latent_in(
+                    runtime.resize_4d_tensor(planner_out.float(), sizes[0]))
+                torch.testing.assert_close(target[0][2].float().reshape(expected.shape), expected,
+                                           atol=1e-6, rtol=1e-6)
+                if count:
+                    expected_counts = {(12, 14): solver_calls(solver, 16)}
+                    expected_counts.update({hw: solver_calls(solver, 16 - start)
+                                            for hw, start in zip(sizes, starts)})
+                    assert counts == expected_counts, (solver, counts, expected_counts)
+                else:
+                    assert [r["outer_steps"] for r in reports] == [16] + [16 - start for start in starts], reports
+                    assert all(r["fallback"] is None for r in reports), reports
+                again = native_run(selected, solver, count, limit_px=112, **options)
+                assert same(completed, again[0]) and again[1] == reports, (label, solver)
+                print(json.dumps({"case": label + "_trajectory_auto_native", "sampler": solver,
+                                  "stages": [list(hw) for hw in sizes],
+                                  "start_sigmas": [f[1] for f in target],
+                                  "reasons": [decision.reason for _, decision in decisions],
+                                  "reports": reports}))
+
+        # The limit is read only by trajectory_auto_native.
+        for mode in ("trajectory", "trajectory_auto"):
+            plain = native_run(selected, "er_sde", False, mode=mode, **two_stage)
+            limited = native_run(selected, "er_sde", False, limit_px=112, mode=mode, **two_stage)
+            assert same(plain[0], limited[0]) and plain[1] == limited[1], (label, mode)
+
+    # The learned enlargement feeds the first pass too when it is a completed handoff.
+    learned_first = native_run(model, "er_sde", True, limit_px=112, max_stage_upscale=0.,
+                               latent_upscale_method="sesqui_wan21")
+    interpolated_first = native_run(model, "er_sde", True, limit_px=112, max_stage_upscale=0.)
+    assert learned_first[3] and not same(learned_first[0][:1], interpolated_first[0][:1])
+    assert same(learned_first[0][1:2], interpolated_first[0][1:2])
 
 
     # SA-PECE must preserve its second denoiser prediction at each corrected
@@ -1297,87 +1359,21 @@ def main():
                                           latent_hw=(24, 28))[1]
                     assert not any(r.get("native_only") for r in forecasting), forecasting
 
+    # An interrupted completed-first pass leaves no state behind.
     for label, selected in cases:
-        options = {"mode": "trajectory_auto_observe", "stage_megapixels": "0.08",
-                   "latent_hw": (42, 50), "max_stage_upscale": 0., "planner_mp": .04}
-        reference, before, _, _ = img2img(selected, "er_sde", 16, **options)
-        try:
-            img2img(selected, "er_sde", 16, fail=((42, 50), 1), **options)
-        except comfy.model_management.InterruptProcessingException:
-            pass
-        else:
-            raise AssertionError("structure screening run did not propagate interruption")
-        repeated, after, _, _ = img2img(selected, "er_sde", 16, **options)
+        options = {"mode": "trajectory_auto_native", "max_stage_upscale": 0., "er_sde_max_stage": 1}
+        with patch.object(runtime, "KREA2_NATIVE_MAX_AXIS_PX", 112):
+            reference, before, _, _ = img2img(selected, "er_sde", 16, **options)
+            try:
+                img2img(selected, "er_sde", 16, fail=((16, 20), 1), **options)
+            except comfy.model_management.InterruptProcessingException:
+                pass
+            else:
+                raise AssertionError("trajectory_auto_native did not propagate interruption")
+            repeated, after, _, _ = img2img(selected, "er_sde", 16, **options)
         assert before == after, label
         assert all(torch.equal(a["samples"], b["samples"]) for a, b in zip(reference, repeated))
         assert not base.diffusion_model.last._forward_pre_hooks
-
-    # Inject a known pair only into the observer's inputs after the real
-    # callback has run. The native solver and its forecast ledger are kept
-    # intact. The actual selector must change the delivered latent and the
-    # following stage's source, through the normal node output path.
-    for label, selected in cases:
-        decisions = []
-        starts = []
-        real_finish = runtime.Krea2StructureObserver.finish
-        real_enlarge = runtime._enlarge_stage_source
-        real_wrap = runtime.Krea2StructureObserver.wrap
-
-        def build_scene(hw, device):
-            h, w = hw
-            y = (torch.arange(h, device=device) + .5) / h
-            x = (torch.arange(w, device=device) + .5) / w
-            shape = ((y[:, None] > .22) & (y[:, None] < .78) & (x > .14) & (x < .36))
-            return shape.float()[None, None].expand(1, 16, -1, -1).clone()
-
-        def scene_wrap(self, callback, screen):
-            observe = real_wrap(self, callback, screen)
-
-            def callback_with_known_candidate(step, x0, x, total):
-                if step == len(screen.sigmas) - 3:
-                    # Route the constructed clean prediction to the observer
-                    # only. The original preview still receives native x0.
-                    observe_only = real_wrap(self, lambda *args: None, screen)
-                    scene = build_scene(x0.shape[-2:], x0.device).unsqueeze(2)
-                    observe_only(step, scene, x, total)
-                    callback(step, x0, x, total)
-                else:
-                    observe(step, x0, x, total)
-            return callback_with_known_candidate
-
-        def scene_finish(self, screen, stage, samples, diagnostics=None):
-            assert self.penultimate is not None, (label, stage)
-            expected = self.model.model.process_latent_out(self.penultimate)
-            screen.reference = runtime.reduce_latent(self.penultimate, screen.hw)
-            altered = self.penultimate.clone()
-            h, w = altered.shape[-2:]
-            altered[..., h // 3:h * 2 // 3, w * 2 // 3:w * 5 // 6] += 1
-            terminal = self.model.model.process_latent_out(altered)
-            corrected, indices = real_finish(self, screen, stage, terminal, diagnostics)
-            assert indices == [0], (label, stage)
-            assert torch.equal(corrected, expected) and not torch.equal(corrected, terminal)
-            decisions.append(corrected.clone())
-            return corrected, indices
-
-        def capture_enlargement(model, source, *args):
-            starts.append(source.clone())
-            return real_enlarge(model, source, *args)
-
-        options = {"stage_megapixels": "0.47", "latent_hw": (96, 128), "max_stage_upscale": 0.,
-                   "planner_mp": .24, "composition_lock_sigma": .35, "er_sde_max_stage": 1}
-        _, control_reports, _, _ = img2img(selected, "er_sde", 16, mode="trajectory_auto", **options)
-        with patch.object(runtime.Krea2StructureObserver, "wrap", scene_wrap), patch.object(runtime.Krea2StructureObserver, "finish", scene_finish), patch.object(
-            runtime, "_enlarge_stage_source", capture_enlargement
-        ):
-            corrected, reports, _, _ = img2img(selected, "er_sde", 16, mode="trajectory_auto_correct", **options)
-        assert len(starts) == 1 and len(decisions) == 2
-        assert torch.equal(starts[0], decisions[0])
-        assert all(torch.equal(corrected[i]["samples"], decisions[-1]) for i in (0, 2))
-        if label == "spectrum":
-            fields = ("outer_steps", "denoiser_calls", "actual", "forecast", "fallback")
-            assert [{k: r[k] for k in fields} for r in reports] == [
-                {k: r[k] for k in fields} for r in control_reports
-            ]
 
     # Spectrum stays operational in the planner and in every img2img stage.
     if reports_context is not None:
