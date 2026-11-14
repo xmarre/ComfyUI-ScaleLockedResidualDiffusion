@@ -367,11 +367,17 @@ def main():
 
             with patch.object(runtime, "choose_refinement_restart", capture_decision), patch.object(
                 selected.model.model_sampling, "noise_scaling", capture_forward
-            ):
+            ), patch.object(runtime._LOGGER, "info", wraps=runtime._LOGGER.info) as recorded_logs:
                 auto, reports, counts = controls(
                     selected, sampler_name, "simple", 1.0, steps, label == "native",
                     regeneration_mode="trajectory_auto", **options,
                 )
+            # The default handoff_diagnostics=off must still identify
+            # the selected native restart for real-checkpoint comparisons.
+            assert any(
+                call.args and call.args[0].startswith("Krea 2 trajectory_auto restart:")
+                for call in recorded_logs.call_args_list
+            ), (label, sampler_name)
             assert len(decisions) == len(restarts) == 1
             decision = decisions[0]
             schedule = runtime.calculate_sigmas(selected, scheduler="simple", steps=steps, denoise=1.0)
