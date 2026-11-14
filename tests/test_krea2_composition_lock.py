@@ -636,3 +636,21 @@ def test_native_first_stage_grid(planner, final, expected):
         # No larger even grid of the same orientation stays in range.
         assert max(grid) == 256
         assert abs(grid[0] / grid[1] - final[0] / final[1]) < 2 / min(grid)
+
+
+@pytest.mark.parametrize("planner, cap, expected", [
+    ((144, 216), 4.0, (170, 256)),  # Existing user-scale ladder unchanged
+    ((96, 144), 2.0, (134, 204)),
+    ((64, 96), 4.0, (168, 252)),
+    ((64, 96), 2.0, (126, 192)),
+    ((64, 96), 1.0, None),
+    ((64, 96), 0.0, (170, 256)),  # Native-mode exception to no stage splitting
+])
+def test_native_first_stage_respects_area_cap(planner, cap, expected):
+    target = (418, 628)
+    grid = runtime.krea2_native_first_stage_hw(planner, target, cap)
+    assert grid == expected
+    if grid is not None and cap > 0:
+        assert grid[0] * grid[1] <= planner[0] * planner[1] * cap
+        assert runtime.krea2_within_native_range(grid)
+        assert all(a > b for a, b in zip(grid, planner))
