@@ -277,6 +277,24 @@ runtime and does not load weights independently.
     `composition_lock_sigma` the first high-resolution stage follows the
     planner's denoising trajectory (its intermediate denoised predictions),
     then refines freely.
+  - `trajectory_auto` (experimental) uses the same planner and first
+    high-resolution pass. For each later pass it uses the completed source
+    and the selected enlargement method to choose a restart on the existing
+    schedule. There are no per-stage noise or step settings. With only one
+    high-resolution pass it produces the same result as `trajectory`.
+    See [Automatic trajectory refinement](docs/krea2-auto-refinement.md)
+    for the selection rule and a matched-seed comparison procedure.
+  - `trajectory_auto_native` (experimental) places the trajectory-driven
+    refinement inside the model's 2048-pixel-per-axis range. With empty
+    `stage_megapixels` the first stage becomes the largest in-range size of
+    the output aspect ratio that respects positive `max_stage_upscale` limits
+    from the planner. A value of 0 disables the area cap but still inserts an
+    in-range stage. Every pass above the range restarts from a completed
+    latent at an automatically selected sigma. With both band locks at zero,
+    a coarse schedule can retime the last two evaluations when their native
+    restart exceeds the measured structure limit. For outputs inside
+    the range it is identical to `trajectory_auto`. See
+    [Automatic trajectory refinement](docs/krea2-auto-refinement.md#native-range-first-refinement).
   - `planner_final_img2img` runs the planner to completion and treats its
     finished latent as an image to refine. Each high-resolution stage resizes
     the finished latent of the stage below (the planner for the first stage),
@@ -487,7 +505,7 @@ runtime and does not load weights independently.
     Every random field is seeded, so identical settings reproduce the same
     trajectory (bitwise only where the device kernels are deterministic).
   - **In other modes** a connected `spectral_calibration` never changes
-    sampling. In `trajectory` mode it logs, for each handoff, the lowest
+    sampling. In both trajectory modes it logs, for each handoff, the lowest
     release sigma at which frequencies above the source grid are still noise
     dominated, and warns when `composition_lock_sigma` is below it (risk of
     defocus). Saved `progressive_transition_sigmas` values are ignored in
