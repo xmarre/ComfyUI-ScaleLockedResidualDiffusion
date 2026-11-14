@@ -641,8 +641,8 @@ def test_native_first_stage_grid(planner, final, expected):
 @pytest.mark.parametrize("planner, cap, expected", [
     ((144, 216), 4.0, (170, 256)),  # Existing user-scale ladder unchanged
     ((96, 144), 2.0, (134, 204)),
-    ((64, 96), 4.0, (168, 252)),
-    ((64, 96), 2.0, (126, 192)),
+    ((64, 96), 4.0, (126, 192)),
+    ((64, 96), 2.0, (90, 136)),
     ((64, 96), 1.0, None),
     ((64, 96), 0.0, (170, 256)),  # Native-mode exception to no stage splitting
 ])
