@@ -343,7 +343,9 @@ class Krea2TurboFlowAlignedRegenerate:
                                "trajectory_auto (experimental): keep the first trajectory refinement and choose "
                                "native restart steps automatically for later completed-latent handoffs. "
                                "trajectory_auto_observe: same sampling as trajectory_auto, with local structural "
-                               "comparison of unlocked predictions and completed stages in the log."}),
+                               "comparison of unlocked predictions and completed stages in the log. "
+                               "trajectory_auto_correct (experimental): select an earlier native clean prediction "
+                               "at a stage boundary when structural and detail checks support it."}),
                 "img2img_start_sigma": ("FLOAT", {"default": 0.65, "min": 0.01, "max": 0.99, "step": 0.01,
                     "tooltip": "planner_final_img2img only: noise level the finished image is re-noised to before "
                                "each high-resolution stage. The first sigma of the native refinement suffix is "

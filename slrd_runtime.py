@@ -23,6 +23,7 @@ import latent_preview
 
 from .auto_refinement import RefinementRestart, choose_refinement_restart
 from .krea2_flow import build_patch_coupled_noise
+from .structure_correction import select_structure_candidate
 from .structure_screening import MIN_AXIS, StageStructureScreen, analysis_hw, reduce_latent
 from .spectral_progressive import (
     describe_calibration,
@@ -1246,16 +1247,17 @@ def sample_with_runtime(
     finally:
         if restore_after:
             restore_original_predict_noise(guider)
+    changed = False
+    if screen is not None:
+        samples, changed = structure_observer.finish(screen, 0, samples, diagnostics)
     if diagnostics is not None:
         diagnostics.save_completed(0, samples, final=True)
-    if screen is not None:
-        structure_observer.finish(screen, 0, samples)
     samples = samples.to(comfy.model_management.intermediate_device())
 
     out = clean_latent(runtime.highres_latent)
     out["samples"] = samples
 
-    if "x0" in x0_output:
+    if "x0" in x0_output and not changed:
         try:
             x0_out = runtime.model.model.process_latent_out(x0_output["x0"].cpu())
         except Exception:
@@ -1294,9 +1296,11 @@ def _stage_seed(detail_seed: int, stage_index: int) -> int:
 class Krea2StructureObserver:
     """Observe the clean estimate consumed by the solver's outer callback."""
 
-    def __init__(self, model, seed):
+    def __init__(self, model, seed, *, correct=False):
         self.model = model
         self.seed = int(seed)
+        self.correct = correct
+        self.penultimate = None
         self.noise_scale = float(getattr(_model_sampling_obj(model), "noise_scale", 1.0))
 
     def _internal_grid(self, samples, hw):
@@ -1307,31 +1311,63 @@ class Krea2StructureObserver:
         return self.model.model.process_latent_in(reduced.unsqueeze(2)).squeeze(2)
 
     def stage(self, source, target_hw, sigmas, lock_sigma, enlarged_source=None):
+        self.penultimate = None
         hw = analysis_hw(source.shape[-2:], target_hw)
         reference = self._internal_grid(source, hw)
         if reference is None:
             return None
         screen = StageStructureScreen(reference, sigmas, lock_sigma, self.noise_scale)
-        if enlarged_source is not None and min(hw) >= MIN_AXIS:
+        if not self.correct and enlarged_source is not None and min(hw) >= MIN_AXIS:
             enlarged = self._internal_grid(enlarged_source, hw)
             if enlarged is not None:
                 screen.record("enlarged_source", enlarged)
         return screen
 
-    @staticmethod
-    def wrap(callback, screen):
+    def wrap(self, callback, screen):
         if screen is None:
             return callback
 
         def observe(step, x0, x, total_steps):
-            screen.record("prediction", x0, step)
+            if self.correct:
+                # Hold one independently owned clean prediction. No state
+                # or forecast-history tensor is modified by this callback.
+                if (screen.reference is not None and step == len(screen.sigmas) - 3
+                        and step >= screen.first and total_steps == len(screen.sigmas) - 1
+                        and 0. == screen.sigmas[-1] < screen.sigmas[step + 1] < screen.sigmas[step] < 1.):
+                    self.penultimate = x0.detach().clone()
+            else:
+                screen.record("prediction", x0, step)
             callback(step, x0, x, total_steps)
 
         return observe
 
-    def finish(self, screen, stage, samples):
+    def finish(self, screen, stage, samples, diagnostics=None):
         if screen is None:
-            return
+            return samples, False
+        if self.correct:
+            earlier, self.penultimate = self.penultimate, None
+            selected, receipt = select_structure_candidate(
+                screen.reference, earlier, samples, self.model.model.process_latent_in,
+            )
+            if selected:
+                if diagnostics is not None and diagnostics.save:
+                    diagnostics._save(f"stage{stage}_native_completed", samples)
+                result = samples.clone()
+                for index in selected:
+                    replacement = self.model.model.process_latent_out(earlier[index:index + 1])
+                    result[index:index + 1].copy_(replacement)
+                samples = result
+            record = {"seed": self.seed, "stage": stage, "source_grid_hw": list(screen.hw),
+                      "candidate_sigma": screen.sigmas[-3] if earlier is not None else None,
+                      "selected": selected, "items": receipt}
+            if screen.reference is None:
+                record["reason"] = "comparison_grid_too_small"
+            elif earlier is None:
+                record["reason"] = "no_unlocked_penultimate_prediction"
+            elif not receipt:
+                record["reason"] = "incompatible_candidate_geometry"
+            _LOGGER.info("Krea 2 structure correction: %s", json.dumps(record, allow_nan=False))
+            return samples, bool(selected)
         if min(screen.hw) >= MIN_AXIS:
             completed = self._internal_grid(samples, screen.hw)
             if completed is not None:
@@ -1343,6 +1379,7 @@ class Krea2StructureObserver:
             **screen.report(),
         }
         _LOGGER.info("Krea 2 structure screening: %s", json.dumps(record, allow_nan=False))
+        return samples, False
 
 
 def _run_resolution_ladder(
@@ -1426,6 +1463,7 @@ def _run_resolution_ladder(
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
     x0_output: dict = {}
     finished = None
+    changed = False
     if diagnostics is not None:
         diagnostics.set_planner(lowres_out["samples"])
 
@@ -1563,17 +1601,17 @@ def _run_resolution_ladder(
             )
         finally:
             restore_original_predict_noise(guider)
+        if screen is not None:
+            finished, changed = structure_observer.finish(screen, index, finished, diagnostics)
         if diagnostics is not None:
             diagnostics.save_completed(index, finished, final=final)
-        if screen is not None:
-            structure_observer.finish(screen, index, finished)
         if final:
             x0_output = stage_x0
 
     samples = finished.to(comfy.model_management.intermediate_device())
     out = clean_latent(highres_latent)
     out["samples"] = samples
-    if "x0" in x0_output:
+    if "x0" in x0_output and not changed:
         try:
             x0_out = model.model.process_latent_out(x0_output["x0"].cpu())
         except Exception:
@@ -1586,7 +1624,7 @@ def _run_resolution_ladder(
 
 
 REGENERATION_MODES = ("trajectory", "planner_final_img2img", "planner_final_upscale_only", "planner_final_native_refine",
-                      "spectral_progressive", "trajectory_auto", "trajectory_auto_observe")
+                      "spectral_progressive", "trajectory_auto", "trajectory_auto_observe", "trajectory_auto_correct")
 KREA2_NATIVE_MAX_AXIS_PX = 2048
 HANDOFF_DIAGNOSTIC_MODES = ("off", "log", "log_and_save_latents")
 
@@ -2310,7 +2348,10 @@ def run_scale_locked_ksampler(
         raise ValueError("planner_final_native_refine requires latent_upscale_method=sesqui_wan21")
     if regeneration_mode not in REGENERATION_MODES:
         raise ValueError(f"regeneration_mode must be one of {', '.join(REGENERATION_MODES)}")
-    observe_structure = regeneration_mode == "trajectory_auto_observe"
+    correct_structure = regeneration_mode == "trajectory_auto_correct"
+    observe_structure = regeneration_mode == "trajectory_auto_observe" or correct_structure
+    if correct_structure and isinstance(latent_image.get("noise_mask"), torch.Tensor):
+        raise ValueError("trajectory_auto_correct does not support latent noise masks")
     auto_refinement = regeneration_mode == "trajectory_auto" or observe_structure
     if auto_refinement and stage_hw and (not add_noise or noise_mode != "patch_coupled"):
         raise ValueError("trajectory_auto requires added patch-coupled noise for completed-latent handoffs")
@@ -2492,7 +2533,7 @@ def run_scale_locked_ksampler(
 
     diagnostics = (None if handoff_diagnostics == "off" else
                    Krea2HandoffDiagnostics(model, handoff_diagnostics, regeneration_mode, int(seed)))
-    structure_observer = Krea2StructureObserver(model, seed) if observe_structure else None
+    structure_observer = Krea2StructureObserver(model, seed, correct=correct_structure) if observe_structure else None
     if upscale_only:
         return _run_planner_final_upscale_only(
             model=model, highres_latent=highres_latent, lowres_out=lowres_out,
