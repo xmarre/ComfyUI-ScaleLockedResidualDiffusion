@@ -22,11 +22,11 @@ _SPECTRAL_SPEC = importlib.util.spec_from_file_location("slrd_controls_spectral"
 spectral = importlib.util.module_from_spec(_SPECTRAL_SPEC)
 _SPECTRAL_SPEC.loader.exec_module(spectral)
 REGENERATION_MODES = ("trajectory", "planner_final_img2img", "planner_final_upscale_only",
-                      "planner_final_native_refine", "spectral_progressive", "trajectory_auto", "trajectory_auto_observe", "trajectory_auto_correct")
+                      "planner_final_native_refine", "spectral_progressive", "trajectory_auto", "trajectory_auto_native")
 SAMPLERS = ("euler", "dpmpp_2m", "res_multistep", "deis", "ipndm", "ipndm_v", "gradient_estimation", "er_sde", "sa_solver", "sa_solver_pece")
 
 
-def _node():
+def _node(native_first=None, planned=()):
     source = ast.parse((ROOT / "nodes.py").read_text())
     cls = next(n for n in source.body if isinstance(n, ast.ClassDef)
                and n.name == "Krea2TurboFlowAlignedRegenerate")
@@ -35,6 +35,7 @@ def _node():
         pass
 
     calls = []
+    planning = []
     model = SimpleNamespace(
         model=Krea2(),
         get_model_object=lambda name: SimpleNamespace(shift=1.15),
@@ -69,8 +70,9 @@ def _node():
         "parse_stage_megapixels": lambda text: (
             [float(x) for x in text.split(",") if x.strip()] if text else []
         ),
-        "plan_stage_megapixels": lambda *args: [],
+        "plan_stage_megapixels": lambda *args: (planning.append(args), list(planned))[1],
         "krea2_native_refine_hw": lambda planner, target: (256, 256),
+        "krea2_native_first_stage_hw": lambda planner, target: native_first,
         "full_lock_prefix_length": prefix,
         "calculate_sigmas": calculate_sigmas,
         "effective_er_sde_sigmas": lambda sigmas, model: sigmas,
@@ -96,6 +98,7 @@ def _node():
     node = namespace[cls.name]()
     latent = {"samples": torch.zeros(1, 16, 200, 200)}
     base_args = (model, "positive", "negative", latent, 42, 1.0, 0.0, 0.0)
+    node.planning = planning
     return node, calls, base_args
 
 
@@ -589,3 +592,32 @@ def test_trajectory_auto_uses_existing_widgets_without_manual_refinement_sigmas(
     assert call["stage_hw"]
     assert call["img2img_start_sigma"] is None
     assert call["progressive_transition_sigmas"] == []
+
+
+def test_trajectory_auto_native_plans_the_in_range_grid_as_first_stage():
+    # Planner 1 MP -> (124, 124) on the test grid; output (200, 200).
+    node, calls, args = _node(native_first=(150, 150), planned=(2.0,))
+    node.sample(*args, regeneration_mode="trajectory_auto_native")
+    call = calls[-1]
+    assert call["regeneration_mode"] == "trajectory_auto_native"
+    # The in-range grid leads; later stages are planned from it, not from the planner.
+    assert call["stage_hw"] == ((150, 150), (176, 176))
+    assert node.planning[-1][0] == 150 * 150 * 64.0
+    assert call["img2img_start_sigma"] is None
+
+
+def test_trajectory_auto_native_without_an_in_range_grid_keeps_the_planned_layout():
+    node, calls, args = _node(native_first=None, planned=(2.0,))
+    node.sample(*args, regeneration_mode="trajectory_auto_native")
+    assert calls[-1]["stage_hw"] == ((176, 176),)
+    assert node.planning[-1][0] == 124 * 124 * 64.0
+
+
+def test_native_first_stage_is_specific_to_its_mode_and_respects_explicit_stages():
+    node, calls, args = _node(native_first=(150, 150), planned=(2.0,))
+    node.sample(*args, regeneration_mode="trajectory_auto")
+    assert calls[-1]["stage_hw"] == ((176, 176),)
+    node.sample(*args, regeneration_mode="trajectory")
+    assert calls[-1]["stage_hw"] == ((176, 176),)
+    node.sample(*args, regeneration_mode="trajectory_auto_native", stage_megapixels="2")
+    assert calls[-1]["stage_hw"] == ((176, 176),)

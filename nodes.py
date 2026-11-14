@@ -32,6 +32,7 @@ from .slrd_runtime import (
     krea2_sampler_names,
     krea2_er_sde_options,
     krea2_sa_solver_options,
+    krea2_native_first_stage_hw,
     krea2_native_refine_hw,
     sa_native_only_scope,
     effective_er_sde_sigmas,
@@ -342,10 +343,11 @@ class Krea2TurboFlowAlignedRegenerate:
                                "latent_upscale_method is inactive in this mode and its saved value is ignored. "
                                "trajectory_auto (experimental): keep the first trajectory refinement and choose "
                                "native restart steps automatically for later completed-latent handoffs. "
-                               "trajectory_auto_observe: same sampling as trajectory_auto, with local structural "
-                               "comparison of unlocked predictions and completed stages in the log. "
-                               "trajectory_auto_correct (experimental): select an earlier clean prediction "
-                               "at a stage boundary when structural and detail checks support it."}),
+                               "trajectory_auto_native (experimental): trajectory_auto, with the pass that refines "
+                               "freely from composition_lock_sigma kept inside the model's 2048-pixel-per-axis "
+                               "range. With empty stage_megapixels the first stage is the largest in-range size of "
+                               "the output aspect ratio; every pass above the range restarts from a completed "
+                               "latent at an automatically selected sigma."}),
                 "img2img_start_sigma": ("FLOAT", {"default": 0.65, "min": 0.01, "max": 0.99, "step": 0.01,
                     "tooltip": "planner_final_img2img only: noise level the finished image is re-noised to before "
                                "each high-resolution stage. The first sigma of the native refinement suffix is "
@@ -534,6 +536,7 @@ class Krea2TurboFlowAlignedRegenerate:
             raise ValueError("Final LATENT must be larger than the planner canvas")
 
         explicit_stages = parse_stage_megapixels(stage_megapixels)
+        native_first = None
         if native_refine:
             if explicit_stages:
                 raise ValueError("planner_final_native_refine computes one 2048px-or-smaller refinement "
@@ -543,9 +546,19 @@ class Krea2TurboFlowAlignedRegenerate:
         elif explicit_stages:
             stage_mp = explicit_stages
         else:
-            stage_mp = plan_stage_megapixels(low_h * low_w * 64.0, target_h * target_w * 64.0, max_stage_upscale)
+            # trajectory_auto_native: the trajectory-driven first stage is the
+            # largest grid inside the model's native range, when one exists
+            # between the planner and an out-of-range output.
+            native_first = (krea2_native_first_stage_hw((low_h, low_w), (target_h, target_w))
+                            if regeneration_mode == "trajectory_auto_native" else None)
+            start_hw = native_first or (low_h, low_w)
+            stage_mp = plan_stage_megapixels(
+                start_hw[0] * start_hw[1] * 64.0, target_h * target_w * 64.0, max_stage_upscale)
         stage_hw = []
         previous = (low_h, low_w)
+        if not native_refine and not explicit_stages and native_first is not None:
+            stage_hw.append(native_first)
+            previous = native_first
         for megapixels in stage_mp:
             hw = latent_target_hw_from_megapixels(latent, megapixels)
             if hw == previous and not explicit_stages:
