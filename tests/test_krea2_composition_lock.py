@@ -603,3 +603,54 @@ def test_img2img_stage_sde_increments_are_separate_from_planner_and_forward_nois
         sde = runtime._img2img_sde_seed(seed, index)
         assert sde not in (planner, runtime._img2img_root_seed(seed, index), runtime._stage_seed(seed, index))
     assert len({runtime._img2img_sde_seed(seed, i) for i in range(3)}) == 3
+
+
+@pytest.mark.parametrize("hw, inside", [((256, 256), True), ((170, 256), True), ((256, 258), False),
+                                         ((204, 308), False), ((2, 2), True)])
+def test_native_range_is_a_per_axis_limit_in_pixels(hw, inside):
+    assert runtime.KREA2_NATIVE_MAX_AXIS_PX == 2048
+    assert runtime.krea2_within_native_range(hw) is inside
+
+
+@pytest.mark.parametrize("planner, final, expected", [
+    # 1152x1728 planner, 3344x5024 output: the 1360x2048 grid of the output aspect.
+    ((144, 216), (418, 628), (170, 256)),
+    ((216, 144), (628, 418), (256, 170)),
+    ((124, 188), (418, 628), (170, 256)),
+    ((128, 128), (512, 512), (256, 256)),
+    # The planner already fills the range on one axis: no larger in-range grid.
+    ((170, 256), (418, 628), None),
+    ((176, 256), (418, 628), None),
+    # The output is itself in range: nothing to plan.
+    ((96, 96), (256, 256), None),
+    ((96, 144), (170, 256), None),
+])
+def test_native_first_stage_grid(planner, final, expected):
+    grid = runtime.krea2_native_first_stage_hw(planner, final)
+    assert grid == expected
+    if grid is not None:
+        assert runtime.krea2_within_native_range(grid)
+        assert grid[0] > planner[0] and grid[1] > planner[1]
+        assert grid[0] <= final[0] and grid[1] <= final[1]
+        assert grid[0] % 2 == 0 and grid[1] % 2 == 0
+        # No larger even grid of the same orientation stays in range.
+        assert max(grid) == 256
+        assert abs(grid[0] / grid[1] - final[0] / final[1]) < 2 / min(grid)
+
+
+@pytest.mark.parametrize("planner, cap, expected", [
+    ((144, 216), 4.0, (170, 256)),  # Existing user-scale ladder unchanged
+    ((96, 144), 2.0, (134, 204)),
+    ((64, 96), 4.0, (126, 192)),
+    ((64, 96), 2.0, (90, 136)),
+    ((64, 96), 1.0, None),
+    ((64, 96), 0.0, (170, 256)),  # Native-mode exception to no stage splitting
+])
+def test_native_first_stage_respects_area_cap(planner, cap, expected):
+    target = (418, 628)
+    grid = runtime.krea2_native_first_stage_hw(planner, target, cap)
+    assert grid == expected
+    if grid is not None and cap > 0:
+        assert grid[0] * grid[1] <= planner[0] * planner[1] * cap
+        assert runtime.krea2_within_native_range(grid)
+        assert all(a > b for a, b in zip(grid, planner))
