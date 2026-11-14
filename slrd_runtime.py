@@ -1423,6 +1423,17 @@ def _run_resolution_ladder(
                         index, source_hw, hw, decision, sigma_values, release,
                         time.perf_counter() - policy_start,
                     )
+                else:
+                    # A default run must reveal whether automatic refinement
+                    # actually shortened this stage or kept the legacy suffix.
+                    _LOGGER.info(
+                        "Krea 2 trajectory_auto restart: stage=%d source=%sx%s target=%sx%s "
+                        "legacy_sigma=%.6f selected_sigma=%.6f legacy_steps=%d "
+                        "selected_steps=%d reason=%s",
+                        index, source_hw[1] * 8, source_hw[0] * 8, hw[1] * 8, hw[0] * 8,
+                        sigma_values[release], sigma_values[stage_start],
+                        total_steps - release, total_steps - stage_start, decision.reason,
+                    )
 
         if sampler_name in SNR_SOLVER_NAMES:
             sampler = _krea2_sampler_object(
