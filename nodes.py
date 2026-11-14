@@ -263,8 +263,9 @@ class Krea2TurboFlowAlignedRegenerate:
                                "smaller outputs or other samplers may need a different release point."}),
                 "max_stage_upscale": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 64.0, "step": 0.25,
                     "tooltip": "Largest pixel-area growth per resolution stage (4.0 = 2x per side). Larger jumps are "
-                               "split into geometrically spaced intermediate stages. 0 always jumps from the planner "
-                               "straight to the output size. Ignored when stage_megapixels is set."}),
+                               "split into geometrically spaced intermediate stages. 0 disables ordinary splitting; "
+                               "trajectory_auto_native can still add a native-range first stage. "
+                               "Ignored when stage_megapixels is set."}),
                 "stage_megapixels": ("STRING", {"default": "", "multiline": False,
                     "tooltip": "Optional explicit intermediate stage sizes in megapixels, ascending and between the "
                                "planner and the output, e.g. '4, 8'. Empty uses max_stage_upscale."}),
@@ -346,8 +347,9 @@ class Krea2TurboFlowAlignedRegenerate:
                                "trajectory_auto_native (experimental): trajectory_auto, with the pass that refines "
                                "freely from composition_lock_sigma kept inside the model's 2048-pixel-per-axis "
                                "range. With empty stage_megapixels the first stage is the largest in-range size of "
-                               "the output aspect ratio; every pass above the range restarts from a completed "
-                               "latent at an automatically selected sigma."}),
+                               "the output aspect ratio allowed by max_stage_upscale (0 removes that area cap). "
+                               "Every pass above the range restarts from a completed latent at an "
+                               "automatically selected sigma."}),
                 "img2img_start_sigma": ("FLOAT", {"default": 0.65, "min": 0.01, "max": 0.99, "step": 0.01,
                     "tooltip": "planner_final_img2img only: noise level the finished image is re-noised to before "
                                "each high-resolution stage. The first sigma of the native refinement suffix is "
