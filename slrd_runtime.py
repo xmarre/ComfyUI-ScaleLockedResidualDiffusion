@@ -3,11 +3,13 @@ from __future__ import annotations
 import contextvars
 import copy
 from contextlib import contextmanager
+import json
 import logging
 import math
 import sys
+import time
 import types
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Optional
 
 import torch
@@ -19,7 +21,10 @@ import comfy.samplers
 import comfy.utils
 import latent_preview
 
+from .auto_refinement import RefinementRestart, choose_refinement_restart
 from .krea2_flow import build_patch_coupled_noise
+from .structure_correction import select_structure_candidate
+from .structure_screening import MIN_AXIS, StageStructureScreen, analysis_hw, reduce_latent
 from .spectral_progressive import (
     describe_calibration,
     expand_flow_state,
@@ -1177,6 +1182,7 @@ def sample_with_runtime(
     analytic_full_lock: bool = False,
     skip_locked_model_calls: bool = False,
     diagnostics: Optional["Krea2HandoffDiagnostics"] = None,
+    structure_observer: Optional["Krea2StructureObserver"] = None,
 ) -> ScaleLockedSampleResult:
     if runtime.sigmas.numel() == 0:
         out = clean_latent(runtime.highres_latent)
@@ -1195,6 +1201,9 @@ def sample_with_runtime(
             )
             if diagnostics is not None:
                 _record_fully_locked_diagnostics(diagnostics, runtime, sigmas, out["samples"])
+            if structure_observer is not None:
+                screen = structure_observer.stage(runtime.lowres_out["samples"], clean.shape[-2:], (), None)
+                structure_observer.finish(screen, 0, out["samples"])
             return ScaleLockedSampleResult(
                 output=out, lowres_planner=clean_latent(runtime.lowres_out), denoised_output=out
             )
@@ -1202,8 +1211,6 @@ def sample_with_runtime(
         # reproducing sigma * noise + (1 - sigma) * clean at the release step.
         sigmas = sigmas[locked_steps:]
         latent_samples = runtime.model.model.process_latent_out(clean).to(dtype=latent_samples.dtype)
-
-    apply_scale_lock_to_guider(guider, runtime, config, skip_locked_model_calls=skip_locked_model_calls)
 
     x0_output = {}
     callback = make_preview_callback(runtime.model, len(sigmas) - 1, x0_output)
@@ -1213,9 +1220,19 @@ def sample_with_runtime(
             callback, stage=0, stage_hw=tuple(latent_samples.shape[-2:]), sigmas=sigmas,
             noise=runtime.highres_noise, source=runtime.lowres_out["samples"], lock_sigma=config.full_lock_sigma,
         )
+    screen = None
+    if structure_observer is not None:
+        effective = effective_er_sde_sigmas(sigmas, runtime.model) if getattr(
+            getattr(sampler, "sampler_function", None), "__name__", ""
+        ) in ("sample_er_sde", "sample_sa_solver", "sample_sa_solver_pece") else sigmas
+        screen = structure_observer.stage(
+            runtime.lowres_out["samples"], latent_samples.shape[-2:], effective.tolist(), config.full_lock_sigma,
+        )
+        callback = structure_observer.wrap(callback, screen)
     noise_mask = runtime.highres_latent.get("noise_mask", None)
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
+    apply_scale_lock_to_guider(guider, runtime, config, skip_locked_model_calls=skip_locked_model_calls)
     try:
         samples = guider.sample(
             runtime.highres_noise,
@@ -1230,6 +1247,9 @@ def sample_with_runtime(
     finally:
         if restore_after:
             restore_original_predict_noise(guider)
+    selected = []
+    if screen is not None:
+        samples, selected = structure_observer.finish(screen, 0, samples, diagnostics)
     if diagnostics is not None:
         diagnostics.save_completed(0, samples, final=True)
     samples = samples.to(comfy.model_management.intermediate_device())
@@ -1242,6 +1262,8 @@ def sample_with_runtime(
             x0_out = runtime.model.model.process_latent_out(x0_output["x0"].cpu())
         except Exception:
             x0_out = x0_output["x0"].detach().cpu()
+        if selected:
+            x0_out = _replace_selected_denoised(x0_out, samples, selected)
         denoised = clean_latent(runtime.highres_latent)
         denoised["samples"] = x0_out
     else:
@@ -1273,6 +1295,102 @@ def _stage_seed(detail_seed: int, stage_index: int) -> int:
     return (int(detail_seed) ^ ((stage_index + 1) * 0xD1B54A32D192ED03)) & 0xFFFFFFFFFFFFFFFF
 
 
+def _replace_selected_denoised(denoised, samples, selected):
+    denoised = denoised.clone()
+    for index in selected:
+        denoised[index:index + 1].copy_(samples[index:index + 1])
+    return denoised
+
+
+class Krea2StructureObserver:
+    """Observe the clean estimate consumed by the solver's outer callback."""
+
+    def __init__(self, model, seed, *, correct=False):
+        self.model = model
+        self.seed = int(seed)
+        self.correct = correct
+        self.penultimate = None
+        self.noise_scale = float(getattr(_model_sampling_obj(model), "noise_scale", 1.0))
+
+    def _internal_grid(self, samples, hw):
+        # Wan 2.1's per-channel affine normalization commutes with pooling.
+        reduced = reduce_latent(samples, hw)
+        if reduced is None:
+            return None
+        return self.model.model.process_latent_in(reduced.unsqueeze(2)).squeeze(2)
+
+    def stage(self, source, target_hw, sigmas, lock_sigma, enlarged_source=None):
+        self.penultimate = None
+        hw = analysis_hw(source.shape[-2:], target_hw)
+        reference = self._internal_grid(source, hw)
+        if reference is None:
+            return None
+        screen = StageStructureScreen(reference, sigmas, lock_sigma, self.noise_scale)
+        if not self.correct and enlarged_source is not None and min(hw) >= MIN_AXIS:
+            enlarged = self._internal_grid(enlarged_source, hw)
+            if enlarged is not None:
+                screen.record("enlarged_source", enlarged)
+        return screen
+
+    def wrap(self, callback, screen):
+        if screen is None:
+            return callback
+
+        def observe(step, x0, x, total_steps):
+            if self.correct:
+                # Hold one independently owned clean prediction. No state
+                # or forecast-history tensor is modified by this callback.
+                if (screen.reference is not None and step == len(screen.sigmas) - 3
+                        and step >= screen.first and total_steps == len(screen.sigmas) - 1
+                        and 0. == screen.sigmas[-1] < screen.sigmas[step + 1] < screen.sigmas[step] < 1.):
+                    self.penultimate = x0.detach().clone()
+            else:
+                screen.record("prediction", x0, step)
+            callback(step, x0, x, total_steps)
+
+        return observe
+
+    def finish(self, screen, stage, samples, diagnostics=None):
+        if screen is None:
+            return samples, []
+        if self.correct:
+            earlier, self.penultimate = self.penultimate, None
+            selected, receipt = select_structure_candidate(
+                screen.reference, earlier, samples, self.model.model.process_latent_in,
+            )
+            if selected:
+                if diagnostics is not None and diagnostics.save:
+                    diagnostics._save(f"stage{stage}_native_completed", samples)
+                result = samples.clone()
+                for index in selected:
+                    replacement = self.model.model.process_latent_out(earlier[index:index + 1])
+                    result[index:index + 1].copy_(replacement)
+                samples = result
+            record = {"seed": self.seed, "stage": stage, "source_grid_hw": list(screen.hw),
+                      "candidate_sigma": screen.sigmas[-3] if earlier is not None else None,
+                      "selected": selected, "items": receipt}
+            if screen.reference is None:
+                record["reason"] = "comparison_grid_too_small"
+            elif earlier is None:
+                record["reason"] = "no_unlocked_penultimate_prediction"
+            elif not receipt:
+                record["reason"] = "incompatible_candidate_geometry"
+            _LOGGER.info("Krea 2 structure correction: %s", json.dumps(record, allow_nan=False))
+            return samples, selected
+        if min(screen.hw) >= MIN_AXIS:
+            completed = self._internal_grid(samples, screen.hw)
+            if completed is not None:
+                screen.record("completed", completed)
+        record = {
+            "seed": self.seed, "stage": stage, "stage_hw": list(samples.shape[-2:]),
+            "prediction_kind": "solver_outer_step",
+            "prediction_provenance": "actual_or_forecast",
+            **screen.report(),
+        }
+        _LOGGER.info("Krea 2 structure screening: %s", json.dumps(record, allow_nan=False))
+        return samples, []
+
+
 def _run_resolution_ladder(
     *,
     model,
@@ -1297,6 +1415,8 @@ def _run_resolution_ladder(
     pece_corrected_anchors: Optional[list] = None,
     diagnostics: Optional["Krea2HandoffDiagnostics"] = None,
     latent_upscale_method: str = "interpolate",
+    auto_refinement: bool = False,
+    structure_observer: Optional[Krea2StructureObserver] = None,
 ) -> ScaleLockedSampleResult:
     """Refine through increasing resolutions, each stage finishing its image.
 
@@ -1305,12 +1425,13 @@ def _run_resolution_ladder(
     integrating the locked prefix natively with the planner predictions in
     place of target model calls, which preserves their multistep history.
     Every later stage re-noises the finished image of the stage below, resized to
-    its own size, to the same release noise level with its own patch-coupled
-    noise, and runs the remaining steps. Each stage therefore repeats the
+    its own size, with its own patch-coupled noise, and runs a native suffix
+    from the release sigma or a later automatically selected restart.
+    Each stage therefore repeats the
     planner-to-2x handoff at a bounded scale ratio, starting from a sharp
     image rather than from mid-noise predictions, whose posterior-mean blur
     a late, low-noise start cannot remove. A later stage is a fresh solver
-    start at the release sigma, so multistep solvers begin it at first order.
+    start, so multistep solvers begin it at first order.
     """
     if config.full_lock_sigma is None:
         raise ValueError("resolution stages require the composition lock")
@@ -1351,6 +1472,7 @@ def _run_resolution_ladder(
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
     x0_output: dict = {}
     finished = None
+    selected = []
     if diagnostics is not None:
         diagnostics.set_planner(lowres_out["samples"])
 
@@ -1367,7 +1489,8 @@ def _run_resolution_ladder(
             mode=noise_mode,
         )
 
-        stage_sigmas = sigmas[release:]
+        stage_start = release
+        stage_sigmas = sigmas[stage_start:]
         if finished is None:
             start_latent = stage_samples
             if not euler:
@@ -1388,14 +1511,53 @@ def _run_resolution_ladder(
                 start_latent = model.model.process_latent_out(clean).to(dtype=stage_samples.dtype)
         else:
             # Output-space latent: CFGGuider.inner_sample applies process_latent_in
-            # and the flow noise scaling re-noises it to the release sigma.
+            # and flow noise scaling re-noises it to the selected start sigma.
             start_latent = _enlarge_stage_source(model, finished, hw, stage_samples, latent_upscale_method)
+            if auto_refinement:
+                source_hw = tuple(finished.shape[-2:])
+                policy_start = time.perf_counter() if diagnostics is not None else None
+                if total_steps - release <= 2:
+                    decision = RefinementRestart(release, "no_shorter_two_step_suffix")
+                else:
+                    with torch.no_grad():
+                        # Measure on the smaller grid. For Wan 2.1 the latent
+                        # transform is channelwise affine and commutes with area resize.
+                        source = model.model.process_latent_in(finished.float())
+                        roundtrip = resize_4d_tensor(start_latent.float(), source_hw).to(source.device)
+                        roundtrip = model.model.process_latent_in(roundtrip)
+                        decision = choose_refinement_restart(
+                            sigma_values, release, source, roundtrip, hw,
+                            float(getattr(_model_sampling_obj(model), "noise_scale", 1.0)),
+                        )
+                        if decision.reason == "invalid_spectral_measurement" and (
+                            not bool(torch.isfinite(source).all()) or not bool(torch.isfinite(roundtrip).all())
+                        ):
+                            raise ValueError("trajectory_auto received a nonfinite completed or enlarged latent")
+                        del source, roundtrip
+                stage_start = decision.index
+                stage_sigmas = sigmas[stage_start:]
+                if diagnostics is not None:
+                    diagnostics.log_restart(
+                        index, source_hw, hw, decision, sigma_values, release,
+                        time.perf_counter() - policy_start,
+                    )
+                else:
+                    # A default run must reveal whether automatic refinement
+                    # actually shortened this stage or kept the legacy suffix.
+                    _LOGGER.info(
+                        "Krea 2 trajectory_auto restart: stage=%d source=%sx%s target=%sx%s "
+                        "legacy_sigma=%.6f selected_sigma=%.6f legacy_steps=%d "
+                        "selected_steps=%d reason=%s",
+                        index, source_hw[1] * 8, source_hw[0] * 8, hw[1] * 8, hw[0] * 8,
+                        sigma_values[release], sigma_values[stage_start],
+                        total_steps - release, total_steps - stage_start, decision.reason,
+                    )
 
         if sampler_name in SNR_SOLVER_NAMES:
             sampler = _krea2_sampler_object(
                 sampler_name, sampler_options, model=model, low_shape=tuple(lowres_noise.shape),
                 stage_shapes=shapes, stage_index=index, seed=stochastic_seed,
-                start_step=0 if finished is None else release,
+                start_step=0 if finished is None else stage_start,
                 sigmas=stage_sigmas, noise_like=stage_noise,
             )
 
@@ -1412,7 +1574,6 @@ def _run_resolution_ladder(
             pece_corrected_anchors=pece_corrected_anchors,
         )
         guider = create_cfg_guider(model, positive, negative, cfg)
-        apply_scale_lock_to_guider(guider, stage_runtime, config, skip_locked_model_calls=True)
         stage_x0: dict = {}
         callback = make_preview_callback(model, len(stage_sigmas) - 1, stage_x0)
         if diagnostics is not None:
@@ -1422,7 +1583,20 @@ def _run_resolution_ladder(
                 noise=stage_noise, source=lowres_out["samples"] if finished is None else finished,
                 lock_sigma=config.full_lock_sigma,
                 enlarged_source=None if finished is None else start_latent,
+                completed_source=finished,
             )
+        screen = None
+        if structure_observer is not None:
+            # Non-Euler's first pass includes the locked prefix. Every
+            # completed handoff uses the suffix at its actual restart.
+            source = lowres_out["samples"] if finished is None else finished
+            visible_sigmas = sigma_values[-len(stage_sigmas):]
+            screen = structure_observer.stage(
+                source, hw, visible_sigmas, config.full_lock_sigma,
+                None if finished is None else start_latent,
+            )
+            callback = structure_observer.wrap(callback, screen)
+        apply_scale_lock_to_guider(guider, stage_runtime, config, skip_locked_model_calls=True)
         try:
             finished = guider.sample(
                 stage_noise,
@@ -1436,6 +1610,8 @@ def _run_resolution_ladder(
             )
         finally:
             restore_original_predict_noise(guider)
+        if screen is not None:
+            finished, selected = structure_observer.finish(screen, index, finished, diagnostics)
         if diagnostics is not None:
             diagnostics.save_completed(index, finished, final=final)
         if final:
@@ -1449,6 +1625,8 @@ def _run_resolution_ladder(
             x0_out = model.model.process_latent_out(x0_output["x0"].cpu())
         except Exception:
             x0_out = x0_output["x0"].detach().cpu()
+        if selected:
+            x0_out = _replace_selected_denoised(x0_out, samples, selected)
         denoised = clean_latent(highres_latent)
         denoised["samples"] = x0_out
     else:
@@ -1457,7 +1635,7 @@ def _run_resolution_ladder(
 
 
 REGENERATION_MODES = ("trajectory", "planner_final_img2img", "planner_final_upscale_only", "planner_final_native_refine",
-                      "spectral_progressive")
+                      "spectral_progressive", "trajectory_auto", "trajectory_auto_observe", "trajectory_auto_correct")
 KREA2_NATIVE_MAX_AXIS_PX = 2048
 HANDOFF_DIAGNOSTIC_MODES = ("off", "log", "log_and_save_latents")
 
@@ -1600,19 +1778,31 @@ class Krea2HandoffDiagnostics:
             if final:
                 self._save("final_output", output_space)
 
+    def log_restart(self, stage, source_hw, target_hw, decision, sigmas, release, elapsed):
+        record = {
+            **asdict(decision), "stage": stage, "source_hw": source_hw, "target_hw": target_hw,
+            "legacy_sigma": sigmas[release], "selected_sigma": sigmas[decision.index],
+            "legacy_steps": len(sigmas) - 1 - release,
+            "selected_steps": len(sigmas) - 1 - decision.index, "policy_seconds": elapsed,
+        }
+        self.records.append(record)
+        _LOGGER.info("Krea 2 trajectory_auto restart: %s", record)
+
     @staticmethod
     def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
         return float((a - b).norm() / b.norm().clamp_min(1e-12))
 
     def wrap(self, callback, *, stage: int, stage_hw, sigmas: torch.Tensor, noise: torch.Tensor,
              source: Optional[torch.Tensor], lock_sigma: Optional[float],
-             enlarged_source: Optional[torch.Tensor] = None):
+             enlarged_source: Optional[torch.Tensor] = None,
+             completed_source: Optional[torch.Tensor] = None):
         if self.reference is None:
             raise RuntimeError("handoff diagnostics need the finished planner first")
         sigma_values = [float(v) for v in sigmas.detach().cpu().tolist()]
         planner_hw = tuple(self.reference.shape[-2:])
         noise_scale = float(getattr(_model_sampling_obj(self.model), "noise_scale", 1.0))
         source_in = None
+        completed_source_in = None
         if source is not None:
             with torch.no_grad():
                 # Compare against the stage's actual clean start latent when the
@@ -1625,6 +1815,11 @@ class Krea2HandoffDiagnostics:
                 source_in = self.model.model.process_latent_in(resized_source)
                 if self.save:
                     self._save(f"stage{stage}_source_resized", resized_source)
+        if completed_source is not None:
+            completed_source_in = self.model.model.process_latent_in(
+                completed_source.detach().to(device="cpu", dtype=torch.float32)
+            )
+            completed_source_hw = tuple(completed_source_in.shape[-2:])
         state = {"previous_locked": None}
 
         def observe(step, x0, x, total_steps):
@@ -1648,6 +1843,10 @@ class Krea2HandoffDiagnostics:
                         record["state_clean_vs_stage_source"] = self._rel(clean, source_in)
                 if source_in is not None:
                     record["x0_vs_stage_source"] = self._rel(pred, source_in)
+                if completed_source_in is not None:
+                    record["x0_vs_previous_stage_lowband"] = self._rel(
+                        resize_4d_tensor(pred, completed_source_hw), completed_source_in
+                    )
                 self.records.append(record)
                 _LOGGER.info("Krea 2 handoff diagnostics: %s", record)
                 if self.save:
@@ -2160,6 +2359,13 @@ def run_scale_locked_ksampler(
         raise ValueError("planner_final_native_refine requires latent_upscale_method=sesqui_wan21")
     if regeneration_mode not in REGENERATION_MODES:
         raise ValueError(f"regeneration_mode must be one of {', '.join(REGENERATION_MODES)}")
+    correct_structure = regeneration_mode == "trajectory_auto_correct"
+    observe_structure = regeneration_mode == "trajectory_auto_observe" or correct_structure
+    if correct_structure and isinstance(latent_image.get("noise_mask"), torch.Tensor):
+        raise ValueError("trajectory_auto_correct does not support latent noise masks")
+    auto_refinement = regeneration_mode == "trajectory_auto" or observe_structure
+    if auto_refinement and stage_hw and (not add_noise or noise_mode != "patch_coupled"):
+        raise ValueError("trajectory_auto requires added patch-coupled noise for completed-latent handoffs")
     progressive = regeneration_mode == "spectral_progressive"
     if (isinstance(spectral_tolerance, bool) or not isinstance(spectral_tolerance, (int, float))
             or not math.isfinite(spectral_tolerance) or not 0.0 < spectral_tolerance < 1.0):
@@ -2192,11 +2398,14 @@ def run_scale_locked_ksampler(
     # sampler execution rather than rejecting an otherwise valid saved graph
     # or forcing an extra diffusion stage. The selected method is explicitly
     # reported as inactive for this invocation.
+    trajectory = regeneration_mode == "trajectory" or auto_refinement
     learned_handoff_unused = (
-        regeneration_mode == "trajectory"
+        trajectory
         and not stage_hw
         and latent_upscale_method != "interpolate"
     )
+    if auto_refinement and not stage_hw:
+        _LOGGER.info("Krea 2 trajectory_auto: no completed-latent handoff; using the first trajectory refinement")
     if learned_handoff_unused:
         _LOGGER.warning(
             "Krea 2 trajectory: latent_upscale_method=%s is inactive for a "
@@ -2282,7 +2491,7 @@ def run_scale_locked_ksampler(
     if spectral_calibration is not None:
         # Outside spectral_progressive the calibration is advisory only: an
         # unusable calibration is reported but never alters or blocks sampling.
-        if regeneration_mode == "trajectory" and config.full_lock_sigma is not None:
+        if trajectory and config.full_lock_sigma is not None:
             sizes = ([tuple(map(int, lowres_latent["samples"].shape[-2:]))] + [tuple(map(int, hw)) for hw in stage_hw]
                      + [tuple(map(int, highres_latent["samples"].shape[-2:]))])
             try:
@@ -2335,6 +2544,7 @@ def run_scale_locked_ksampler(
 
     diagnostics = (None if handoff_diagnostics == "off" else
                    Krea2HandoffDiagnostics(model, handoff_diagnostics, regeneration_mode, int(seed)))
+    structure_observer = Krea2StructureObserver(model, seed, correct=correct_structure) if observe_structure else None
     if upscale_only:
         return _run_planner_final_upscale_only(
             model=model, highres_latent=highres_latent, lowres_out=lowres_out,
@@ -2377,6 +2587,8 @@ def run_scale_locked_ksampler(
             config=config, stage_hw=tuple(stage_hw), sampler_options=sampler_options,
             pece_corrected_anchors=pece_corrections, diagnostics=diagnostics,
             latent_upscale_method=latent_upscale_method,
+            auto_refinement=auto_refinement,
+            structure_observer=structure_observer,
         )
 
     runtime = ScaleLockedRuntimeContext(
@@ -2417,5 +2629,6 @@ def run_scale_locked_ksampler(
         analytic_full_lock=analytic_full_lock,
         skip_locked_model_calls=config.full_lock_sigma is not None,
         diagnostics=diagnostics,
+        structure_observer=structure_observer,
     )
 

@@ -8,6 +8,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+from unittest.mock import patch
 
 
 def main():
@@ -334,6 +335,175 @@ def main():
                               "model_calls": {f"{h}x{w}": n for (h, w), n in counts.items()},
                               "reports": reports}))
 
+    # Validate the real native forward state and shortened schedule, including
+    # the SNR samplers' stochastic/corrector paths and Spectrum call boundaries.
+    for label, selected in cases:
+        for sampler_name in ("euler", "dpmpp_2m", "er_sde", "sa_solver", "sa_solver_pece"):
+            steps = 16
+            options = {
+                "latent": torch.zeros(1, 4, 24, 28), "stage_megapixels": "0.02",
+                "er_sde_max_stage": 1,
+            }
+            reference, legacy_reports, legacy_counts = controls(
+                selected, sampler_name, "simple", 1.0, steps, label == "native", **options,
+            )
+            decisions = []
+            restarts = []
+            real_decide = runtime.choose_refinement_restart
+            real_noise_scaling = selected.model.model_sampling.noise_scaling
+
+            def capture_decision(*args):
+                decision = real_decide(*args)
+                decisions.append(decision)
+                return decision
+
+            def capture_forward(sigma, noise, latent_image, max_denoise=False):
+                value = real_noise_scaling(sigma, noise, latent_image, max_denoise)
+                if noise.shape[-2:] == (24, 28):
+                    scale = getattr(selected.model.model_sampling, "noise_scale", 1.0)
+                    torch.testing.assert_close(value, (1 - sigma) * latent_image + sigma * (scale * noise))
+                    restarts.append(float(sigma))
+                return value
+
+            with patch.object(runtime, "choose_refinement_restart", capture_decision), patch.object(
+                selected.model.model_sampling, "noise_scaling", capture_forward
+            ), patch.object(runtime._LOGGER, "info", wraps=runtime._LOGGER.info) as recorded_logs:
+                auto, reports, counts = controls(
+                    selected, sampler_name, "simple", 1.0, steps, label == "native",
+                    regeneration_mode="trajectory_auto", **options,
+                )
+            # The default handoff_diagnostics=off must still identify
+            # the selected native restart for real-checkpoint comparisons.
+            assert any(
+                call.args and call.args[0].startswith("Krea 2 trajectory_auto restart:")
+                for call in recorded_logs.call_args_list
+            ), (label, sampler_name)
+            assert len(decisions) == len(restarts) == 1
+            decision = decisions[0]
+            schedule = runtime.calculate_sigmas(selected, scheduler="simple", steps=steps, denoise=1.0)
+            release = runtime.full_lock_prefix_length(schedule.tolist(), default_lock)
+            assert decision.index > release and decision.reason == "reduced", decision
+            assert restarts == [float(schedule[decision.index])]
+            assert torch.equal(auto[1]["samples"], reference[1]["samples"])
+            expected_steps = steps - decision.index
+            if label == "native":
+                assert counts[(12, 14)] == legacy_counts[(12, 14)]
+                assert counts[(16, 20)] == legacy_counts[(16, 20)]
+                assert counts[(24, 28)] == solver_calls(sampler_name, expected_steps), counts
+            else:
+                assert len(reports) == 3
+                fields = ("outer_steps", "actual", "forecast", "fallback")
+                for report, legacy in zip(reports[:2], legacy_reports[:2]):
+                    assert tuple(report[k] for k in fields) == tuple(legacy[k] for k in fields), reports
+                assert reports[-1]["outer_steps"] == expected_steps and reports[-1]["fallback"] is None, reports
+            repeat, _, _ = controls(
+                selected, sampler_name, "simple", 1.0, steps, False, regeneration_mode="trajectory_auto", **options,
+            )
+            assert all(torch.equal(a["samples"], b["samples"]) for a, b in zip(auto, repeat)), sampler_name
+            print(json.dumps({"case": label + "_trajectory_auto", "sampler": sampler_name,
+                              "reason": decision.reason, "start_sigma": restarts[0],
+                              "stage_steps": expected_steps, "reports": reports}))
+
+    # Single-stage auto has no completed-latent handoff.
+    single, _, _ = controls(model, "euler", "simple", 1.0, 8, False)
+    single_auto, _, _ = controls(model, "euler", "simple", 1.0, 8, False, regeneration_mode="trajectory_auto")
+    assert all(torch.equal(a["samples"], b["samples"]) for a, b in zip(single, single_auto))
+
+    # A two-step legacy suffix must take the identical native trajectory.
+    short_options = {
+        "latent": torch.zeros(1, 4, 24, 28), "stage_megapixels": "0.02",
+        "composition_lock_sigma": .55,
+    }
+    short, _, _ = controls(model, "er_sde", "simple", 1.0, 8, False, **short_options)
+    short_auto, _, _ = controls(
+        model, "er_sde", "simple", 1.0, 8, False, regeneration_mode="trajectory_auto", **short_options,
+    )
+    assert all(torch.equal(a["samples"], b["samples"]) for a, b in zip(short, short_auto))
+
+    # Measure the real learned enlargement and honor the model noise scale.
+    measured_scales = []
+    real_decide = runtime.choose_refinement_restart
+
+    def record_scale(*args):
+        measured_scales.append(args[-1])
+        return real_decide(*args)
+
+    with patch.object(model.model.model_sampling, "noise_scale", 1.25, create=True), patch.object(
+        runtime, "choose_refinement_restart", record_scale
+    ):
+        learned, _, _ = controls(
+            model, "euler", "simple", 1.0, 16, False, regeneration_mode="trajectory_auto",
+            latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02", latent_upscale_method="sesqui_wan21",
+        )
+    assert measured_scales == [1.25]
+    assert learned[0]["samples"].shape[-2:] == (24, 28)
+
+    # Observe real solver callbacks at a size large enough to score both
+    # scales. Neither prediction values nor Spectrum call receipts may change.
+    for label, selected in cases:
+        for solver in ("euler", "dpmpp_2m", "er_sde", "sa_solver", "sa_solver_pece"):
+            captured = []
+            observer_info = runtime._LOGGER.info
+
+            def capture_structure(message, *args, **kwargs):
+                if message == "Krea 2 structure screening: %s":
+                    captured.append(json.loads(args[0]))
+                return observer_info(message, *args, **kwargs)
+
+            def observe_run(mode, *, ladder=True):
+                reports = []
+                token = reports_context.set(reports) if reports_context is not None else None
+                try:
+                    with torch.inference_mode():
+                        out = node.sample(
+                            selected, positive, negative, {"samples": torch.zeros(1, 4, 42, 50)},
+                            42, .04, 0., 0., steps=16, sampler_name=solver, er_sde_max_stage=1,
+                            max_stage_upscale=0., stage_megapixels="0.08" if ladder else "",
+                            regeneration_mode=mode, sa_spectrum_forecasts=True,
+                        )
+                    return out, reports
+                finally:
+                    if token is not None:
+                        reports_context.reset(token)
+
+            reference, before = observe_run("trajectory_auto")
+            with patch.object(runtime._LOGGER, "info", capture_structure):
+                observed, after = observe_run("trajectory_auto_observe")
+            assert before == after, (label, solver)
+            assert all(torch.equal(a["samples"], b["samples"]) for a, b in zip(reference, observed))
+            assert [r["stage"] for r in captured] == [0, 1]
+            first, later = (r["images"][0]["candidates"] for r in captured)
+            assert [x["kind"] for x in first] == ["prediction"] * 5 + ["completed"], first
+            assert later[0]["kind"] == "enlarged_source" and later[-1]["kind"] == "completed", later
+            assert 2 <= len(later) - 2 <= 5
+            assert all(c["sigma"] <= default_lock for c in first if c["kind"] == "prediction")
+            if label == "spectrum":
+                assert all(r["fallback"] is None for r in after), after
+                assert after[-1]["outer_steps"] == len(later) - 2
+            captured.clear()
+
+            def capture_correction(message, *args, **kwargs):
+                if message == "Krea 2 structure correction: %s":
+                    captured.append(json.loads(args[0]))
+                return observer_info(message, *args, **kwargs)
+
+            # Tiny random weights provide no labeled geometry. Test the
+            # neutral selector path without depending on their image quality.
+            with patch.object(runtime._LOGGER, "info", capture_correction), patch.object(
+                runtime, "select_structure_candidate", return_value=([], [])
+            ):
+                neutral, neutral_reports = observe_run("trajectory_auto_correct")
+            assert before == neutral_reports
+            assert all(torch.equal(a["samples"], b["samples"]) for a, b in zip(reference, neutral))
+            assert len(captured) == 2 and all(not c["selected"] for c in captured)
+            if solver == "er_sde":
+                captured.clear()
+                with patch.object(runtime._LOGGER, "info", capture_structure):
+                    single, after = observe_run("trajectory_auto_observe", ladder=False)
+                plain, before = observe_run("trajectory_auto", ladder=False)
+                assert before == after
+                assert all(torch.equal(a["samples"], b["samples"]) for a, b in zip(plain, single))
+                assert len(captured) == 1 and captured[0]["images"][0]["candidates"][0]["sigma"] <= default_lock
 
 
     # SA-PECE must preserve its second denoiser prediction at each corrected
@@ -741,7 +911,7 @@ def main():
     model_sampling = model.get_model_object("model_sampling")
 
     def img2img(selected, sampler_name, steps, *, latent_hw=(16, 20), capture_inputs=False,
-                mode="planner_final_img2img", fail=None, start_sigma=None, **extra):
+                mode="planner_final_img2img", fail=None, start_sigma=None, planner_mp=.01, **extra):
         if sampler_name in ("sa_solver", "sa_solver_pece"):
             extra.setdefault("sa_spectrum_forecasts", True)
         reports, stages, inputs = [], [], []
@@ -780,7 +950,7 @@ def main():
             with torch.inference_mode():
                 result = node.sample(
                     selected, positive, negative, {"samples": torch.zeros(1, 4, *latent_hw)},
-                    42, .01, 0.0, 0.0, steps=steps, sampler_name=sampler_name,
+                    42, planner_mp, 0.0, 0.0, steps=steps, sampler_name=sampler_name,
                     regeneration_mode=mode,
                     img2img_start_sigma=img2img_sigma if start_sigma is None else start_sigma,
                     **extra,
@@ -1126,6 +1296,88 @@ def main():
                     forecasting = img2img(selected, sampler_name, 8, stage_megapixels="0.02",
                                           latent_hw=(24, 28))[1]
                     assert not any(r.get("native_only") for r in forecasting), forecasting
+
+    for label, selected in cases:
+        options = {"mode": "trajectory_auto_observe", "stage_megapixels": "0.08",
+                   "latent_hw": (42, 50), "max_stage_upscale": 0., "planner_mp": .04}
+        reference, before, _, _ = img2img(selected, "er_sde", 16, **options)
+        try:
+            img2img(selected, "er_sde", 16, fail=((42, 50), 1), **options)
+        except comfy.model_management.InterruptProcessingException:
+            pass
+        else:
+            raise AssertionError("structure screening run did not propagate interruption")
+        repeated, after, _, _ = img2img(selected, "er_sde", 16, **options)
+        assert before == after, label
+        assert all(torch.equal(a["samples"], b["samples"]) for a, b in zip(reference, repeated))
+        assert not base.diffusion_model.last._forward_pre_hooks
+
+    # Inject a known pair only into the observer's inputs after the real
+    # callback has run. The native solver and its forecast ledger are kept
+    # intact. The actual selector must change the delivered latent and the
+    # following stage's source, through the normal node output path.
+    for label, selected in cases:
+        decisions = []
+        starts = []
+        real_finish = runtime.Krea2StructureObserver.finish
+        real_enlarge = runtime._enlarge_stage_source
+        real_wrap = runtime.Krea2StructureObserver.wrap
+
+        def build_scene(hw, device):
+            h, w = hw
+            y = (torch.arange(h, device=device) + .5) / h
+            x = (torch.arange(w, device=device) + .5) / w
+            shape = ((y[:, None] > .22) & (y[:, None] < .78) & (x > .14) & (x < .36))
+            return shape.float()[None, None].expand(1, 16, -1, -1).clone()
+
+        def scene_wrap(self, callback, screen):
+            observe = real_wrap(self, callback, screen)
+
+            def callback_with_known_candidate(step, x0, x, total):
+                if step == len(screen.sigmas) - 3:
+                    # Route the constructed clean prediction to the observer
+                    # only. The original preview still receives native x0.
+                    observe_only = real_wrap(self, lambda *args: None, screen)
+                    scene = build_scene(x0.shape[-2:], x0.device).unsqueeze(2)
+                    observe_only(step, scene, x, total)
+                    callback(step, x0, x, total)
+                else:
+                    observe(step, x0, x, total)
+            return callback_with_known_candidate
+
+        def scene_finish(self, screen, stage, samples, diagnostics=None):
+            assert self.penultimate is not None, (label, stage)
+            expected = self.model.model.process_latent_out(self.penultimate)
+            screen.reference = runtime.reduce_latent(self.penultimate, screen.hw)
+            altered = self.penultimate.clone()
+            h, w = altered.shape[-2:]
+            altered[..., h // 3:h * 2 // 3, w * 2 // 3:w * 5 // 6] += 1
+            terminal = self.model.model.process_latent_out(altered)
+            corrected, indices = real_finish(self, screen, stage, terminal, diagnostics)
+            assert indices == [0], (label, stage)
+            assert torch.equal(corrected, expected) and not torch.equal(corrected, terminal)
+            decisions.append(corrected.clone())
+            return corrected, indices
+
+        def capture_enlargement(model, source, *args):
+            starts.append(source.clone())
+            return real_enlarge(model, source, *args)
+
+        options = {"stage_megapixels": "0.47", "latent_hw": (96, 128), "max_stage_upscale": 0.,
+                   "planner_mp": .24, "composition_lock_sigma": .35, "er_sde_max_stage": 1}
+        _, control_reports, _, _ = img2img(selected, "er_sde", 16, mode="trajectory_auto", **options)
+        with patch.object(runtime.Krea2StructureObserver, "wrap", scene_wrap), patch.object(runtime.Krea2StructureObserver, "finish", scene_finish), patch.object(
+            runtime, "_enlarge_stage_source", capture_enlargement
+        ):
+            corrected, reports, _, _ = img2img(selected, "er_sde", 16, mode="trajectory_auto_correct", **options)
+        assert len(starts) == 1 and len(decisions) == 2
+        assert torch.equal(starts[0], decisions[0])
+        assert all(torch.equal(corrected[i]["samples"], decisions[-1]) for i in (0, 2))
+        if label == "spectrum":
+            fields = ("outer_steps", "denoiser_calls", "actual", "forecast", "fallback")
+            assert [{k: r[k] for k in fields} for r in reports] == [
+                {k: r[k] for k in fields} for r in control_reports
+            ]
 
     # Spectrum stays operational in the planner and in every img2img stage.
     if reports_context is not None:
