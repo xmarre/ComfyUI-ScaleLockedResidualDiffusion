@@ -47,7 +47,7 @@ The policy uses no additional denoiser calls. It computes two source-grid FFTs a
 | Layout | First high-resolution pass | Later passes |
 | --- | --- | --- |
 | Output inside the range | Unchanged trajectory pass. Identical to `trajectory_auto`. | Automatic restarts |
-| Output outside the range, `stage_megapixels` empty, an in-range grid larger than the planner exists | Trajectory pass on the largest in-range grid of the output aspect ratio (for a 3344 x 5024 output: 1360 x 2048). Remaining stages are spaced geometrically from that grid with `max_stage_upscale`. | Automatic restarts |
+| Output outside the range, `stage_megapixels` empty, an in-range grid larger than the planner exists | Trajectory pass on the largest in-range grid of the output aspect ratio that respects a positive `max_stage_upscale` from the planner. When the cap permits it (as for a 1152×1728 planner and 3344×5024 output with cap 4), this is 1360×2048. A zero cap retains the native-range first pass instead of disabling it. Remaining stages are spaced geometrically from that grid. | Automatic restarts |
 | First grid outside the range (explicit `stage_megapixels`, or a planner that already fills the range) | Completed-latent handoff from the finished planner with an automatic restart, like every later pass. No pass refines from `composition_lock_sigma`. | Automatic restarts |
 
 The rule moves where the free refinement happens. It does not inspect or alter predictions, adds no model evaluation, and uses the same handoff, noise coupling, solver restarts and restart selection as `trajectory_auto`. The planned in-range stage is smaller than a geometrically spaced first stage, so a layout can gain one short pass.
