@@ -1787,16 +1787,32 @@ def krea2_within_native_range(hw) -> bool:
     return max(map(int, hw)) * 8 <= KREA2_NATIVE_MAX_AXIS_PX
 
 
-def krea2_native_first_stage_hw(planner_hw: tuple, final_hw: tuple) -> Optional[tuple]:
-    """Largest in-range grid of the final aspect ratio that still enlarges the
-    planner on both axes, or ``None`` when no such grid exists or the final
-    grid is itself in range."""
+def krea2_native_first_stage_hw(
+    planner_hw: tuple, final_hw: tuple, max_stage_upscale: float = 0.0,
+) -> Optional[tuple]:
+    """Largest feasible native-range grid, also respecting the stage area cap.
+
+    A zero cap preserves the native-mode policy of adding a native-range pass
+    even when ordinary automatic stage splitting has been disabled.
+    """
     if krea2_within_native_range(final_hw):
         return None
     try:
-        return krea2_native_refine_hw(planner_hw, final_hw)
+        nh, nw = krea2_native_refine_hw(planner_hw, final_hw)
     except ValueError:
         return None
+    ph, pw = map(int, planner_hw)
+    if max_stage_upscale > 0.0:
+        growth = (nh * nw) / (ph * pw)
+        if growth > max_stage_upscale:
+            # Round down to the 16-pixel grid so the selected first pass
+            # cannot exceed the user-configured per-stage area growth.
+            shrink = math.sqrt(max_stage_upscale / growth)
+            nh = 2 * math.floor(nh * shrink / 2)
+            nw = 2 * math.floor(nw * shrink / 2)
+            if nh <= ph or nw <= pw:
+                return None
+    return (nh, nw)
 
 
 def krea2_native_refine_hw(planner_hw: tuple, final_hw: tuple) -> tuple:
