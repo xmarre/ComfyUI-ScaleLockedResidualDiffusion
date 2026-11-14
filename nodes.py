@@ -549,8 +549,9 @@ class Krea2TurboFlowAlignedRegenerate:
             # trajectory_auto_native: the trajectory-driven first stage is the
             # largest grid inside the model's native range, when one exists
             # between the planner and an out-of-range output.
-            native_first = (krea2_native_first_stage_hw((low_h, low_w), (target_h, target_w))
-                            if regeneration_mode == "trajectory_auto_native" else None)
+            native_first = (krea2_native_first_stage_hw(
+                                (low_h, low_w), (target_h, target_w), max_stage_upscale,
+                            ) if regeneration_mode == "trajectory_auto_native" else None)
             start_hw = native_first or (low_h, low_w)
             stage_mp = plan_stage_megapixels(
                 start_hw[0] * start_hw[1] * 64.0, target_h * target_w * 64.0, max_stage_upscale)
