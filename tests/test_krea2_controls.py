@@ -21,6 +21,8 @@ ROOT = Path(__file__).resolve().parents[1]
 _SPECTRAL_SPEC = importlib.util.spec_from_file_location("slrd_controls_spectral", ROOT / "spectral_progressive.py")
 spectral = importlib.util.module_from_spec(_SPECTRAL_SPEC)
 _SPECTRAL_SPEC.loader.exec_module(spectral)
+REGENERATION_MODES = ("trajectory", "planner_final_img2img", "planner_final_upscale_only",
+                      "planner_final_native_refine", "spectral_progressive", "trajectory_auto", "trajectory_auto_observe")
 SAMPLERS = ("euler", "dpmpp_2m", "res_multistep", "deis", "ipndm", "ipndm_v", "gradient_estimation", "er_sde", "sa_solver", "sa_solver_pece")
 
 
@@ -61,6 +63,7 @@ def _node():
         "comfy": SimpleNamespace(model_base=SimpleNamespace(Krea2=Krea2)),
         "compat_scheduler_names": lambda: ["simple", "normal", "sgm_uniform"],
         "krea2_sampler_names": lambda: list(SAMPLERS),
+        "REGENERATION_MODES": REGENERATION_MODES,
         "fix_latent_channels": lambda model, latent: latent,
         "latent_target_hw_from_megapixels": target_hw,
         "parse_stage_megapixels": lambda text: (
@@ -153,7 +156,7 @@ def test_existing_widget_slots_and_explicit_defaults():
     ]
     assert schema["optional"]["latent_upscale_method"][0] == ["interpolate", "sesqui_wan21"]
     assert schema["optional"]["latent_upscale_method"][1]["default"] == "interpolate"
-    assert schema["optional"]["regeneration_mode"][0] == ["trajectory", "planner_final_img2img", "planner_final_upscale_only", "planner_final_native_refine", "spectral_progressive"]
+    assert schema["optional"]["regeneration_mode"][0] == list(REGENERATION_MODES)
     assert schema["optional"]["progressive_transition_sigmas"][1]["default"] == ""
     assert schema["optional"]["spectral_tolerance"][1]["default"] == 0.01
     assert schema["optional"]["spectral_calibration"][0] == "SLRD_SPECTRUM"
@@ -341,7 +344,7 @@ def test_trajectory_mode_ignores_img2img_sigma():
 
 
 @pytest.mark.parametrize("extra, message", [
-    ({"regeneration_mode": "img2img"}, "invalid regeneration_mode"),
+    ({"regeneration_mode": "img2img"}, "regeneration_mode must be one of"),
     ({"handoff_diagnostics": "verbose"}, "handoff_diagnostics must be"),
     ({"regeneration_mode": "planner_final_img2img", "img2img_start_sigma": 0.0}, "strictly between"),
     ({"regeneration_mode": "planner_final_img2img", "img2img_start_sigma": 1.0}, "strictly between"),
@@ -575,3 +578,14 @@ def test_invalid_progressive_transition_sigmas_rejected_before_sampling(text):
     with pytest.raises(ValueError, match="progressive_transition_sigmas"):
         node.sample(*args, regeneration_mode="spectral_progressive", progressive_transition_sigmas=text)
     assert not calls
+
+
+def test_trajectory_auto_uses_existing_widgets_without_manual_refinement_sigmas():
+    node, calls, args = _node()
+    node.sample(*args, regeneration_mode="trajectory_auto", stage_megapixels="2",
+                img2img_start_sigma=0.0, progressive_transition_sigmas="invalid inactive setting")
+    call = calls[-1]
+    assert call["regeneration_mode"] == "trajectory_auto"
+    assert call["stage_hw"]
+    assert call["img2img_start_sigma"] is None
+    assert call["progressive_transition_sigmas"] == []
