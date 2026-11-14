@@ -8,6 +8,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+from unittest.mock import patch
 
 
 def main():
@@ -334,6 +335,237 @@ def main():
                               "model_calls": {f"{h}x{w}": n for (h, w), n in counts.items()},
                               "reports": reports}))
 
+    # Validate the real native forward state and shortened schedule, including
+    # the SNR samplers' stochastic/corrector paths and Spectrum call boundaries.
+    for label, selected in cases:
+        for sampler_name in ("euler", "dpmpp_2m", "er_sde", "sa_solver", "sa_solver_pece"):
+            steps = 16
+            options = {
+                "latent": torch.zeros(1, 4, 24, 28), "stage_megapixels": "0.02",
+                "er_sde_max_stage": 1,
+            }
+            reference, legacy_reports, legacy_counts = controls(
+                selected, sampler_name, "simple", 1.0, steps, label == "native", **options,
+            )
+            decisions = []
+            restarts = []
+            real_decide = runtime.choose_refinement_restart
+            real_noise_scaling = selected.model.model_sampling.noise_scaling
+
+            def capture_decision(*args):
+                decision = real_decide(*args)
+                decisions.append(decision)
+                return decision
+
+            def capture_forward(sigma, noise, latent_image, max_denoise=False):
+                value = real_noise_scaling(sigma, noise, latent_image, max_denoise)
+                if noise.shape[-2:] == (24, 28):
+                    scale = getattr(selected.model.model_sampling, "noise_scale", 1.0)
+                    torch.testing.assert_close(value, (1 - sigma) * latent_image + sigma * (scale * noise))
+                    restarts.append(float(sigma))
+                return value
+
+            with patch.object(runtime, "choose_refinement_restart", capture_decision), patch.object(
+                selected.model.model_sampling, "noise_scaling", capture_forward
+            ), patch.object(runtime._LOGGER, "info", wraps=runtime._LOGGER.info) as recorded_logs:
+                auto, reports, counts = controls(
+                    selected, sampler_name, "simple", 1.0, steps, label == "native",
+                    regeneration_mode="trajectory_auto", **options,
+                )
+            # The default handoff_diagnostics=off must still identify
+            # the selected native restart for real-checkpoint comparisons.
+            assert any(
+                call.args and call.args[0].startswith("Krea 2 trajectory_auto restart:")
+                for call in recorded_logs.call_args_list
+            ), (label, sampler_name)
+            assert len(decisions) == len(restarts) == 1
+            decision = decisions[0]
+            schedule = runtime.calculate_sigmas(selected, scheduler="simple", steps=steps, denoise=1.0)
+            release = runtime.full_lock_prefix_length(schedule.tolist(), default_lock)
+            assert decision.index > release and decision.reason == "reduced", decision
+            assert restarts == [float(schedule[decision.index])]
+            assert torch.equal(auto[1]["samples"], reference[1]["samples"])
+            expected_steps = steps - decision.index
+            if label == "native":
+                assert counts[(12, 14)] == legacy_counts[(12, 14)]
+                assert counts[(16, 20)] == legacy_counts[(16, 20)]
+                assert counts[(24, 28)] == solver_calls(sampler_name, expected_steps), counts
+            else:
+                assert len(reports) == 3
+                fields = ("outer_steps", "actual", "forecast", "fallback")
+                for report, legacy in zip(reports[:2], legacy_reports[:2]):
+                    assert tuple(report[k] for k in fields) == tuple(legacy[k] for k in fields), reports
+                assert reports[-1]["outer_steps"] == expected_steps and reports[-1]["fallback"] is None, reports
+            repeat, _, _ = controls(
+                selected, sampler_name, "simple", 1.0, steps, False, regeneration_mode="trajectory_auto", **options,
+            )
+            assert all(torch.equal(a["samples"], b["samples"]) for a, b in zip(auto, repeat)), sampler_name
+            print(json.dumps({"case": label + "_trajectory_auto", "sampler": sampler_name,
+                              "reason": decision.reason, "start_sigma": restarts[0],
+                              "stage_steps": expected_steps, "reports": reports}))
+
+    # Single-stage auto has no completed-latent handoff.
+    single, _, _ = controls(model, "euler", "simple", 1.0, 8, False)
+    single_auto, _, _ = controls(model, "euler", "simple", 1.0, 8, False, regeneration_mode="trajectory_auto")
+    assert all(torch.equal(a["samples"], b["samples"]) for a, b in zip(single, single_auto))
+
+    # A two-step legacy suffix must take the identical native trajectory.
+    short_options = {
+        "latent": torch.zeros(1, 4, 24, 28), "stage_megapixels": "0.02",
+        "composition_lock_sigma": .55,
+    }
+    short, _, _ = controls(model, "er_sde", "simple", 1.0, 8, False, **short_options)
+    short_auto, _, _ = controls(
+        model, "er_sde", "simple", 1.0, 8, False, regeneration_mode="trajectory_auto", **short_options,
+    )
+    assert all(torch.equal(a["samples"], b["samples"]) for a, b in zip(short, short_auto))
+
+    # Measure the real learned enlargement and honor the model noise scale.
+    measured_scales = []
+    real_decide = runtime.choose_refinement_restart
+
+    def record_scale(*args):
+        measured_scales.append(args[-1])
+        return real_decide(*args)
+
+    with patch.object(model.model.model_sampling, "noise_scale", 1.25, create=True), patch.object(
+        runtime, "choose_refinement_restart", record_scale
+    ):
+        learned, _, _ = controls(
+            model, "euler", "simple", 1.0, 16, False, regeneration_mode="trajectory_auto",
+            latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02", latent_upscale_method="sesqui_wan21",
+        )
+    assert measured_scales == [1.25]
+    assert learned[0]["samples"].shape[-2:] == (24, 28)
+
+    # trajectory_auto_native. The tiny model's grids are far below the real
+    # 2048 px limit, so the limit itself is scaled down to place the same
+    # planner/stage/output grids on either side of it. Everything else is the
+    # node's real path: stage planning, the ladder, native solvers, Spectrum.
+    native_solvers = ("euler", "dpmpp_2m", "er_sde", "sa_solver", "sa_solver_pece")
+
+    def native_run(selected, solver, count, limit_px=None, mode="trajectory_auto_native", **options):
+        decisions, forwards = [], []
+        real_decide = runtime.choose_refinement_restart
+        real_noise_scaling = selected.model.model_sampling.noise_scaling
+
+        def capture_decision(schedule, release, source, *rest):
+            decision = real_decide(schedule, release, source, *rest)
+            decisions.append((tuple(source.shape[-2:]), decision))
+            return decision
+
+        def capture_forward(sigma, noise, latent_image, max_denoise=False):
+            value = real_noise_scaling(sigma, noise, latent_image, max_denoise)
+            forwards.append((tuple(noise.shape[-2:]), float(sigma), latent_image.detach().clone(),
+                             noise.detach().clone(), value.detach().clone()))
+            return value
+
+        patches = [patch.object(runtime, "choose_refinement_restart", capture_decision),
+                   patch.object(selected.model.model_sampling, "noise_scaling", capture_forward)]
+        if limit_px is not None:
+            patches.append(patch.object(runtime, "KREA2_NATIVE_MAX_AXIS_PX", limit_px))
+        for item in patches:
+            item.start()
+        try:
+            result, reports, counts = controls(
+                selected, solver, "simple", 1.0, 16, count, regeneration_mode=mode,
+                er_sde_max_stage=1, **options)
+        finally:
+            for item in reversed(patches):
+                item.stop()
+        return result, reports, counts, decisions, forwards
+
+    def same(a, b):
+        return all(torch.equal(x["samples"], y["samples"]) for x, y in zip(a, b))
+
+    schedule16 = runtime.calculate_sigmas(model, scheduler="simple", steps=16, denoise=1.0)
+    release16 = runtime.full_lock_prefix_length(schedule16.tolist(), default_lock)
+    two_stage = {"latent": torch.zeros(1, 4, 24, 28), "stage_megapixels": "0.02"}
+    for label, selected in cases:
+        count = label == "native"
+        for solver in native_solvers:
+            # Every grid inside the range: exactly trajectory_auto.
+            auto, auto_reports, auto_counts, auto_decisions, _ = native_run(
+                selected, solver, count, mode="trajectory_auto", **two_stage)
+            inside, reports, counts, decisions, _ = native_run(selected, solver, count, **two_stage)
+            assert same(auto, inside) and reports == auto_reports and counts == auto_counts, (label, solver)
+            assert [hw for hw, _ in decisions] == [hw for hw, _ in auto_decisions] == [(16, 20)]
+
+            # A 160 px limit: planner 12x14 and an 18x20 grid are inside, the
+            # 24x28 output is outside. Automatic planning makes 18x20 the
+            # trajectory-driven first stage; only the output restarts automatically.
+            planned, reports, counts, decisions, forwards = native_run(
+                selected, solver, count, limit_px=160, latent=torch.zeros(1, 4, 24, 28), max_stage_upscale=0.)
+            assert [hw for hw, _ in decisions] == [(18, 20)], (label, solver, decisions)
+            final_start = decisions[0][1].index
+            assert release16 <= final_start < 16
+            assert same(planned[1:2], auto[1:2])  # the planner pass is untouched
+            last = [f for f in forwards if f[0] == (24, 28)]
+            assert len(last) == 1 and last[0][1] == float(schedule16[final_start])
+            if count:
+                assert counts == {
+                    (12, 14): solver_calls(solver, 16),
+                    (18, 20): target_calls(solver, 16, release16),
+                    (24, 28): solver_calls(solver, 16 - final_start),
+                }, (solver, counts)
+            else:
+                assert len(reports) == 3 and reports[-1]["outer_steps"] == 16 - final_start, reports
+                assert all(r["fallback"] is None for r in reports), reports
+
+            # A 112 px limit: only the planner is inside. No pass refines from
+            # the composition-lock release; each one restarts from the finished
+            # latent below it at the measured sigma, with the exact native
+            # forward corruption of that latent.
+            for options, sizes in (
+                ({"max_stage_upscale": 0.}, [(16, 20)]),
+                (two_stage, [(16, 20), (24, 28)]),
+            ):
+                completed, reports, counts, decisions, forwards = native_run(
+                    selected, solver, count, limit_px=112, **options)
+                sources = [(12, 14)] + sizes[:-1]
+                assert [hw for hw, _ in decisions] == sources, (label, solver, decisions)
+                starts = [decision.index for _, decision in decisions]
+                assert all(release16 <= start < 16 for start in starts), starts
+                assert same(completed[1:2], auto[1:2])
+                planner_out = completed[1]["samples"]
+                target = [f for f in forwards if f[0] != (12, 14)]
+                assert [f[0] for f in target] == sizes and [f[1] for f in target] == [
+                    float(schedule16[start]) for start in starts]
+                scale = getattr(selected.model.model_sampling, "noise_scale", 1.0)
+                for _, sigma, clean, noise, value in target:
+                    torch.testing.assert_close(value, (1 - sigma) * clean + sigma * (scale * noise))
+                expected = selected.model.process_latent_in(
+                    runtime.resize_4d_tensor(planner_out.float(), sizes[0]))
+                torch.testing.assert_close(target[0][2].float().reshape(expected.shape), expected,
+                                           atol=1e-6, rtol=1e-6)
+                if count:
+                    expected_counts = {(12, 14): solver_calls(solver, 16)}
+                    expected_counts.update({hw: solver_calls(solver, 16 - start)
+                                            for hw, start in zip(sizes, starts)})
+                    assert counts == expected_counts, (solver, counts, expected_counts)
+                else:
+                    assert [r["outer_steps"] for r in reports] == [16] + [16 - start for start in starts], reports
+                    assert all(r["fallback"] is None for r in reports), reports
+                again = native_run(selected, solver, count, limit_px=112, **options)
+                assert same(completed, again[0]) and again[1] == reports, (label, solver)
+                print(json.dumps({"case": label + "_trajectory_auto_native", "sampler": solver,
+                                  "stages": [list(hw) for hw in sizes],
+                                  "start_sigmas": [f[1] for f in target],
+                                  "reasons": [decision.reason for _, decision in decisions],
+                                  "reports": reports}))
+
+        # The limit is read only by trajectory_auto_native.
+        for mode in ("trajectory", "trajectory_auto"):
+            plain = native_run(selected, "er_sde", False, mode=mode, **two_stage)
+            limited = native_run(selected, "er_sde", False, limit_px=112, mode=mode, **two_stage)
+            assert same(plain[0], limited[0]) and plain[1] == limited[1], (label, mode)
+
+    # The learned enlargement feeds the first pass too when it is a completed handoff.
+    learned_first = native_run(model, "er_sde", True, limit_px=112, max_stage_upscale=0.,
+                               latent_upscale_method="sesqui_wan21")
+    interpolated_first = native_run(model, "er_sde", True, limit_px=112, max_stage_upscale=0.)
+    assert learned_first[3] and not same(learned_first[0][:1], interpolated_first[0][:1])
+    assert same(learned_first[0][1:2], interpolated_first[0][1:2])
 
 
     # SA-PECE must preserve its second denoiser prediction at each corrected
@@ -741,7 +973,7 @@ def main():
     model_sampling = model.get_model_object("model_sampling")
 
     def img2img(selected, sampler_name, steps, *, latent_hw=(16, 20), capture_inputs=False,
-                mode="planner_final_img2img", fail=None, start_sigma=None, **extra):
+                mode="planner_final_img2img", fail=None, start_sigma=None, planner_mp=.01, **extra):
         if sampler_name in ("sa_solver", "sa_solver_pece"):
             extra.setdefault("sa_spectrum_forecasts", True)
         reports, stages, inputs = [], [], []
@@ -780,7 +1012,7 @@ def main():
             with torch.inference_mode():
                 result = node.sample(
                     selected, positive, negative, {"samples": torch.zeros(1, 4, *latent_hw)},
-                    42, .01, 0.0, 0.0, steps=steps, sampler_name=sampler_name,
+                    42, planner_mp, 0.0, 0.0, steps=steps, sampler_name=sampler_name,
                     regeneration_mode=mode,
                     img2img_start_sigma=img2img_sigma if start_sigma is None else start_sigma,
                     **extra,
@@ -1126,6 +1358,22 @@ def main():
                     forecasting = img2img(selected, sampler_name, 8, stage_megapixels="0.02",
                                           latent_hw=(24, 28))[1]
                     assert not any(r.get("native_only") for r in forecasting), forecasting
+
+    # An interrupted completed-first pass leaves no state behind.
+    for label, selected in cases:
+        options = {"mode": "trajectory_auto_native", "max_stage_upscale": 0., "er_sde_max_stage": 1}
+        with patch.object(runtime, "KREA2_NATIVE_MAX_AXIS_PX", 112):
+            reference, before, _, _ = img2img(selected, "er_sde", 16, **options)
+            try:
+                img2img(selected, "er_sde", 16, fail=((16, 20), 1), **options)
+            except comfy.model_management.InterruptProcessingException:
+                pass
+            else:
+                raise AssertionError("trajectory_auto_native did not propagate interruption")
+            repeated, after, _, _ = img2img(selected, "er_sde", 16, **options)
+        assert before == after, label
+        assert all(torch.equal(a["samples"], b["samples"]) for a, b in zip(reference, repeated))
+        assert not base.diffusion_model.last._forward_pre_hooks
 
     # Spectrum stays operational in the planner and in every img2img stage.
     if reports_context is not None:

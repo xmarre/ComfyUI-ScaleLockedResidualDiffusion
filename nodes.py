@@ -17,6 +17,7 @@ from .spectral_progressive import CALIBRATION_TYPE, build_calibration, describe_
 from .slrd_runtime import (
     LOCK_SCHEDULE_OPTIONS,
     MID_SCHEDULE_OPTIONS,
+    REGENERATION_MODES,
     ScaleLockConfig,
     _resolve_sampler_device,
     apply_scale_lock_to_noise_prediction,
@@ -31,6 +32,7 @@ from .slrd_runtime import (
     krea2_sampler_names,
     krea2_er_sde_options,
     krea2_sa_solver_options,
+    krea2_native_first_stage_hw,
     krea2_native_refine_hw,
     sa_native_only_scope,
     effective_er_sde_sigmas,
@@ -315,7 +317,7 @@ class Krea2TurboFlowAlignedRegenerate:
                                "Off evaluates every planner step natively while preserving Spectrum acceleration "
                                "in the intermediate and final high-resolution stages. This is a quality comparison "
                                "for planner texture loss; the planner uses the same native noise and solver."}),
-                "regeneration_mode": (["trajectory", "planner_final_img2img", "planner_final_upscale_only", "planner_final_native_refine", "spectral_progressive"], {"default": "trajectory",
+                "regeneration_mode": (list(REGENERATION_MODES), {"default": "trajectory",
                     "tooltip": "trajectory (default, unchanged): the first high-resolution stage follows the planner's "
                                "denoising trajectory above composition_lock_sigma, then refines freely. "
                                "planner_final_img2img: every high-resolution stage starts from the finished image "
@@ -338,7 +340,14 @@ class Krea2TurboFlowAlignedRegenerate:
                                "smaller sizes. Transitions come from progressive_transition_sigmas, a connected "
                                "spectral_calibration, or (single transition only) composition_lock_sigma. Band "
                                "lock strengths must be 0; multistep solver history restarts at each transition. "
-                               "latent_upscale_method is inactive in this mode and its saved value is ignored."}),
+                               "latent_upscale_method is inactive in this mode and its saved value is ignored. "
+                               "trajectory_auto (experimental): keep the first trajectory refinement and choose "
+                               "native restart steps automatically for later completed-latent handoffs. "
+                               "trajectory_auto_native (experimental): trajectory_auto, with the pass that refines "
+                               "freely from composition_lock_sigma kept inside the model's 2048-pixel-per-axis "
+                               "range. With empty stage_megapixels the first stage is the largest in-range size of "
+                               "the output aspect ratio; every pass above the range restarts from a completed "
+                               "latent at an automatically selected sigma."}),
                 "img2img_start_sigma": ("FLOAT", {"default": 0.65, "min": 0.01, "max": 0.99, "step": 0.01,
                     "tooltip": "planner_final_img2img only: noise level the finished image is re-noised to before "
                                "each high-resolution stage. The first sigma of the native refinement suffix is "
@@ -433,10 +442,8 @@ class Krea2TurboFlowAlignedRegenerate:
     ):
         if latent_upscale_method not in ("interpolate", "sesqui_wan21"):
             raise ValueError("latent_upscale_method must be interpolate or sesqui_wan21")
-        if regeneration_mode not in ("trajectory", "planner_final_img2img", "planner_final_upscale_only",
-                                     "planner_final_native_refine", "spectral_progressive"):
-            raise ValueError("invalid regeneration_mode; select trajectory, planner_final_img2img, "
-                             "planner_final_upscale_only, planner_final_native_refine or spectral_progressive")
+        if regeneration_mode not in REGENERATION_MODES:
+            raise ValueError(f"regeneration_mode must be one of {', '.join(REGENERATION_MODES)}")
         progressive = regeneration_mode == "spectral_progressive"
         # Manual spectral transitions are dormant in every other regeneration mode.
         # Preserve the widget value so switching back restores the schedule.
@@ -529,6 +536,7 @@ class Krea2TurboFlowAlignedRegenerate:
             raise ValueError("Final LATENT must be larger than the planner canvas")
 
         explicit_stages = parse_stage_megapixels(stage_megapixels)
+        native_first = None
         if native_refine:
             if explicit_stages:
                 raise ValueError("planner_final_native_refine computes one 2048px-or-smaller refinement "
@@ -538,9 +546,19 @@ class Krea2TurboFlowAlignedRegenerate:
         elif explicit_stages:
             stage_mp = explicit_stages
         else:
-            stage_mp = plan_stage_megapixels(low_h * low_w * 64.0, target_h * target_w * 64.0, max_stage_upscale)
+            # trajectory_auto_native: the trajectory-driven first stage is the
+            # largest grid inside the model's native range, when one exists
+            # between the planner and an out-of-range output.
+            native_first = (krea2_native_first_stage_hw((low_h, low_w), (target_h, target_w))
+                            if regeneration_mode == "trajectory_auto_native" else None)
+            start_hw = native_first or (low_h, low_w)
+            stage_mp = plan_stage_megapixels(
+                start_hw[0] * start_hw[1] * 64.0, target_h * target_w * 64.0, max_stage_upscale)
         stage_hw = []
         previous = (low_h, low_w)
+        if not native_refine and not explicit_stages and native_first is not None:
+            stage_hw.append(native_first)
+            previous = native_first
         for megapixels in stage_mp:
             hw = latent_target_hw_from_megapixels(latent, megapixels)
             if hw == previous and not explicit_stages:
