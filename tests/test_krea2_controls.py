@@ -36,6 +36,7 @@ def _node(native_first=None, planned=()):
 
     calls = []
     planning = []
+    native_calls = []
     model = SimpleNamespace(
         model=Krea2(),
         get_model_object=lambda name: SimpleNamespace(shift=1.15),
@@ -72,7 +73,9 @@ def _node(native_first=None, planned=()):
         ),
         "plan_stage_megapixels": lambda *args: (planning.append(args), list(planned))[1],
         "krea2_native_refine_hw": lambda planner, target: (256, 256),
-        "krea2_native_first_stage_hw": lambda planner, target: native_first,
+        "krea2_native_first_stage_hw": lambda planner, target, cap: (
+            native_calls.append((planner, target, cap)), native_first
+        )[1],
         "full_lock_prefix_length": prefix,
         "calculate_sigmas": calculate_sigmas,
         "effective_er_sde_sigmas": lambda sigmas, model: sigmas,
@@ -99,6 +102,7 @@ def _node(native_first=None, planned=()):
     latent = {"samples": torch.zeros(1, 16, 200, 200)}
     base_args = (model, "positive", "negative", latent, 42, 1.0, 0.0, 0.0)
     node.planning = planning
+    node.native_calls = native_calls
     return node, calls, base_args
 
 
@@ -602,6 +606,7 @@ def test_trajectory_auto_native_plans_the_in_range_grid_as_first_stage():
     assert call["regeneration_mode"] == "trajectory_auto_native"
     # The in-range grid leads; later stages are planned from it, not from the planner.
     assert call["stage_hw"] == ((150, 150), (176, 176))
+    assert node.native_calls == [((124, 124), (200, 200), 4.0)]
     assert node.planning[-1][0] == 150 * 150 * 64.0
     assert call["img2img_start_sigma"] is None
 
