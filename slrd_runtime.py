@@ -6,8 +6,9 @@ from contextlib import contextmanager
 import logging
 import math
 import sys
+import time
 import types
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Optional
 
 import torch
@@ -19,6 +20,7 @@ import comfy.samplers
 import comfy.utils
 import latent_preview
 
+from .auto_refinement import RefinementRestart, choose_refinement_restart
 from .krea2_flow import build_patch_coupled_noise
 from .spectral_progressive import (
     describe_calibration,
@@ -1297,6 +1299,7 @@ def _run_resolution_ladder(
     pece_corrected_anchors: Optional[list] = None,
     diagnostics: Optional["Krea2HandoffDiagnostics"] = None,
     latent_upscale_method: str = "interpolate",
+    auto_refinement: bool = False,
 ) -> ScaleLockedSampleResult:
     """Refine through increasing resolutions, each stage finishing its image.
 
@@ -1305,12 +1308,13 @@ def _run_resolution_ladder(
     integrating the locked prefix natively with the planner predictions in
     place of target model calls, which preserves their multistep history.
     Every later stage re-noises the finished image of the stage below, resized to
-    its own size, to the same release noise level with its own patch-coupled
-    noise, and runs the remaining steps. Each stage therefore repeats the
+    its own size, with its own patch-coupled noise, and runs a native suffix
+    from the release sigma or a later automatically selected restart.
+    Each stage therefore repeats the
     planner-to-2x handoff at a bounded scale ratio, starting from a sharp
     image rather than from mid-noise predictions, whose posterior-mean blur
     a late, low-noise start cannot remove. A later stage is a fresh solver
-    start at the release sigma, so multistep solvers begin it at first order.
+    start, so multistep solvers begin it at first order.
     """
     if config.full_lock_sigma is None:
         raise ValueError("resolution stages require the composition lock")
@@ -1367,7 +1371,8 @@ def _run_resolution_ladder(
             mode=noise_mode,
         )
 
-        stage_sigmas = sigmas[release:]
+        stage_start = release
+        stage_sigmas = sigmas[stage_start:]
         if finished is None:
             start_latent = stage_samples
             if not euler:
@@ -1388,14 +1393,53 @@ def _run_resolution_ladder(
                 start_latent = model.model.process_latent_out(clean).to(dtype=stage_samples.dtype)
         else:
             # Output-space latent: CFGGuider.inner_sample applies process_latent_in
-            # and the flow noise scaling re-noises it to the release sigma.
+            # and flow noise scaling re-noises it to the selected start sigma.
             start_latent = _enlarge_stage_source(model, finished, hw, stage_samples, latent_upscale_method)
+            if auto_refinement:
+                source_hw = tuple(finished.shape[-2:])
+                policy_start = time.perf_counter() if diagnostics is not None else None
+                if total_steps - release <= 2:
+                    decision = RefinementRestart(release, "no_shorter_two_step_suffix")
+                else:
+                    with torch.no_grad():
+                        # Measure on the smaller grid. For Wan 2.1 the latent
+                        # transform is channelwise affine and commutes with area resize.
+                        source = model.model.process_latent_in(finished.float())
+                        roundtrip = resize_4d_tensor(start_latent.float(), source_hw).to(source.device)
+                        roundtrip = model.model.process_latent_in(roundtrip)
+                        decision = choose_refinement_restart(
+                            sigma_values, release, source, roundtrip, hw,
+                            float(getattr(_model_sampling_obj(model), "noise_scale", 1.0)),
+                        )
+                        if decision.reason == "invalid_spectral_measurement" and (
+                            not bool(torch.isfinite(source).all()) or not bool(torch.isfinite(roundtrip).all())
+                        ):
+                            raise ValueError("trajectory_auto received a nonfinite completed or enlarged latent")
+                        del source, roundtrip
+                stage_start = decision.index
+                stage_sigmas = sigmas[stage_start:]
+                if diagnostics is not None:
+                    diagnostics.log_restart(
+                        index, source_hw, hw, decision, sigma_values, release,
+                        time.perf_counter() - policy_start,
+                    )
+                else:
+                    # A default run must reveal whether automatic refinement
+                    # actually shortened this stage or kept the legacy suffix.
+                    _LOGGER.info(
+                        "Krea 2 trajectory_auto restart: stage=%d source=%sx%s target=%sx%s "
+                        "legacy_sigma=%.6f selected_sigma=%.6f legacy_steps=%d "
+                        "selected_steps=%d reason=%s",
+                        index, source_hw[1] * 8, source_hw[0] * 8, hw[1] * 8, hw[0] * 8,
+                        sigma_values[release], sigma_values[stage_start],
+                        total_steps - release, total_steps - stage_start, decision.reason,
+                    )
 
         if sampler_name in SNR_SOLVER_NAMES:
             sampler = _krea2_sampler_object(
                 sampler_name, sampler_options, model=model, low_shape=tuple(lowres_noise.shape),
                 stage_shapes=shapes, stage_index=index, seed=stochastic_seed,
-                start_step=0 if finished is None else release,
+                start_step=0 if finished is None else stage_start,
                 sigmas=stage_sigmas, noise_like=stage_noise,
             )
 
@@ -1422,6 +1466,7 @@ def _run_resolution_ladder(
                 noise=stage_noise, source=lowres_out["samples"] if finished is None else finished,
                 lock_sigma=config.full_lock_sigma,
                 enlarged_source=None if finished is None else start_latent,
+                completed_source=finished,
             )
         try:
             finished = guider.sample(
@@ -1457,7 +1502,7 @@ def _run_resolution_ladder(
 
 
 REGENERATION_MODES = ("trajectory", "planner_final_img2img", "planner_final_upscale_only", "planner_final_native_refine",
-                      "spectral_progressive")
+                      "spectral_progressive", "trajectory_auto")
 KREA2_NATIVE_MAX_AXIS_PX = 2048
 HANDOFF_DIAGNOSTIC_MODES = ("off", "log", "log_and_save_latents")
 
@@ -1600,19 +1645,31 @@ class Krea2HandoffDiagnostics:
             if final:
                 self._save("final_output", output_space)
 
+    def log_restart(self, stage, source_hw, target_hw, decision, sigmas, release, elapsed):
+        record = {
+            **asdict(decision), "stage": stage, "source_hw": source_hw, "target_hw": target_hw,
+            "legacy_sigma": sigmas[release], "selected_sigma": sigmas[decision.index],
+            "legacy_steps": len(sigmas) - 1 - release,
+            "selected_steps": len(sigmas) - 1 - decision.index, "policy_seconds": elapsed,
+        }
+        self.records.append(record)
+        _LOGGER.info("Krea 2 trajectory_auto restart: %s", record)
+
     @staticmethod
     def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
         return float((a - b).norm() / b.norm().clamp_min(1e-12))
 
     def wrap(self, callback, *, stage: int, stage_hw, sigmas: torch.Tensor, noise: torch.Tensor,
              source: Optional[torch.Tensor], lock_sigma: Optional[float],
-             enlarged_source: Optional[torch.Tensor] = None):
+             enlarged_source: Optional[torch.Tensor] = None,
+             completed_source: Optional[torch.Tensor] = None):
         if self.reference is None:
             raise RuntimeError("handoff diagnostics need the finished planner first")
         sigma_values = [float(v) for v in sigmas.detach().cpu().tolist()]
         planner_hw = tuple(self.reference.shape[-2:])
         noise_scale = float(getattr(_model_sampling_obj(self.model), "noise_scale", 1.0))
         source_in = None
+        completed_source_in = None
         if source is not None:
             with torch.no_grad():
                 # Compare against the stage's actual clean start latent when the
@@ -1625,6 +1682,11 @@ class Krea2HandoffDiagnostics:
                 source_in = self.model.model.process_latent_in(resized_source)
                 if self.save:
                     self._save(f"stage{stage}_source_resized", resized_source)
+        if completed_source is not None:
+            completed_source_in = self.model.model.process_latent_in(
+                completed_source.detach().to(device="cpu", dtype=torch.float32)
+            )
+            completed_source_hw = tuple(completed_source_in.shape[-2:])
         state = {"previous_locked": None}
 
         def observe(step, x0, x, total_steps):
@@ -1648,6 +1710,10 @@ class Krea2HandoffDiagnostics:
                         record["state_clean_vs_stage_source"] = self._rel(clean, source_in)
                 if source_in is not None:
                     record["x0_vs_stage_source"] = self._rel(pred, source_in)
+                if completed_source_in is not None:
+                    record["x0_vs_previous_stage_lowband"] = self._rel(
+                        resize_4d_tensor(pred, completed_source_hw), completed_source_in
+                    )
                 self.records.append(record)
                 _LOGGER.info("Krea 2 handoff diagnostics: %s", record)
                 if self.save:
@@ -2160,6 +2226,9 @@ def run_scale_locked_ksampler(
         raise ValueError("planner_final_native_refine requires latent_upscale_method=sesqui_wan21")
     if regeneration_mode not in REGENERATION_MODES:
         raise ValueError(f"regeneration_mode must be one of {', '.join(REGENERATION_MODES)}")
+    auto_refinement = regeneration_mode == "trajectory_auto"
+    if auto_refinement and stage_hw and (not add_noise or noise_mode != "patch_coupled"):
+        raise ValueError("trajectory_auto requires added patch-coupled noise for completed-latent handoffs")
     progressive = regeneration_mode == "spectral_progressive"
     if (isinstance(spectral_tolerance, bool) or not isinstance(spectral_tolerance, (int, float))
             or not math.isfinite(spectral_tolerance) or not 0.0 < spectral_tolerance < 1.0):
@@ -2192,11 +2261,14 @@ def run_scale_locked_ksampler(
     # sampler execution rather than rejecting an otherwise valid saved graph
     # or forcing an extra diffusion stage. The selected method is explicitly
     # reported as inactive for this invocation.
+    trajectory = regeneration_mode == "trajectory" or auto_refinement
     learned_handoff_unused = (
-        regeneration_mode == "trajectory"
+        trajectory
         and not stage_hw
         and latent_upscale_method != "interpolate"
     )
+    if auto_refinement and not stage_hw:
+        _LOGGER.info("Krea 2 trajectory_auto: no completed-latent handoff; using the first trajectory refinement")
     if learned_handoff_unused:
         _LOGGER.warning(
             "Krea 2 trajectory: latent_upscale_method=%s is inactive for a "
@@ -2282,7 +2354,7 @@ def run_scale_locked_ksampler(
     if spectral_calibration is not None:
         # Outside spectral_progressive the calibration is advisory only: an
         # unusable calibration is reported but never alters or blocks sampling.
-        if regeneration_mode == "trajectory" and config.full_lock_sigma is not None:
+        if trajectory and config.full_lock_sigma is not None:
             sizes = ([tuple(map(int, lowres_latent["samples"].shape[-2:]))] + [tuple(map(int, hw)) for hw in stage_hw]
                      + [tuple(map(int, highres_latent["samples"].shape[-2:]))])
             try:
@@ -2377,6 +2449,7 @@ def run_scale_locked_ksampler(
             config=config, stage_hw=tuple(stage_hw), sampler_options=sampler_options,
             pece_corrected_anchors=pece_corrections, diagnostics=diagnostics,
             latent_upscale_method=latent_upscale_method,
+            auto_refinement=auto_refinement,
         )
 
     runtime = ScaleLockedRuntimeContext(

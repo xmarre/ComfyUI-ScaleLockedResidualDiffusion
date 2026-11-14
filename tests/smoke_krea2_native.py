@@ -8,6 +8,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+from unittest.mock import patch
 
 
 def main():
@@ -334,6 +335,108 @@ def main():
                               "model_calls": {f"{h}x{w}": n for (h, w), n in counts.items()},
                               "reports": reports}))
 
+    # Validate the real native forward state and shortened schedule, including
+    # the SNR samplers' stochastic/corrector paths and Spectrum call boundaries.
+    for label, selected in cases:
+        for sampler_name in ("euler", "dpmpp_2m", "er_sde", "sa_solver", "sa_solver_pece"):
+            steps = 16
+            options = {
+                "latent": torch.zeros(1, 4, 24, 28), "stage_megapixels": "0.02",
+                "er_sde_max_stage": 1,
+            }
+            reference, legacy_reports, legacy_counts = controls(
+                selected, sampler_name, "simple", 1.0, steps, label == "native", **options,
+            )
+            decisions = []
+            restarts = []
+            real_decide = runtime.choose_refinement_restart
+            real_noise_scaling = selected.model.model_sampling.noise_scaling
+
+            def capture_decision(*args):
+                decision = real_decide(*args)
+                decisions.append(decision)
+                return decision
+
+            def capture_forward(sigma, noise, latent_image, max_denoise=False):
+                value = real_noise_scaling(sigma, noise, latent_image, max_denoise)
+                if noise.shape[-2:] == (24, 28):
+                    scale = getattr(selected.model.model_sampling, "noise_scale", 1.0)
+                    torch.testing.assert_close(value, (1 - sigma) * latent_image + sigma * (scale * noise))
+                    restarts.append(float(sigma))
+                return value
+
+            with patch.object(runtime, "choose_refinement_restart", capture_decision), patch.object(
+                selected.model.model_sampling, "noise_scaling", capture_forward
+            ), patch.object(runtime._LOGGER, "info", wraps=runtime._LOGGER.info) as recorded_logs:
+                auto, reports, counts = controls(
+                    selected, sampler_name, "simple", 1.0, steps, label == "native",
+                    regeneration_mode="trajectory_auto", **options,
+                )
+            # The default handoff_diagnostics=off must still identify
+            # the selected native restart for real-checkpoint comparisons.
+            assert any(
+                call.args and call.args[0].startswith("Krea 2 trajectory_auto restart:")
+                for call in recorded_logs.call_args_list
+            ), (label, sampler_name)
+            assert len(decisions) == len(restarts) == 1
+            decision = decisions[0]
+            schedule = runtime.calculate_sigmas(selected, scheduler="simple", steps=steps, denoise=1.0)
+            release = runtime.full_lock_prefix_length(schedule.tolist(), default_lock)
+            assert decision.index > release and decision.reason == "reduced", decision
+            assert restarts == [float(schedule[decision.index])]
+            assert torch.equal(auto[1]["samples"], reference[1]["samples"])
+            expected_steps = steps - decision.index
+            if label == "native":
+                assert counts[(12, 14)] == legacy_counts[(12, 14)]
+                assert counts[(16, 20)] == legacy_counts[(16, 20)]
+                assert counts[(24, 28)] == solver_calls(sampler_name, expected_steps), counts
+            else:
+                assert len(reports) == 3
+                fields = ("outer_steps", "actual", "forecast", "fallback")
+                for report, legacy in zip(reports[:2], legacy_reports[:2]):
+                    assert tuple(report[k] for k in fields) == tuple(legacy[k] for k in fields), reports
+                assert reports[-1]["outer_steps"] == expected_steps and reports[-1]["fallback"] is None, reports
+            repeat, _, _ = controls(
+                selected, sampler_name, "simple", 1.0, steps, False, regeneration_mode="trajectory_auto", **options,
+            )
+            assert all(torch.equal(a["samples"], b["samples"]) for a, b in zip(auto, repeat)), sampler_name
+            print(json.dumps({"case": label + "_trajectory_auto", "sampler": sampler_name,
+                              "reason": decision.reason, "start_sigma": restarts[0],
+                              "stage_steps": expected_steps, "reports": reports}))
+
+    # Single-stage auto has no completed-latent handoff.
+    single, _, _ = controls(model, "euler", "simple", 1.0, 8, False)
+    single_auto, _, _ = controls(model, "euler", "simple", 1.0, 8, False, regeneration_mode="trajectory_auto")
+    assert all(torch.equal(a["samples"], b["samples"]) for a, b in zip(single, single_auto))
+
+    # A two-step legacy suffix must take the identical native trajectory.
+    short_options = {
+        "latent": torch.zeros(1, 4, 24, 28), "stage_megapixels": "0.02",
+        "composition_lock_sigma": .55,
+    }
+    short, _, _ = controls(model, "er_sde", "simple", 1.0, 8, False, **short_options)
+    short_auto, _, _ = controls(
+        model, "er_sde", "simple", 1.0, 8, False, regeneration_mode="trajectory_auto", **short_options,
+    )
+    assert all(torch.equal(a["samples"], b["samples"]) for a, b in zip(short, short_auto))
+
+    # Measure the real learned enlargement and honor the model noise scale.
+    measured_scales = []
+    real_decide = runtime.choose_refinement_restart
+
+    def record_scale(*args):
+        measured_scales.append(args[-1])
+        return real_decide(*args)
+
+    with patch.object(model.model.model_sampling, "noise_scale", 1.25, create=True), patch.object(
+        runtime, "choose_refinement_restart", record_scale
+    ):
+        learned, _, _ = controls(
+            model, "euler", "simple", 1.0, 16, False, regeneration_mode="trajectory_auto",
+            latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02", latent_upscale_method="sesqui_wan21",
+        )
+    assert measured_scales == [1.25]
+    assert learned[0]["samples"].shape[-2:] == (24, 28)
 
 
     # SA-PECE must preserve its second denoiser prediction at each corrected
