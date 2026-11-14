@@ -560,6 +560,18 @@ def main():
             limited = native_run(selected, "er_sde", False, limit_px=112, mode=mode, **two_stage)
             assert same(plain[0], limited[0]) and plain[1] == limited[1], (label, mode)
 
+    # The native-range insertion must obey the existing maximum per-stage
+    # area growth from the planner. At a 160px limit, the unconstrained
+    # native first grid would be 18x20 (360/168 > 2); cap 2 selects 16x18.
+    capped, _, capped_counts, capped_decisions, _ = native_run(
+        model, "er_sde", True, limit_px=160,
+        latent=torch.zeros(1, 4, 24, 28), max_stage_upscale=2.0,
+    )
+    assert capped[0]["samples"].shape[-2:] == (24, 28)
+    assert (16, 18) in capped_counts and (18, 20) not in capped_counts, capped_counts
+    assert capped_decisions and capped_decisions[0][0] == (16, 18), capped_decisions
+    assert 16 * 18 <= 12 * 14 * 2.0
+
     # The learned enlargement feeds the first pass too when it is a completed handoff.
     learned_first = native_run(model, "er_sde", True, limit_px=112, max_stage_upscale=0.,
                                latent_upscale_method="sesqui_wan21")
