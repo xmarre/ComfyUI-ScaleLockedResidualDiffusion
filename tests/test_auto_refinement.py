@@ -27,9 +27,9 @@ def make_source(edge, *, interior=2.0, shape=(16, 24)):
             edge * ((x * (w // 3)).cos() + (y * (h // 3)).cos()))[None, None]
 
 
-def choose(source, *, target=(24, 32), schedule=SCHEDULE, roundtrip=None, noise_scale=1.0):
+def choose(source, *, target=(24, 32), schedule=SCHEDULE, roundtrip=None, noise_scale=1.0, **options):
     return policy.choose_refinement_restart(
-        schedule, RELEASE, source, source if roundtrip is None else roundtrip, target, noise_scale,
+        schedule, RELEASE, source, source if roundtrip is None else roundtrip, target, noise_scale, **options,
     )
 
 
@@ -88,6 +88,42 @@ def test_discrete_rounding_and_short_schedule_fallback():
     assert long[a.index] >= a.detail_sigma > long[a.index + 1]
     assert len(long[a.index:]) >= 3
     assert choose(make_source(1.1)).index == RELEASE
+
+
+@pytest.mark.parametrize("prefix", [[], [.71, .65]])
+def test_retimes_coarse_two_step_floor_in_half_log_snr(prefix):
+    first, last = .5582663416862488, .34492799639701843
+    source = make_source(.16, interior=.28)
+    schedule = [1., .9, .8, *prefix, first, last, 0.]
+    decision = choose(source, schedule=schedule, retime_sigma_min=.001)
+    assert decision.reason == "retimed_two_step_suffix"
+    assert decision.index == len(schedule) - 3
+    start, terminal, zero = decision.retimed_sigmas
+    odds = lambda s: s / (1 - s)
+    assert decision.detail_sigma < start < decision.structure_sigma < first
+    assert 0. < terminal < last and zero == 0.
+    assert odds(start) / odds(terminal) == pytest.approx(odds(first) / odds(last))
+    assert odds(start) ** 2 == pytest.approx(odds(decision.detail_sigma) * odds(decision.structure_sigma))
+    assert choose(source * .7, schedule=schedule, retime_sigma_min=.001).retimed_sigmas[0] < start
+
+
+def test_retime_keeps_native_fallback_for_unsafe_evidence_and_one_step():
+    schedule = [1., .9, .8, .55, .34, 0.]
+    source = make_source(.16, interior=.28)
+    options = dict(schedule=schedule, retime_sigma_min=.001)
+    assert choose(make_source(.16, interior=.06), **options).retimed_sigmas is None
+    assert choose(torch.zeros_like(source), **options).retimed_sigmas is None
+    assert choose(make_source(.16, interior=2.), **options).reason == "native_two_step_suffix"
+    assert choose(source, schedule=schedule, retime_sigma_min=.3).reason == "no_safe_two_step_retime"
+    assert choose(source, schedule=[1., .9, .8, .55, 0.],
+                  retime_sigma_min=.001).reason == "no_shorter_two_step_suffix"
+
+
+def test_retime_checks_model_minimum_and_rounded_knots():
+    result = policy._retime_two_steps(.15, .52, .55826634, .344928, .25, torch.float32)
+    assert result is not None and result[1] >= .25
+    assert policy._retime_two_steps(.15, .40, .55826634, .344928, .25, torch.float32) is None
+    assert policy._retime_two_steps(.1, .4, .558, .55799999, .001, torch.float32) is None
 
 
 @pytest.mark.parametrize("shape", [(16, 24), (14, 28), (18, 22)])

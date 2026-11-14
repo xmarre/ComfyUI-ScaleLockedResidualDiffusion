@@ -444,13 +444,13 @@ def main():
     # node's real path: stage planning, the ladder, native solvers, Spectrum.
     native_solvers = ("euler", "dpmpp_2m", "er_sde", "sa_solver", "sa_solver_pece")
 
-    def native_run(selected, solver, count, limit_px=None, mode="trajectory_auto_native", **options):
+    def native_run(selected, solver, count, limit_px=None, mode="trajectory_auto_native", *, steps=16, **options):
         decisions, forwards = [], []
         real_decide = runtime.choose_refinement_restart
         real_noise_scaling = selected.model.model_sampling.noise_scaling
 
-        def capture_decision(schedule, release, source, *rest):
-            decision = real_decide(schedule, release, source, *rest)
+        def capture_decision(schedule, release, source, *rest, **options):
+            decision = real_decide(schedule, release, source, *rest, **options)
             decisions.append((tuple(source.shape[-2:]), decision))
             return decision
 
@@ -468,7 +468,7 @@ def main():
             item.start()
         try:
             result, reports, counts = controls(
-                selected, solver, "simple", 1.0, 16, count, regeneration_mode=mode,
+                selected, solver, "simple", 1.0, steps, count, regeneration_mode=mode,
                 er_sde_max_stage=1, **options)
         finally:
             for item in reversed(patches):
@@ -501,7 +501,7 @@ def main():
             assert release16 <= final_start < 16
             assert same(planned[1:2], auto[1:2])  # the planner pass is untouched
             last = [f for f in forwards if f[0] == (24, 28)]
-            assert len(last) == 1 and last[0][1] == float(schedule16[final_start])
+            assert len(last) == 1 and last[0][1] == (decisions[0][1].retimed_sigmas or (float(schedule16[final_start]),))[0]
             if count:
                 assert counts == {
                     (12, 14): solver_calls(solver, 16),
@@ -530,7 +530,8 @@ def main():
                 planner_out = completed[1]["samples"]
                 target = [f for f in forwards if f[0] != (12, 14)]
                 assert [f[0] for f in target] == sizes and [f[1] for f in target] == [
-                    float(schedule16[start]) for start in starts]
+                    (decision.retimed_sigmas or (float(schedule16[decision.index]),))[0]
+                    for _, decision in decisions]
                 scale = getattr(selected.model.model_sampling, "noise_scale", 1.0)
                 for _, sigma, clean, noise, value in target:
                     torch.testing.assert_close(value, (1 - sigma) * clean + sigma * (scale * noise))
@@ -559,6 +560,46 @@ def main():
             plain = native_run(selected, "er_sde", False, mode=mode, **two_stage)
             limited = native_run(selected, "er_sde", False, limit_px=112, mode=mode, **two_stage)
             assert same(plain[0], limited[0]) and plain[1] == limited[1], (label, mode)
+
+    # Seven steps reproduce the coarse two-step restart on the simple
+    # scheduler. Use explicit sizes so the only A/B difference is retiming.
+    short = {
+        "steps": 7, "composition_lock_sigma": .65, "latent": torch.zeros(1, 4, 30, 36),
+        "stage_megapixels": "0.02,0.04",
+    }
+    short_schedule = runtime.calculate_sigmas(model, scheduler="simple", steps=7, denoise=1.0).tolist()
+    assert abs(short_schedule[-3] - .55826634) < 1e-6 and abs(short_schedule[-2] - .344928) < 1e-6
+    for label, selected in cases:
+        for solver in runtime.KREA2_SAMPLERS:
+            baseline = native_run(selected, solver, label == "native", mode="trajectory_auto", **short)
+            result, reports, counts, decisions, forwards = native_run(
+                selected, solver, label == "native", limit_px=160, **short,
+            )
+            assert same(result[1:2], baseline[0][1:2])
+            assert len(decisions) == 2
+            retimed_decisions = [d for _, d in decisions if d.retimed_sigmas is not None]
+            assert retimed_decisions, (label, solver, decisions)
+            assert len(forwards) == 4
+            for observed, original in zip(forwards[:2], baseline[4][:2]):
+                assert observed[:2] == original[:2]
+                assert all(torch.equal(a, b) for a, b in zip(observed[2:], original[2:]))
+            for forward, (_, decision) in zip(forwards[2:], decisions):
+                _, sigma, clean, noise, value = forward
+                expected = decision.retimed_sigmas or tuple(short_schedule[-3:])
+                assert sigma == expected[0]
+                scale = getattr(selected.model.model_sampling, "noise_scale", 1.0)
+                torch.testing.assert_close(value, (1 - sigma) * clean + sigma * (scale * noise))
+            if label == "native":
+                assert counts == baseline[2]
+            else:
+                assert reports[:2] == baseline[1][:2]
+                assert all(r["outer_steps"] == 2 and r["fallback"] is None for r in reports[2:]), reports
+                if solver == "sa_solver_pece":
+                    assert all(r["actual"] == 3 and r["pece_corrector_evaluations"] == 1 for r in reports[2:]), reports
+            repeat = native_run(selected, solver, False, limit_px=160, **short)
+            assert same(result, repeat[0]) and reports == repeat[1]
+            print(json.dumps({"case": label + "_two_step_retime", "sampler": solver,
+                              "retimed": [d.retimed_sigmas for d in retimed_decisions]}))
 
     # The native-range insertion must obey the existing maximum per-stage
     # area growth from the planner. At a 160px limit, the unconstrained

@@ -1301,6 +1301,7 @@ def _run_resolution_ladder(
     latent_upscale_method: str = "interpolate",
     auto_refinement: bool = False,
     completed_first: bool = False,
+    retime_short_restarts: bool = False,
 ) -> ScaleLockedSampleResult:
     """Refine through increasing resolutions, each stage finishing its image.
 
@@ -1322,7 +1323,8 @@ def _run_resolution_ladder(
     """
     if config.full_lock_sigma is None:
         raise ValueError("resolution stages require the composition lock")
-    if not isinstance(_model_sampling_obj(model), comfy.model_sampling.CONST):
+    model_sampling = _model_sampling_obj(model)
+    if not isinstance(model_sampling, comfy.model_sampling.CONST):
         raise ValueError("resolution stages require flow model sampling")
     euler = _normalize_sampler_name(sampler_name) == "euler"
     if (
@@ -1377,6 +1379,7 @@ def _run_resolution_ladder(
 
         stage_start = release
         stage_sigmas = sigmas[stage_start:]
+        retimed = None
         if finished is None:
             start_latent = stage_samples
             if not euler:
@@ -1402,7 +1405,14 @@ def _run_resolution_ladder(
             if auto_refinement:
                 source_hw = tuple(finished.shape[-2:])
                 policy_start = time.perf_counter() if diagnostics is not None else None
-                if total_steps - release <= 2:
+                # The off-grid tail has no corresponding planner prediction.
+                # Preserve the established anchor path when band locks are set.
+                can_retime = (
+                    retime_short_restarts and not krea2_within_native_range(hw)
+                    and config.lock_strength == 0.0 and config.mid_strength == 0.0
+                    and sampler_name in KREA2_SAMPLERS
+                )
+                if total_steps - release <= 2 and not (can_retime and total_steps - release == 2):
                     decision = RefinementRestart(release, "no_shorter_two_step_suffix")
                 else:
                     with torch.no_grad():
@@ -1411,9 +1421,13 @@ def _run_resolution_ladder(
                         source = model.model.process_latent_in(finished.float())
                         roundtrip = resize_4d_tensor(start_latent.float(), source_hw).to(source.device)
                         roundtrip = model.model.process_latent_in(roundtrip)
+                        retime_options = ({
+                            "retime_sigma_min": float(model_sampling.sigma_min),
+                            "schedule_dtype": sigmas.dtype,
+                        } if can_retime else {})
                         decision = choose_refinement_restart(
                             sigma_values, release, source, roundtrip, hw,
-                            float(getattr(_model_sampling_obj(model), "noise_scale", 1.0)),
+                            float(getattr(model_sampling, "noise_scale", 1.0)), **retime_options,
                         )
                         if decision.reason == "invalid_spectral_measurement" and (
                             not bool(torch.isfinite(source).all()) or not bool(torch.isfinite(roundtrip).all())
@@ -1421,7 +1435,9 @@ def _run_resolution_ladder(
                             raise ValueError("trajectory_auto received a nonfinite completed or enlarged latent")
                         del source, roundtrip
                 stage_start = decision.index
-                stage_sigmas = sigmas[stage_start:]
+                retimed = decision.retimed_sigmas
+                stage_sigmas = sigmas[stage_start:] if retimed is None else sigmas.new_tensor(retimed)
+                selected_sigma = sigma_values[stage_start] if retimed is None else retimed[0]
                 if diagnostics is not None:
                     diagnostics.log_restart(
                         index, source_hw, hw, decision, sigma_values, release,
@@ -1433,10 +1449,10 @@ def _run_resolution_ladder(
                     _LOGGER.info(
                         "Krea 2 trajectory_auto restart: stage=%d source=%sx%s target=%sx%s "
                         "legacy_sigma=%.6f selected_sigma=%.6f legacy_steps=%d "
-                        "selected_steps=%d reason=%s",
+                        "selected_steps=%d reason=%s retimed_sigmas=%s",
                         index, source_hw[1] * 8, source_hw[0] * 8, hw[1] * 8, hw[0] * 8,
-                        sigma_values[release], sigma_values[stage_start],
-                        total_steps - release, total_steps - stage_start, decision.reason,
+                        sigma_values[release], selected_sigma,
+                        total_steps - release, len(stage_sigmas) - 1, decision.reason, retimed,
                     )
 
         if sampler_name in SNR_SOLVER_NAMES:
@@ -1460,7 +1476,8 @@ def _run_resolution_ladder(
             pece_corrected_anchors=pece_corrected_anchors,
         )
         guider = create_cfg_guider(model, positive, negative, cfg)
-        apply_scale_lock_to_guider(guider, stage_runtime, config, skip_locked_model_calls=True)
+        if retimed is None:
+            apply_scale_lock_to_guider(guider, stage_runtime, config, skip_locked_model_calls=True)
         stage_x0: dict = {}
         callback = make_preview_callback(model, len(stage_sigmas) - 1, stage_x0)
         if diagnostics is not None:
@@ -1652,7 +1669,8 @@ class Krea2HandoffDiagnostics:
     def log_restart(self, stage, source_hw, target_hw, decision, sigmas, release, elapsed):
         record = {
             **asdict(decision), "stage": stage, "source_hw": source_hw, "target_hw": target_hw,
-            "legacy_sigma": sigmas[release], "selected_sigma": sigmas[decision.index],
+            "legacy_sigma": sigmas[release],
+            "selected_sigma": sigmas[decision.index] if decision.retimed_sigmas is None else decision.retimed_sigmas[0],
             "legacy_steps": len(sigmas) - 1 - release,
             "selected_steps": len(sigmas) - 1 - decision.index, "policy_seconds": elapsed,
         }
@@ -2505,6 +2523,7 @@ def run_scale_locked_ksampler(
             pece_corrected_anchors=pece_corrections, diagnostics=diagnostics,
             latent_upscale_method=latent_upscale_method,
             auto_refinement=auto_refinement, completed_first=completed_first,
+            retime_short_restarts=regeneration_mode == "trajectory_auto_native",
         )
 
     runtime = ScaleLockedRuntimeContext(

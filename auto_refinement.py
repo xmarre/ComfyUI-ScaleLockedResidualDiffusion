@@ -16,6 +16,7 @@ class RefinementRestart:
     interior_power: float | None = None
     detail_sigma: float | None = None
     structure_sigma: float | None = None
+    retimed_sigmas: tuple[float, float, float] | None = None
 
 
 def _crossing(power: float, noise_scale: float) -> float:
@@ -24,10 +25,37 @@ def _crossing(power: float, noise_scale: float) -> float:
     return rms / (noise_scale + rms)
 
 
+def _noise_odds(sigma: float) -> float:
+    return sigma / (1.0 - sigma)
+
+
+def _retime_two_steps(detail: float, structure: float, native_start: float,
+                      native_last: float, sigma_min: float, dtype: torch.dtype):
+    """Move the two positive knots together in half-log-SNR."""
+    if not 0.0 < sigma_min <= native_last < native_start < 1.0 or not 0.0 < detail <= structure < native_start:
+        return None
+    start_odds = _noise_odds(native_start)
+    interval = start_odds / _noise_odds(native_last)
+    # Equal distance to the two measured crossings in log noise odds.
+    middle = math.sqrt(_noise_odds(detail)) * math.sqrt(_noise_odds(structure))
+    # Ensure even the final model evaluation stays within model support.
+    first = max(middle, interval * _noise_odds(sigma_min))
+    second = first / interval
+    values = torch.tensor([first / (1 + first), second / (1 + second), 0.0], dtype=dtype).tolist()
+    if not sigma_min <= values[1] < values[0] < native_start or not detail <= values[0] <= structure:
+        return None
+    # An audited SA noise matcher uses a 1e-6 absolute tolerance. Reject a
+    # collapsed or near-coincident interval after conversion to sampler dtype.
+    if math.isclose(values[0], values[1], rel_tol=1e-5, abs_tol=1e-6):
+        return None
+    return tuple(values)
+
+
 @torch.no_grad()
 def choose_refinement_restart(
     schedule: Sequence[float], release: int, source: torch.Tensor,
     roundtrip: torch.Tensor, target_hw: tuple[int, int], noise_scale: float,
+    *, retime_sigma_min: float | None = None, schedule_dtype: torch.dtype = torch.float32,
 ) -> RefinementRestart:
     """Select a native suffix from the actual source and resized handoff.
 
@@ -44,7 +72,7 @@ def choose_refinement_restart(
         return RefinementRestart(release, "invalid_native_suffix")
     # A terminal-to-zero update alone has no nonterminal refinement step.
     # Retain at least one of each, or use the original suffix if it is shorter.
-    if len(tail) <= 3:
+    if len(tail) == 2 or (len(tail) == 3 and retime_sigma_min is None):
         return RefinementRestart(release, "no_shorter_two_step_suffix")
     if not math.isfinite(noise_scale) or noise_scale <= 0.0:
         return RefinementRestart(release, "invalid_noise_scale")
@@ -90,6 +118,18 @@ def choose_refinement_restart(
 
     detail_sigma = _crossing(max(p_edge, p_roundtrip), noise_scale)
     structure_sigma = _crossing(p_interior, noise_scale)
+    two_step_index = len(schedule) - 3
+    if retime_sigma_min is not None:
+        floor_sigma = schedule[two_step_index]
+        if detail_sigma <= structure_sigma < floor_sigma:
+            retimed = _retime_two_steps(
+                detail_sigma, structure_sigma, floor_sigma, schedule[-2], retime_sigma_min, schedule_dtype,
+            )
+            if retimed is not None:
+                return RefinementRestart(
+                    two_step_index, "retimed_two_step_suffix", p_edge, p_roundtrip, p_interior,
+                    detail_sigma, structure_sigma, retimed,
+                )
     # Round toward more refinement when the native schedule is coarse. The
     # retained interior must still have at least unit SNR at that point.
     index = release
@@ -97,7 +137,9 @@ def choose_refinement_restart(
         if schedule[candidate] < detail_sigma:
             break
         index = candidate
-    if index == release:
+    if len(tail) == 3:
+        reason = "no_safe_two_step_retime" if structure_sigma < tail[0] else "native_two_step_suffix"
+    elif index == release:
         reason = "detail_needs_legacy_suffix"
     elif schedule[index] > structure_sigma:
         index, reason = release, "no_native_step_separates_bands"
