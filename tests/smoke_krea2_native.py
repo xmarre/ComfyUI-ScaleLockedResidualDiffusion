@@ -822,6 +822,49 @@ def main():
                 "restored_planner_forecasts": restored[0]["forecast"],
             }))
 
+    if reports_context is not None:
+        # Full-native 12-step planner, accelerated target: verify the new
+        # all-solver native scope with an actual Spectrum wrapper, including
+        # the ER-SDE path that the previous SA-only override could not cover.
+        stage_forecasting = SpectrumApplyKrea2().apply(
+            model, preset="turbo", warmup=2, tail=1, bootstrap=False,
+            extrapolation_guard_enabled=False,
+        )[0]
+        for sampler_name in ("euler", "er_sde"):
+            options = dict(latent=torch.zeros(1, 4, 24, 28),
+                           stage_megapixels="0.02", er_sde_max_stage=1)
+            baseline, _, _ = controls(
+                model, sampler_name, "simple", 1.0, 12, False, **options,
+            )
+            native_planner, reports, _ = controls(
+                stage_forecasting, sampler_name, "simple", 1.0, 12, False,
+                planner_native_sampling=True, **options,
+            )
+            assert len(reports) == 3, reports
+            assert reports[0]["native_only"] is True, reports
+            assert reports[0]["forecast"] == 0 and reports[0]["actual"] == 12, reports
+            assert reports[0]["fallback"] is None, reports
+            torch.testing.assert_close(
+                native_planner[1]["samples"], baseline[1]["samples"],
+                rtol=0, atol=0,
+            )
+            assert all(not r["native_only"] for r in reports[1:]), reports
+            assert any(r["forecast"] > 0 for r in reports[1:]), reports
+
+            _, restored, _ = controls(
+                stage_forecasting, sampler_name, "simple", 1.0, 12, False,
+                planner_native_sampling=False, **options,
+            )
+            assert restored[0]["native_only"] is False, restored
+            assert restored[0]["forecast"] > 0, restored
+            print(json.dumps({
+                "case": "all_solver_native_planner_only",
+                "sampler": sampler_name,
+                "planner_calls": reports[0]["actual"],
+                "target_forecasts": [r["forecast"] for r in reports[1:]],
+                "restored_planner_forecasts": restored[0]["forecast"],
+            }))
+
     # ER-SDE's three modes must not contaminate later queued invocations,
     # even when ComfyUI reuses the same node, MODEL patcher, and Spectrum
     # wrapper instance. Test the *complete* three-resolution sampler, not just
