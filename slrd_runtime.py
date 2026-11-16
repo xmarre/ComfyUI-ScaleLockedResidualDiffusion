@@ -1621,6 +1621,7 @@ class Krea2HandoffDiagnostics:
         self.directory = None
         self.records: list[dict] = []
         self.saved: list[str] = []
+        self.planner_check: Optional[dict] = None
 
     def set_planner(self, planner_out: torch.Tensor) -> None:
         with torch.no_grad():
@@ -1751,6 +1752,62 @@ class Krea2HandoffDiagnostics:
 
         return observe
 
+
+
+def _compare_planner_with_stock_ksampler(
+    *, model, positive, negative, cfg, sampler_name, scheduler, steps, denoise,
+    lowres_latent: dict, planner_out: torch.Tensor, seed: int, disable_noise: bool,
+    sampler_options: Optional[dict], diagnostics: Krea2HandoffDiagnostics,
+) -> Optional[dict]:
+    """Rerun the planner canvas through ComfyUI's own KSampler path and compare.
+
+    Mirrors ComfyUI's ``common_ksampler``: its latent preparation, noise,
+    ``comfy.sample.sample`` and schedule, sharing nothing with the planner
+    implementation. Diagnostic only; the planner result is not altered. The
+    reference is saved next to ``planner_final`` for decoding.
+    """
+    if sampler_options is not None and sampler_name in SNR_SOLVER_NAMES:
+        # KSampler cannot receive the configured solver options or the same
+        # stochastic increments, so no like-for-like reference exists.
+        _LOGGER.info(
+            "Krea 2 planner check skipped: sampler %s runs with node-configured options that the stock "
+            "KSampler does not accept. Select a solver without such options (for example euler) to compare.",
+            sampler_name,
+        )
+        return None
+    latent_image = comfy.sample.fix_empty_latent_channels(
+        model, lowres_latent["samples"].detach().cpu(), lowres_latent.get("downscale_ratio_spacial", None))
+    if disable_noise:
+        noise = torch.zeros(latent_image.size(), dtype=latent_image.dtype, layout=latent_image.layout, device="cpu")
+    else:
+        noise = comfy.sample.prepare_noise(latent_image, seed, lowres_latent.get("batch_index", None))
+    reference = comfy.sample.sample(
+        model, noise, steps, cfg, sampler_name, scheduler, positive, negative, latent_image,
+        denoise=denoise, disable_noise=disable_noise, noise_mask=lowres_latent.get("noise_mask", None),
+        disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED, seed=seed,
+    )
+    reference = reference.detach().to(device="cpu", dtype=torch.float32)
+    planner = planner_out.detach().to(device="cpu", dtype=torch.float32)
+    if planner.shape != reference.shape:
+        raise RuntimeError("Krea 2 planner check: stock KSampler returned a different latent shape")
+    delta = planner - reference
+    record = {
+        "max_abs": float(delta.abs().max()),
+        "relative_rms": float(delta.norm() / reference.norm().clamp_min(1e-12)),
+        "identical": bool(torch.equal(planner, reference)),
+    }
+    _LOGGER.info(
+        "Krea 2 planner check: LOWRES_PLANNER vs stock ComfyUI KSampler at %dx%d (%s/%s, %d steps, cfg %g, "
+        "seed %d): %s; max abs difference %.3e, relative RMS difference %.3e. Bit-identical or a difference "
+        "at floating-point rounding level means the planner is the stock sampler result for this MODEL "
+        "and conditioning.",
+        planner.shape[-1] * 8, planner.shape[-2] * 8, sampler_name, scheduler, int(steps), float(cfg), int(seed),
+        "bit-identical" if record["identical"] else "not bit-identical",
+        record["max_abs"], record["relative_rms"],
+    )
+    diagnostics.planner_check = record
+    diagnostics._save("planner_stock_ksampler", reference)
+    return record
 
 
 def _run_planner_final_upscale_only(
@@ -2482,6 +2539,13 @@ def run_scale_locked_ksampler(
 
     diagnostics = (None if handoff_diagnostics == "off" else
                    Krea2HandoffDiagnostics(model, handoff_diagnostics, regeneration_mode, int(seed)))
+    if diagnostics is not None and diagnostics.save:
+        _compare_planner_with_stock_ksampler(
+            model=model, positive=positive, negative=negative, cfg=cfg, sampler_name=sampler_name,
+            scheduler=scheduler, steps=steps, denoise=denoise, lowres_latent=lowres_latent,
+            planner_out=lowres_out["samples"], seed=planner_seed, disable_noise=disable_noise,
+            sampler_options=sampler_options, diagnostics=diagnostics,
+        )
     if upscale_only:
         return _run_planner_final_upscale_only(
             model=model, highres_latent=highres_latent, lowres_out=lowres_out,

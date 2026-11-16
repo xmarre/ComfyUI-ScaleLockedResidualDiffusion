@@ -190,6 +190,62 @@ def check_planner_is_stock_sampling(*, torch, comfy, runtime, node, base, cases,
     print(json.dumps({"case": "planner_is_stock_sampling", "models": [label for label, _ in cases],
                       "bitwise_equal_invocations": checked}))
 
+    # 3. The saved-latent diagnostics rerun the planner canvas through the
+    # stock KSampler path, report the difference and leave sampling unchanged.
+    import tempfile
+    import folder_paths
+    import safetensors.torch
+    created = []
+
+    class Captured(runtime.Krea2HandoffDiagnostics):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    def diagnosed(selected, name, **extra):
+        with torch.inference_mode():
+            return node.sample(selected, positive, negative, {"samples": torch.zeros(1, 4, 32, 40)},
+                               42, .01, 0.0, 0.0, steps=12, sampler_name=name, **extra)
+
+    previous_output = folder_paths.get_output_directory()
+    try:
+        with tempfile.TemporaryDirectory() as tmp, patch.object(runtime, "Krea2HandoffDiagnostics", Captured):
+            folder_paths.set_output_directory(tmp)
+            for label, selected in cases:
+                for name in ("euler", "gradient_estimation", "dpmpp_2m"):
+                    plain = diagnosed(selected, name)
+                    for mode in ("log", "log_and_save_latents"):
+                        observed = diagnosed(selected, name, handoff_diagnostics=mode)
+                        assert all(torch.equal(a["samples"], b["samples"]) for a, b in zip(plain, observed))
+                        saved = [p for p in created[-1].saved if p.endswith("planner_stock_ksampler.latent")]
+                        if mode == "log":
+                            assert created[-1].planner_check is None and not saved
+                            continue
+                        assert created[-1].planner_check == {"max_abs": 0.0, "relative_rms": 0.0,
+                                                             "identical": True}, created[-1].planner_check
+                        reference = safetensors.torch.load_file(saved[0])["latent_tensor"]
+                        assert torch.equal(reference, observed[1]["samples"].float())
+                # A planner that deviates from stock sampling is reported, not hidden.
+                original = runtime._run_lowres_planner
+
+                def deviating(**kwargs):
+                    out = list(original(**kwargs))
+                    out[0] = dict(out[0], samples=out[0]["samples"] * 1.01)
+                    return tuple(out)
+
+                with patch.object(runtime, "_run_lowres_planner", deviating):
+                    diagnosed(selected, "euler", handoff_diagnostics="log_and_save_latents")
+                check = created[-1].planner_check
+                assert not check["identical"] and 0.009 < check["relative_rms"] < 0.011, check
+                # Node-configured stochastic solvers have no stock KSampler equivalent.
+                for name in ("er_sde", "sa_solver"):
+                    diagnosed(selected, name, handoff_diagnostics="log_and_save_latents")
+                    assert created[-1].planner_check is None
+                    assert not any(p.endswith("planner_stock_ksampler.latent") for p in created[-1].saved)
+    finally:
+        folder_paths.set_output_directory(previous_output)
+    print(json.dumps({"case": "planner_stock_ksampler_diagnostic", "models": [label for label, _ in cases]}))
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

@@ -613,6 +613,22 @@ runtime and does not load weights independently.
   `output/scale_locked_diagnostics/`. Load them with LoadLatent and VAE Decode
   to see the actual tensors that the live preview approximates. Nothing is
   decoded inside the sampler.
+- **Planner check against the stock KSampler:** with
+  `handoff_diagnostics=log_and_save_latents` the node also runs the planner
+  canvas once more through ComfyUI's own `KSampler` code path (same MODEL,
+  conditioning, seed, steps, CFG, sampler and scheduler), logs a
+  `Krea 2 planner check:` line with the maximum and relative RMS difference
+  from `LOWRES_PLANNER`, and saves the reference as
+  `planner_stock_ksampler.latent` beside `planner_final.latent`. This costs
+  one extra planner pass and does not change any output. "Bit-identical" or a
+  difference at floating-point rounding level (GPU kernels are not always
+  bitwise repeatable) means the planner image is exactly what the stock
+  sampler produces for these inputs, so its quality is determined by the
+  checkpoint, LoRAs, MODEL patches, prompt, step count and planner size. A
+  larger difference means the planner deviates from stock sampling and
+  should be reported with the log line. The check is skipped for `er_sde`,
+  `sa_solver` and `sa_solver_pece`, whose node-configured options the stock
+  KSampler cannot receive; select another solver such as `euler` to run it.
 - **Five-stage handoff diagnostic viewer:** Import
   [`workflows/krea2-handoff-diagnostics.json`](workflows/krea2-handoff-diagnostics.json)
   after one generation with `handoff_diagnostics=log_and_save_latents`.

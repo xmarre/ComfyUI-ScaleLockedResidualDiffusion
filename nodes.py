@@ -364,7 +364,9 @@ class Krea2TurboFlowAlignedRegenerate:
                                "high-resolution step, how far the denoised prediction and the state's clean component "
                                "are from the finished planner. log_and_save_latents also writes each stage's starting "
                                "state and every denoised prediction as .latent files under "
-                               "output/scale_locked_diagnostics for LoadLatent + VAE Decode. Sampling is unchanged."}),
+                               "output/scale_locked_diagnostics for LoadLatent + VAE Decode, and reruns the planner once "
+                               "through ComfyUI's stock KSampler path to log how far LOWRES_PLANNER is from it "
+                               "(one extra planner pass). Sampling is unchanged."}),
                 "planner_fidelity_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "DISABLED: real-checkpoint testing showed severe duplicated anatomy even when "
                                "latent lowband errors were zero. Retained only to preserve previously saved "
