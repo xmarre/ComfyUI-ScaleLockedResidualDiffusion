@@ -160,7 +160,7 @@ def test_existing_widget_slots_and_explicit_defaults():
         "planner_fidelity_strength", "planner_detail_strength",
         "latent_upscale_method",
         "progressive_transition_sigmas", "spectral_tolerance", "spectral_calibration",
-        "stage_planning",
+        "stage_planning", "planner_native_sampling",
     ]
     assert schema["optional"]["latent_upscale_method"][0] == ["interpolate", "sesqui_wan21"]
     assert schema["optional"]["latent_upscale_method"][1]["default"] == "interpolate"
@@ -170,6 +170,7 @@ def test_existing_widget_slots_and_explicit_defaults():
     assert schema["optional"]["spectral_calibration"][0] == "SLRD_SPECTRUM"
     assert schema["optional"]["stage_planning"][0] == ["manual", "auto_two_passes"]
     assert schema["optional"]["stage_planning"][1]["default"] == "manual"
+    assert schema["optional"]["planner_native_sampling"][1]["default"] is False
     assert schema["optional"]["regeneration_mode"][1]["default"] == "trajectory"
     assert schema["optional"]["steps"][1]["default"] == 12
     assert schema["optional"]["composition_lock_sigma"][1]["default"] == 0.65
@@ -614,6 +615,19 @@ def test_trajectory_auto_native_plans_the_in_range_grid_as_first_stage():
     assert call["img2img_start_sigma"] is None
 
 
+def test_planner_native_sampling_controls_only_the_planner_and_all_solvers():
+    node, calls, args = _node()
+    for sampler_name in ("euler", "er_sde", "sa_solver", "sa_solver_pece"):
+        node.sample(*args, sampler_name=sampler_name, planner_native_sampling=True)
+        assert calls[-1]["planner_native_only"] is True
+        node.sample(*args, sampler_name=sampler_name)
+        assert calls[-1]["planner_native_only"] is False
+    with pytest.raises(ValueError, match="planner_native_sampling"):
+        node.sample(*args, planner_native_sampling="false")
+    with pytest.raises(ValueError, match="planner_native_sampling"):
+        node.sample(*args, planner_native_sampling=1)
+
+
 def test_auto_two_passes_uses_target_grid_instead_of_a_fixed_upscale_cap():
     node, calls, args = _node(native_first=(150, 150))
     node.sample(*args, regeneration_mode="trajectory_auto_native",
@@ -674,3 +688,43 @@ def test_native_first_stage_is_specific_to_its_mode_and_respects_explicit_stages
     assert calls[-1]["stage_hw"] == ((176, 176),)
     node.sample(*args, regeneration_mode="trajectory_auto_native", stage_megapixels="2")
     assert calls[-1]["stage_hw"] == ((176, 176),)
+
+
+def test_all_solver_native_scope_is_nested_and_exception_safe(monkeypatch):
+    import contextvars
+    import sys
+    from contextlib import contextmanager
+
+    source = ast.parse((ROOT / "slrd_runtime.py").read_text())
+    names = {"_spectrum_all_solver_native_vars", "spectrum_planner_native_scope"}
+    methods = [x for x in source.body if isinstance(x, ast.FunctionDef) and x.name in names]
+    assert len(methods) == 2
+    runtime = {
+        "contextvars": contextvars, "sys": sys, "contextmanager": contextmanager,
+        "_SPECTRUM_RUNTIME": "comfyui_spectrum_krea2.runtime",
+        "_LOGGER": SimpleNamespace(info=lambda *args: None),
+    }
+    exec(compile(ast.Module(body=methods, type_ignores=[]),
+                 str(ROOT / "slrd_runtime.py"), "exec"), runtime)
+    name = "test_scope.comfyui_spectrum_krea2.runtime"
+    native = contextvars.ContextVar("test_spectrum_planner_native", default=False)
+    module = SimpleNamespace(FORCE_NATIVE_ALL=native)
+    monkeypatch.setitem(sys.modules, name, module)
+    scope = runtime["spectrum_planner_native_scope"]
+    with scope(True):
+        assert native.get() is True
+        with scope(True):
+            assert native.get() is True
+        assert native.get() is True
+        with pytest.raises(RuntimeError, match="cancelled"):
+            with scope(True):
+                raise RuntimeError("cancelled")
+        assert native.get() is True
+    assert native.get() is False
+    with scope(False):
+        assert native.get() is False
+    module.FORCE_NATIVE_ALL = None
+    with pytest.raises(RuntimeError, match="requires Spectrum Krea 2 PR #2"):
+        with scope(True):
+            pass
+    assert native.get() is False
