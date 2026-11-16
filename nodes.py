@@ -252,9 +252,11 @@ class Krea2TurboFlowAlignedRegenerate:
             },
             "optional": {
                 "steps": ("INT", {"default": 12, "min": 1, "max": 10000,
-                                   "tooltip": "Sampling step budget (12 for the tested 4096x4096 Krea 2 profile). "
-                                              "The planner and trajectory stages share the schedule; spectral_progressive "
-                                              "distributes the 12 steps across resolutions. More steps cost more at larger canvases."}),
+                                   "tooltip": "The full native sigma schedule and low-resolution planner step count. "
+                                              "Automatic completed-latent high-resolution passes use a suffix of this "
+                                              "schedule, not another full steps evaluations. "
+                                              "highres_min_step_fraction controls their minimum relative step budget. "
+                                              "Other modes may distribute or reuse parts of the schedule."}),
                 "composition_lock_sigma": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 1.0, "step": 0.01,
                     "tooltip": "Target steps starting above this noise level reuse the complete planner prediction, "
                                "so the high-resolution pass cannot form a second, displaced composition. "
