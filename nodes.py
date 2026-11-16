@@ -411,6 +411,14 @@ class Krea2TurboFlowAlignedRegenerate:
                                "refinement (when possible) plus the final pass. Existing connections "
                                "need no changes. Very large final jumps may reduce image quality.",
                 }),
+                "highres_min_step_fraction": ("FLOAT", {
+                    "default": 0.25, "min": 0.0, "max": 1.0, "step": 0.05, "round": 0.01,
+                    "tooltip": "Minimum share of total steps retained at each automatic completed-latent "
+                               "high-resolution restart (e.g. 20 steps and 0.25 request at least 5). "
+                               "Capped by the post-composition-release native suffix. "
+                               "0.00 restores v1.3.0's unconstrained adaptive two-step selection. "
+                               "Does not alter stage count or other regeneration modes.",
+                }),
             },
         }
 
@@ -454,6 +462,7 @@ class Krea2TurboFlowAlignedRegenerate:
         spectral_tolerance=0.01,
         spectral_calibration=None,
         stage_planning="manual",
+        highres_min_step_fraction=0.25,
     ):
         if latent_upscale_method not in ("interpolate", "sesqui_wan21"):
             raise ValueError("latent_upscale_method must be interpolate or sesqui_wan21")
@@ -461,6 +470,11 @@ class Krea2TurboFlowAlignedRegenerate:
             raise ValueError(f"regeneration_mode must be one of {', '.join(REGENERATION_MODES)}")
         if stage_planning not in ("manual", "auto_two_passes"):
             raise ValueError("stage_planning must be manual or auto_two_passes")
+        if (isinstance(highres_min_step_fraction, bool)
+                or not isinstance(highres_min_step_fraction, (int, float))
+                or not math.isfinite(highres_min_step_fraction)
+                or not 0.0 <= highres_min_step_fraction <= 1.0):
+            raise ValueError("highres_min_step_fraction must be between 0 and 1")
         progressive = regeneration_mode == "spectral_progressive"
         # Manual spectral transitions are dormant in every other regeneration mode.
         # Preserve the widget value so switching back restores the schedule.
@@ -744,6 +758,7 @@ class Krea2TurboFlowAlignedRegenerate:
                 progressive_transition_sigmas=transition_sigmas,
                 spectral_calibration=spectral_calibration,
                 spectral_tolerance=float(spectral_tolerance),
+                highres_min_step_fraction=float(highres_min_step_fraction),
             )
         return (result.output, result.lowres_planner, result.denoised_output)
 
