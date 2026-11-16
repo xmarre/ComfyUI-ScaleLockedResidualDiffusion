@@ -400,13 +400,6 @@ class Krea2TurboFlowAlignedRegenerate:
                                "spectral_progressive derives its transition sigmas from it; trajectory mode only "
                                "logs whether composition_lock_sigma hands over before frequencies the target "
                                "cannot recover become informative. Sampling is otherwise unchanged."}),
-                "planner_native_sampling": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Planner-only quality diagnostic. Disable Spectrum forecasts for "
-                               "the low-resolution planner for every supported solver, including ER-SDE, "
-                               "while preserving Spectrum acceleration in all later stages. "
-                               "Requires the companion Spectrum PR #2 for a forecast-enabled model.",
-                }),
                 "stage_planning": (["manual", "auto_two_passes"], {
                     "default": "manual",
                     "tooltip": "manual preserves max_stage_upscale and explicit stage_megapixels. "
@@ -415,6 +408,13 @@ class Krea2TurboFlowAlignedRegenerate:
                                "LATENT and the rounded planner resolution, keeping one native-range "
                                "refinement (when possible) plus the final pass. Existing connections "
                                "need no changes. Very large final jumps may reduce image quality.",
+                }),
+                "planner_native_sampling": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Planner-only quality diagnostic. Disable Spectrum forecasts for "
+                               "the low-resolution planner for every supported solver, including ER-SDE, "
+                               "while preserving Spectrum acceleration in all later stages. "
+                               "Requires the companion Spectrum PR #2 for a forecast-enabled model.",
                 }),
             },
         }
