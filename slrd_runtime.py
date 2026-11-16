@@ -84,6 +84,40 @@ def _spectrum_force_native_vars() -> list:
     return found
 
 
+def _spectrum_all_solver_native_vars() -> list:
+    """All-solver native-only controls from already loaded Spectrum Krea 2 runtimes."""
+    found = []
+    for name, module in list(sys.modules.items()):
+        if module is None or not (name == _SPECTRUM_RUNTIME or name.endswith("." + _SPECTRUM_RUNTIME)):
+            continue
+        var = getattr(module, "FORCE_NATIVE_ALL", None)
+        if not isinstance(var, contextvars.ContextVar):
+            raise RuntimeError(
+                "planner_native_sampling requires Spectrum Krea 2 PR #2 with "
+                "FORCE_NATIVE_ALL; update that PR overlay or disable planner_native_sampling"
+            )
+        if all(var is not v for v in found):
+            found.append(var)
+    return found
+
+
+@contextmanager
+def spectrum_planner_native_scope(enabled: bool):
+    """Disable forecasts for this planner invocation only, without mutating MODEL patches."""
+    if not enabled:
+        yield
+        return
+    controls = _spectrum_all_solver_native_vars()
+    if not controls:
+        _LOGGER.info("Krea 2 planner native sampling: Spectrum runtime not loaded; no forecasts to suppress")
+    tokens = [(var, var.set(True)) for var in controls]
+    try:
+        yield
+    finally:
+        for var, token in reversed(tokens):
+            var.reset(token)
+
+
 @contextmanager
 def sa_native_only_scope(enabled: bool):
     """Suppress only Spectrum forecasts for the scoped SA execution.
@@ -2265,6 +2299,7 @@ def run_scale_locked_ksampler(
     stage_hw: tuple = (),
     sampler_options: Optional[dict] = None,
     sa_planner_native_only: bool = False,
+    planner_native_only: bool = False,
     regeneration_mode: str = "trajectory",
     img2img_start_sigma: Optional[float] = None,
     handoff_diagnostics: str = "off",
@@ -2463,7 +2498,7 @@ def run_scale_locked_ksampler(
     with sa_native_only_scope(
         bool(sa_planner_native_only)
         and sampler_name in ("sa_solver", "sa_solver_pece")
-    ):
+    ), spectrum_planner_native_scope(bool(planner_native_only)):
         lowres_out, anchors_x0, planner_sigmas, lowres_noise, pece_corrections = _run_lowres_planner(
             model=model,
             positive=positive,
