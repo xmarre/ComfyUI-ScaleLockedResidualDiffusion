@@ -400,6 +400,13 @@ class Krea2TurboFlowAlignedRegenerate:
                                "spectral_progressive derives its transition sigmas from it; trajectory mode only "
                                "logs whether composition_lock_sigma hands over before frequencies the target "
                                "cannot recover become informative. Sampling is otherwise unchanged."}),
+                "planner_native_sampling": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Planner-only quality diagnostic. Disable Spectrum forecasts for "
+                               "the low-resolution planner for every supported solver, including ER-SDE, "
+                               "while preserving Spectrum acceleration in all later stages. "
+                               "Requires the companion Spectrum PR #2 for a forecast-enabled model.",
+                }),
                 "stage_planning": (["manual", "auto_two_passes"], {
                     "default": "manual",
                     "tooltip": "manual preserves max_stage_upscale and explicit stage_megapixels. "
@@ -452,6 +459,7 @@ class Krea2TurboFlowAlignedRegenerate:
         spectral_tolerance=0.01,
         spectral_calibration=None,
         stage_planning="manual",
+        planner_native_sampling=False,
     ):
         if latent_upscale_method not in ("interpolate", "sesqui_wan21"):
             raise ValueError("latent_upscale_method must be interpolate or sesqui_wan21")
@@ -459,6 +467,8 @@ class Krea2TurboFlowAlignedRegenerate:
             raise ValueError(f"regeneration_mode must be one of {', '.join(REGENERATION_MODES)}")
         if stage_planning not in ("manual", "auto_two_passes"):
             raise ValueError("stage_planning must be manual or auto_two_passes")
+        if type(planner_native_sampling) is not bool:
+            raise ValueError("planner_native_sampling must be a boolean")
         progressive = regeneration_mode == "spectral_progressive"
         # Manual spectral transitions are dormant in every other regeneration mode.
         # Preserve the widget value so switching back restores the schedule.
@@ -733,6 +743,7 @@ class Krea2TurboFlowAlignedRegenerate:
                     sampler_name in ("sa_solver", "sa_solver_pece")
                     and not sa_planner_spectrum_forecasts
                 ),
+                planner_native_only=planner_native_sampling,
                 regeneration_mode=regeneration_mode,
                 img2img_start_sigma=float(img2img_start_sigma) if img2img else None,
                 handoff_diagnostics=handoff_diagnostics,
