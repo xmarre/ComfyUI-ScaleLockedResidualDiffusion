@@ -112,6 +112,33 @@ ComfyUI initializes from `(1-s) * clean + s * noise_scale * noise` using the ret
 
 Look for `reason=retimed_two_step_suffix` and `retimed_sigmas` in the restart log. With handoff diagnostics enabled, the entry includes both measured crossings and the native and selected sigma. Under SA-PECE the per-step x0 diagnostics show predictor estimates. Decode `stageN_completed` to inspect the result after the corrector.
 
+## Planner-only native sampling comparison
+
+The original planner pass samples a completed low-resolution latent before
+the high-resolution handoffs. A 16-step planner with Spectrum can execute only
+10 actual model evaluations and forecast six. Those forecasts are useful for
+performance but can potentially degrade facial and fine-texture fidelity;
+the observed cause of a particular defect must be tested on a matched seed.
+
+Enable `planner_native_sampling` on the Scale-Locked Krea 2 node to suppress
+Spectrum forecasts **only** for the planner, including with ER-SDE, while
+preserving the later stage schedule, sampler options, stage layout, model,
+conditioning and Spectrum behavior. This appends a new optional widget with a
+default of OFF, so existing workflows retain their previous results.
+
+The control uses `FORCE_NATIVE_ALL` from Spectrum Krea 2 PR #2; older Spectrum
+overlay versions that lack the control fail explicitly instead of silently
+ignoring the requested comparison. No Spectrum installation means the planner
+is already native. The existing SA-only native control remains independent.
+Check the planner Spectrum report for `forecast=0` and
+`actual=outer_steps`; subsequent target stage reports should be unchanged.
+
+For a matched A/B, compare saved **planner latents**, not just JPEG previews,
+using the same VAE, seed, prompt, LoRAs, resolution and steps, keeping
+`planner_native_sampling` as the only changed setting. If the native planner
+is cleaner, assess the final image's identity and anatomy before changing
+defaults. More compute does not guarantee improved visual quality.
+
 ## Compare decoded outputs
 
 Use fixed seeds, prompts and identical checkpoints, LoRAs, attention patches and resolutions across `trajectory`, `trajectory_auto` and `trajectory_auto_native`. The log line `Krea 2 trajectory_auto_native:` states which first-pass layout applied. Include a `planner_final_img2img` preservation comparison and a `trajectory` comparison with Spectrum disabled when a defect appears during forecasting. Try scenes with faces and hands, repeated patterns, text, fabrics and structured backgrounds.
