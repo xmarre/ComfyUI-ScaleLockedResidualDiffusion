@@ -314,6 +314,16 @@ runtime and does not load weights independently.
     restart exceeds the measured structure limit. For outputs inside
     the range it is identical to `trajectory_auto`. See
     [Automatic trajectory refinement](docs/krea2-auto-refinement.md#native-range-first-refinement).
+    For opt-in automatic stage budgeting, set `stage_planning=auto_two_passes`
+    and clear `stage_megapixels`. The node computes the area-growth cap from
+    the connected final LATENT and the rounded planner grid instead of requiring
+    manual tuning of `max_stage_upscale` after every resolution change. It
+    selects two high-resolution passes when a native-range intermediate exists,
+    otherwise just one direct target pass (including when the planner already
+    exceeds 2048 pixels on an axis). The selector never promises a fixed
+    image-quality improvement, and manual mode remains the default. Existing
+    `ScaleLockedResolutionSelector` connections are sufficient; no additional
+    resolution node is needed.
   - `planner_final_img2img` runs the planner to completion and treats its
     finished latent as an image to refine. Each high-resolution stage resizes
     the finished latent of the stage below (the planner for the first stage),
