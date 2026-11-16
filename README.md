@@ -632,6 +632,34 @@ runtime and does not load weights independently.
   `output/scale_locked_diagnostics/`. Load them with LoadLatent and VAE Decode
   to see the actual tensors that the live preview approximates. Nothing is
   decoded inside the sampler.
+- **Patch-lattice report and correction:** Krea 2 writes every 2x2 latent
+  patch (16x16 image pixels) from one token. A constant per-channel offset
+  between the four positions inside a patch decodes to a faint, perfectly
+  regular 16-pixel grid over the whole image, most visible in hair and
+  fabric and stronger in dark areas. With `handoff_diagnostics=log` (or
+  `log_and_save_latents`) the node logs a `Krea 2 patch lattice:` line for
+  the finished planner, each enlarged stage source and each completed stage,
+  and adds `x0_patch_lattice_*` values to every step record. `coherence` and
+  `max_coherence` are `|mean| / rms` of the per-patch pattern coefficients
+  (RMS and maximum over channels and the three period-2 modes); content that
+  ignores the patch grid gives about `chance` (`1/sqrt(patches)`), and
+  `amplitude` is the pattern's RMS size in model-internal latent units. The
+  first latent whose coherence rises well above chance is where the pattern
+  enters: the planner (checkpoint, quantization or LoRA, independent of
+  resolution), an enlarged source (the latent upscaler), or the predictions
+  of a high-resolution stage (denoising beyond the model's native range).
+  `patch_lattice_correction` (optional, default `off`) is experimental.
+  `final_latent` measures that constant offset in the finished latent and
+  subtracts it from the output and `DENOISED_OUTPUT` latents: three Fourier
+  coefficients per channel change, the channel mean and all other content are
+  preserved, and sampling is unchanged. `LOWRES_PLANNER` is never modified.
+  Measured on Wan 2.1 VAE encodings of four 768-pixel regions (hair, skin,
+  fabric) of one 3920x5888 Krea 2 image that showed the grid, the same
+  subtraction removed 83% to 100% of the decoded pattern and changed pixels
+  by 0.6 to 1.0 of 255 levels on average. Grid-shaped texture that the
+  denoiser already drew into image content is not a constant offset and is
+  not removed; the effect on sampled latents from a real checkpoint, where
+  no VAE or JPEG round trip is involved, has not been measured.
 - **Planner check against the stock KSampler:** with
   `handoff_diagnostics=log_and_save_latents` the node also runs the planner
   canvas once more through ComfyUI's own `KSampler` code path (same MODEL,
