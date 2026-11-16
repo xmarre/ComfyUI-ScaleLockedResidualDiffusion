@@ -20,7 +20,9 @@ import comfy.samplers
 import comfy.utils
 import latent_preview
 
-from .auto_refinement import RefinementRestart, choose_refinement_restart
+from .auto_refinement import (
+    RefinementRestart, choose_refinement_restart, apply_refinement_step_budget,
+)
 from .krea2_flow import build_patch_coupled_noise
 from .spectral_progressive import (
     describe_calibration,
@@ -1304,6 +1306,7 @@ def _run_resolution_ladder(
     auto_refinement: bool = False,
     completed_first: bool = False,
     retime_short_restarts: bool = False,
+    highres_min_step_fraction: float = 0.25,
 ) -> ScaleLockedSampleResult:
     """Refine through increasing resolutions, each stage finishing its image.
 
@@ -1436,6 +1439,19 @@ def _run_resolution_ladder(
                         ):
                             raise ValueError("trajectory_auto received a nonfinite completed or enlarged latent")
                         del source, roundtrip
+                decision = apply_refinement_step_budget(
+                    decision, total_steps, release, highres_min_step_fraction,
+                )
+                if highres_min_step_fraction > 0.0:
+                    requested = max(2, math.ceil(total_steps * highres_min_step_fraction))
+                    _LOGGER.info(
+                        "Krea 2 high-res step budget: requested_steps=%d "
+                        "available_after_release=%d selected_steps=%d "
+                        "fraction=%.2f stage=%d",
+                        requested, total_steps - release,
+                        2 if decision.retimed_sigmas is not None else total_steps - decision.index,
+                        highres_min_step_fraction, index,
+                    )
                 stage_start = decision.index
                 retimed = decision.retimed_sigmas
                 stage_sigmas = sigmas[stage_start:] if retimed is None else sigmas.new_tensor(retimed)
@@ -2331,6 +2347,7 @@ def run_scale_locked_ksampler(
     progressive_transition_sigmas: Optional[list] = None,
     spectral_calibration: Optional[dict] = None,
     spectral_tolerance: float = 0.01,
+    highres_min_step_fraction: float = 0.25,
 ) -> ScaleLockedSampleResult:
     if steps < 1:
         raise ValueError("steps must be >= 1")
@@ -2590,6 +2607,7 @@ def run_scale_locked_ksampler(
             latent_upscale_method=latent_upscale_method,
             auto_refinement=auto_refinement, completed_first=completed_first,
             retime_short_restarts=regeneration_mode == "trajectory_auto_native",
+            highres_min_step_fraction=highres_min_step_fraction,
         )
 
     runtime = ScaleLockedRuntimeContext(
