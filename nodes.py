@@ -400,6 +400,15 @@ class Krea2TurboFlowAlignedRegenerate:
                                "spectral_progressive derives its transition sigmas from it; trajectory mode only "
                                "logs whether composition_lock_sigma hands over before frequencies the target "
                                "cannot recover become informative. Sampling is otherwise unchanged."}),
+                "stage_planning": (["manual", "auto_two_passes"], {
+                    "default": "manual",
+                    "tooltip": "manual preserves max_stage_upscale and explicit stage_megapixels. "
+                               "auto_two_passes applies only to trajectory_auto_native with no explicit "
+                               "stage list. It derives a per-run area-growth cap from the connected target "
+                               "LATENT and the rounded planner resolution, keeping one native-range "
+                               "refinement (when possible) plus the final pass. Existing connections "
+                               "need no changes. Very large final jumps may reduce image quality.",
+                }),
             },
         }
 
@@ -442,11 +451,14 @@ class Krea2TurboFlowAlignedRegenerate:
         progressive_transition_sigmas="",
         spectral_tolerance=0.01,
         spectral_calibration=None,
+        stage_planning="manual",
     ):
         if latent_upscale_method not in ("interpolate", "sesqui_wan21"):
             raise ValueError("latent_upscale_method must be interpolate or sesqui_wan21")
         if regeneration_mode not in REGENERATION_MODES:
             raise ValueError(f"regeneration_mode must be one of {', '.join(REGENERATION_MODES)}")
+        if stage_planning not in ("manual", "auto_two_passes"):
+            raise ValueError("stage_planning must be manual or auto_two_passes")
         progressive = regeneration_mode == "spectral_progressive"
         # Manual spectral transitions are dormant in every other regeneration mode.
         # Preserve the widget value so switching back restores the schedule.
@@ -539,6 +551,13 @@ class Krea2TurboFlowAlignedRegenerate:
             raise ValueError("Final LATENT must be larger than the planner canvas")
 
         explicit_stages = parse_stage_megapixels(stage_megapixels)
+        auto_two_passes = (
+            stage_planning == "auto_two_passes"
+            and regeneration_mode == "trajectory_auto_native"
+            and not explicit_stages
+        )
+        if stage_planning == "auto_two_passes" and explicit_stages:
+            logger.info("Krea 2 auto stage planning is inactive: explicit stage_megapixels takes precedence")
         native_first = None
         if native_refine:
             if explicit_stages:
@@ -553,11 +572,39 @@ class Krea2TurboFlowAlignedRegenerate:
             # largest grid inside the model's native range, when one exists
             # between the planner and an out-of-range output.
             native_first = (krea2_native_first_stage_hw(
-                                (low_h, low_w), (target_h, target_w), max_stage_upscale,
+                                (low_h, low_w), (target_h, target_w),
+                                0.0 if auto_two_passes else max_stage_upscale,
                             ) if regeneration_mode == "trajectory_auto_native" else None)
             start_hw = native_first or (low_h, low_w)
+            stage_growth_cap = max_stage_upscale
+            if auto_two_passes:
+                # Compute from actual rounded latent grids (pixel area has the
+                # same ratios). Native-first is constrained by the 2048px axis,
+                # so sqrt(target/planner) alone can undercount later stages.
+                planner_area = low_h * low_w
+                native_area = start_hw[0] * start_hw[1]
+                target_area = target_h * target_w
+                first_growth = native_area / planner_area
+                final_growth = target_area / native_area
+                stage_growth_cap = 1.02 * max(first_growth, final_growth)
+                logger.info(
+                    "Krea 2 auto_two_passes: planner=%sx%s native=%s target=%sx%s "
+                    "per-stage area growth=%.4gx/%.4gx effective_cap=%.4g "
+                    "high_resolution_passes=%d",
+                    low_w * 8, low_h * 8,
+                    f"{start_hw[1] * 8}x{start_hw[0] * 8}" if native_first else "unavailable",
+                    target_w * 8, target_h * 8,
+                    first_growth, final_growth, stage_growth_cap,
+                    2 if native_first else 1,
+                )
+                if final_growth > 7.0:
+                    logger.warning(
+                        "Krea 2 auto_two_passes: final area jump %.2fx exceeds the "
+                        "previously tested 7x range; detail fidelity is unvalidated",
+                        final_growth,
+                    )
             stage_mp = plan_stage_megapixels(
-                start_hw[0] * start_hw[1] * 64.0, target_h * target_w * 64.0, max_stage_upscale)
+                start_hw[0] * start_hw[1] * 64.0, target_h * target_w * 64.0, stage_growth_cap)
         stage_hw = []
         previous = (low_h, low_w)
         if not native_refine and not explicit_stages and native_first is not None:
