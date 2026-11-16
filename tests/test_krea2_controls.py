@@ -160,6 +160,7 @@ def test_existing_widget_slots_and_explicit_defaults():
         "planner_fidelity_strength", "planner_detail_strength",
         "latent_upscale_method",
         "progressive_transition_sigmas", "spectral_tolerance", "spectral_calibration",
+        "stage_planning",
     ]
     assert schema["optional"]["latent_upscale_method"][0] == ["interpolate", "sesqui_wan21"]
     assert schema["optional"]["latent_upscale_method"][1]["default"] == "interpolate"
@@ -167,6 +168,8 @@ def test_existing_widget_slots_and_explicit_defaults():
     assert schema["optional"]["progressive_transition_sigmas"][1]["default"] == ""
     assert schema["optional"]["spectral_tolerance"][1]["default"] == 0.01
     assert schema["optional"]["spectral_calibration"][0] == "SLRD_SPECTRUM"
+    assert schema["optional"]["stage_planning"][0] == ["manual", "auto_two_passes"]
+    assert schema["optional"]["stage_planning"][1]["default"] == "manual"
     assert schema["optional"]["regeneration_mode"][1]["default"] == "trajectory"
     assert schema["optional"]["steps"][1]["default"] == 12
     assert schema["optional"]["composition_lock_sigma"][1]["default"] == 0.65
@@ -609,6 +612,51 @@ def test_trajectory_auto_native_plans_the_in_range_grid_as_first_stage():
     assert node.native_calls == [((124, 124), (200, 200), 4.0)]
     assert node.planning[-1][0] == 150 * 150 * 64.0
     assert call["img2img_start_sigma"] is None
+
+
+def test_auto_two_passes_uses_target_grid_instead_of_a_fixed_upscale_cap():
+    node, calls, args = _node(native_first=(150, 150))
+    node.sample(*args, regeneration_mode="trajectory_auto_native",
+                stage_planning="auto_two_passes", max_stage_upscale=2.0)
+    assert calls[-1]["stage_hw"] == ((150, 150),)
+    assert node.native_calls[-1] == ((124, 124), (200, 200), 0.0)
+    assert node.planning[-1][2] == pytest.approx(
+        1.02 * max((150 / 124) ** 2, (200 / 150) ** 2)
+    )
+
+    # Same planner and native stage; a larger connected target automatically
+    # increases the area cap without changing any widget values.
+    enlarged = list(args)
+    enlarged[3] = {"samples": torch.zeros(1, 16, 300, 300)}
+    node.sample(*enlarged, regeneration_mode="trajectory_auto_native",
+                stage_planning="auto_two_passes", max_stage_upscale=2.0)
+    assert node.native_calls[-1] == ((124, 124), (300, 300), 0.0)
+    assert node.planning[-1][2] == pytest.approx(
+        1.02 * max((150 / 124) ** 2, (300 / 150) ** 2)
+    )
+
+
+def test_auto_two_passes_respects_explicit_stages_and_other_modes():
+    node, calls, args = _node(native_first=(150, 150), planned=(2.0,))
+    node.sample(*args, regeneration_mode="trajectory_auto_native",
+                stage_planning="auto_two_passes", stage_megapixels="2")
+    assert calls[-1]["stage_hw"] == ((176, 176),)
+    assert not node.native_calls and not node.planning
+
+    node.sample(*args, regeneration_mode="trajectory",
+                stage_planning="auto_two_passes")
+    assert node.native_calls == []
+    assert node.planning[-1][2] == 4.0
+    with pytest.raises(ValueError, match="stage_planning"):
+        node.sample(*args, stage_planning="invalid")
+
+
+def test_auto_two_passes_falls_back_to_single_pass_without_native_stage():
+    node, calls, args = _node(native_first=None)
+    node.sample(*args, regeneration_mode="trajectory_auto_native",
+                stage_planning="auto_two_passes")
+    assert calls[-1]["stage_hw"] == ()
+    assert node.planning[-1][2] == pytest.approx(1.02 * (200 / 124) ** 2)
 
 
 def test_trajectory_auto_native_without_an_in_range_grid_keeps_the_planned_layout():
