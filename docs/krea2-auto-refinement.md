@@ -2,6 +2,45 @@
 
 Select `trajectory_auto` in the Krea 2 node's **Regeneration mode**. Keep the same planner size, output size, stage layout, solver and scheduler as the `trajectory` comparison. The existing composition lock still governs the first pass. Each subsequent restart is selected automatically. The feature applies when the stage layout has at least one intermediate high-resolution pass. Both interpolation and SesquiLSR use the same policy. `trajectory` remains the default.
 
+## Automatic stage count from the connected resolution selector
+
+The existing `ScaleLockedResolutionSelector` outputs width and height to the
+shared `EmptyLatentImage`. Both regular and Scale-Locked samplers receive this
+same target latent. There is no need for a second resolution selector or new
+workflow connection.
+
+For `trajectory_auto_native`, set `stage_planning=auto_two_passes` and leave
+`stage_megapixels` empty. The sampler uses the **actual rounded** planner and
+target latent grids on every run. It first chooses the largest valid native-range
+refinement (up to a 2048-pixel axis), then selects an area-growth cap:
+
+```text
+A_p = planner width * planner height
+A_n = native refinement width * native refinement height
+A_t = target width * target height
+effective_cap = 1.02 * max(A_n / A_p, A_t / A_n)
+```
+
+The 2% numerical headroom prevents a borderline rounding decision from
+creating a gratuitous intermediate stage. With a valid native stage, the
+resulting ladder is planner → native → target: two high-resolution passes.
+When there is no valid native stage, the policy uses the direct target pass
+and reports that the native stage was unavailable. The implementation does not
+promise exactly two passes in that case. For a 992×992 planner and 5024×5024
+target, the native stage is 2048×2048 and the derived area cap is about
+6.14, irrespective of the manual `max_stage_upscale` widget.
+
+`stage_planning=manual` is the backward-compatible default and retains the
+existing `max_stage_upscale` behavior. Explicit `stage_megapixels` always
+takes precedence. The auto widget is inert in all other regeneration modes, so
+existing saved workflows and sampler comparisons retain their behavior. The
+calculated cap, stage sizes and large-jump warnings appear in the log.
+
+This is stage-count automation, not a texture-quality guarantee. Large jumps
+can discard fine detail or create artifacts. The previously observed reduction
+in exaggerated skin blemishes from fewer refinement stages requires validation
+across matched seeds, subjects and output sizes.
+
 ## Why the handoff matters
 
 The first high-resolution pass uses intermediate planner predictions above the composition-lock threshold. Euler integrates this locked prefix in closed form when possible. Other solvers integrate it with the original solver and substitute the planner predictions, including the corresponding PECE corrections. The first unlocked prediction can introduce new detail, including unwanted geometry.
