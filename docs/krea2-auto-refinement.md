@@ -41,6 +41,47 @@ can discard fine detail or create artifacts. The previously observed reduction
 in exaggerated skin blemishes from fewer refinement stages requires validation
 across matched seeds, subjects and output sizes.
 
+## High-resolution step budget (separate from stage count)
+
+The `steps` widget defines the planner's native schedule. In automatic
+completed-latent regeneration, the existing restart policy can pick a
+very short **two-evaluation suffix** at each high-resolution stage regardless
+of the total planner steps. `stage_planning=auto_two_passes` controls the
+number of spatial resolution transitions, **not** the number of evaluations
+inside a transition.
+
+The new optional `highres_min_step_fraction` (default **0.25**) imposes a
+minimum share of requested sampling steps at each automatic completed-latent
+high-resolution restart:
+
+```text
+requested_min = max(2, ceil(steps * highres_min_step_fraction))
+available = steps - composition_lock_release_index
+required = min(requested_min, available)
+selected_steps = max(previous_adaptive_selection, required)
+```
+
+For example, with 20 planner steps and 0.25, at least five target steps
+are retained **if five exist after composition-lock release**. With 14
+planner steps, the same fraction requests four target steps. The solver
+uses native sigma knots; no artificial model calls or new interval points
+are introduced. When the release leaves fewer steps, the request is
+capped at that existing suffix, and the log reports requested, available
+and selected counts. Earlier starts increase denoising and can change
+composition or likeness, so the default is a conservative budget rather
+than a full re-generation.
+
+Set the fraction to **0.00** to restore the v1.3.0 behavior, including
+two-step retiming. For a budget requiring more than two steps, the
+retimed two-step grid is discarded and the normal native sigma suffix
+is used. The step fraction does not affect ordinary `trajectory`,
+`planner_final_img2img`, `spectral_progressive` or other modes.
+
+The new widget is appended after `stage_planning` to preserve all
+previously stored widget indices. The default of 0.25 deliberately changes
+the target-step budget for existing auto-mode workflows upgraded from
+v1.3.0; use 0.00 if exact legacy behavior is required.
+
 ## Why the handoff matters
 
 The first high-resolution pass uses intermediate planner predictions above the composition-lock threshold. Euler integrates this locked prefix in closed form when possible. Other solvers integrate it with the original solver and substitute the planner predictions, including the corresponding PECE corrections. The first unlocked prediction can introduce new detail, including unwanted geometry.
