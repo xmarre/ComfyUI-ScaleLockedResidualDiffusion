@@ -685,7 +685,7 @@ def main():
     native_solvers = ("euler", "dpmpp_2m", "er_sde", "sa_solver", "sa_solver_pece")
 
     def native_run(selected, solver, count, limit_px=None, mode="trajectory_auto_native", *,
-                   steps=16, restart_source_scale=1., **options):
+                   steps=16, restart_source_scale=1., force_two_step=False, **options):
         decisions, forwards = [], []
         real_decide = runtime.choose_refinement_restart
         real_noise_scaling = selected.model.model_sampling.noise_scaling
@@ -694,6 +694,10 @@ def main():
             roundtrip, hw, noise_scale = rest
             decision = real_decide(schedule, release, source if restart_source_scale == 1. else source * restart_source_scale,
                                    roundtrip if restart_source_scale == 1. else roundtrip * restart_source_scale, hw, noise_scale, **options)
+            if force_two_step:
+                # Make the old two-step minimum deterministic: the test
+                # evaluates the real guider/scheduler against a fixed decision.
+                decision = runtime.RefinementRestart(len(schedule) - 3, "forced_two_step_test")
             decisions.append((tuple(source.shape[-2:]), decision))
             return decision
 
@@ -710,6 +714,9 @@ def main():
         for item in patches:
             item.start()
         try:
+            # Older native smoke cases validate v1.3.0's exact adaptive
+            # behavior. Exercise the new budget explicitly in its own tests.
+            options.setdefault("highres_min_step_fraction", 0.0)
             result, reports, counts = controls(
                 selected, solver, "simple", 1.0, steps, count, regeneration_mode=mode,
                 er_sde_max_stage=1, **options)
@@ -803,6 +810,44 @@ def main():
             plain = native_run(selected, "er_sde", False, mode=mode, **two_stage)
             limited = native_run(selected, "er_sde", False, limit_px=112, mode=mode, **two_stage)
             assert same(plain[0], limited[0]) and plain[1] == limited[1], (label, mode)
+
+    # The new proportional floor must change the actual high-resolution
+    # model-call schedule, not just a UI field or a diagnostic record. The
+    # synthetic policy decision simulates the observed two-step degeneration.
+    for label, selected in cases:
+        for solver in ("euler", "er_sde"):
+            common = {
+                "limit_px": 112,
+                "steps": 20,
+                "latent": torch.zeros(1, 4, 16, 20),
+                "max_stage_upscale": 0.0,
+                "force_two_step": True,
+            }
+            legacy, legacy_reports, legacy_counts, _, legacy_forwards = native_run(
+                selected, solver, label == "native", highres_min_step_fraction=0.0, **common,
+            )
+            budget, budget_reports, budget_counts, _, budget_forwards = native_run(
+                selected, solver, label == "native", highres_min_step_fraction=0.25, **common,
+            )
+            assert torch.equal(legacy[1]["samples"], budget[1]["samples"]), (label, solver)
+            assert budget[0]["samples"].shape == legacy[0]["samples"].shape
+            assert not torch.equal(legacy[0]["samples"], budget[0]["samples"]), (label, solver)
+            if label == "native":
+                assert legacy_counts[(16, 20)] == solver_calls(solver, 2), legacy_counts
+                assert budget_counts[(16, 20)] == solver_calls(solver, 5), budget_counts
+            else:
+                assert legacy_reports[-1]["outer_steps"] == 2, legacy_reports
+                assert budget_reports[-1]["outer_steps"] == 5, budget_reports
+                assert all(r["fallback"] is None for r in budget_reports), budget_reports
+            assert len(legacy_forwards) == len(budget_forwards) == 1
+            schedule20 = runtime.calculate_sigmas(selected, scheduler="simple", steps=20, denoise=1.0)
+            assert budget_forwards[0][1] == float(schedule20[-6])
+            repeat = native_run(
+                selected, solver, label == "native", highres_min_step_fraction=0.25, **common,
+            )
+            assert same(budget, repeat[0]), (label, solver)
+            print(json.dumps({"case": "min_highres_step_budget_native", "model": label,
+                              "sampler": solver, "legacy_steps": 2, "budgeted_steps": 5}))
 
     # Seven steps reproduce the coarse two-step restart on the simple
     # scheduler. Use explicit sizes so the only A/B difference is retiming.
