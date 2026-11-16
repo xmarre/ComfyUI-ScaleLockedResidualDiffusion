@@ -122,3 +122,91 @@ def test_single_frame_spatial_helpers_preserve_native_latent_layout():
     assert core.latent_target_hw_from_megapixels(source, 1.0) == core.latent_target_hw_from_megapixels(image, 1.0)
     with pytest.raises(ValueError, match="image latent"):
         core.latent_target_hw_from_megapixels(source.repeat(1, 1, 2, 1, 1), 1.0)
+
+
+def _with_lattice(shape, seed, strength=0.25):
+    g = torch.Generator().manual_seed(seed)
+    content = torch.randn(shape, generator=g, dtype=torch.float64)
+    offsets = strength * torch.randn(shape[:-2] + (2, 2), generator=g, dtype=torch.float64)
+    offsets = offsets - offsets.mean(dim=(-2, -1), keepdim=True)
+    tiled = offsets.repeat(*([1] * (len(shape) - 2)), shape[-2] // 2, shape[-1] // 2)
+    return content, offsets, content + tiled
+
+
+@pytest.mark.parametrize("shape", [(1, 16, 12, 20), (2, 16, 30, 14), (1, 16, 1, 16, 18)])
+def test_patch_lattice_removal_is_the_exact_projection_onto_three_fourier_modes(shape):
+    content, offsets, corrupted = _with_lattice(shape, 3)
+    fixed = module.remove_patch_lattice(corrupted)
+    assert fixed.shape == corrupted.shape and fixed.dtype == corrupted.dtype
+    assert module.patch_lattice_modes(fixed).abs().max() < 1e-12
+    # Idempotent, and linear: the injected offset is removed exactly, leaving
+    # the content minus its own (chance-level) lattice modes.
+    assert torch.allclose(module.remove_patch_lattice(fixed), fixed, atol=1e-12)
+    assert torch.allclose(fixed, module.remove_patch_lattice(content), atol=1e-12)
+    # Only the three period-2 Fourier coefficients of each plane change.
+    delta = torch.fft.fft2(corrupted - fixed)
+    h, w = shape[-2:]
+    keep = torch.zeros(h, w, dtype=torch.bool)
+    keep[0, w // 2] = keep[h // 2, 0] = keep[h // 2, w // 2] = True
+    assert delta[..., ~keep].abs().max() < 1e-9
+    assert torch.allclose(fixed.mean(dim=(-2, -1)), corrupted.mean(dim=(-2, -1)), atol=1e-12)
+    # The measured modes reproduce the per-position offsets.
+    modes = module.patch_lattice_modes(corrupted) - module.patch_lattice_modes(content)
+    cols, rows, diag = modes.unbind(-1)
+    assert torch.allclose(cols + rows + diag, offsets[..., 0, 0], atol=1e-12)
+    assert torch.allclose(-cols + rows - diag, offsets[..., 0, 1], atol=1e-12)
+    assert torch.allclose(cols - rows - diag, offsets[..., 1, 0], atol=1e-12)
+    assert torch.allclose(-cols - rows + diag, offsets[..., 1, 1], atol=1e-12)
+
+
+def test_patch_lattice_removal_leaves_grid_free_content_and_other_periods_alone():
+    g = torch.Generator().manual_seed(4)
+    content = torch.randn(1, 16, 96, 128, generator=g)
+    fixed = module.remove_patch_lattice(content)
+    # Three of 12288 coefficients per plane: a chance-level change.
+    assert (fixed - content).pow(2).mean().sqrt() < 0.03 * content.std()
+    # A pattern shifted off the lattice period (three latent pixels) is kept.
+    period3 = torch.zeros(1, 16, 96, 126)
+    period3[..., ::3] = 1.0
+    assert torch.allclose(module.remove_patch_lattice(period3), period3, atol=1e-6)
+    # A one-pixel shift of the grid origin flips the sign of the column and row modes.
+    _, _, corrupted = _with_lattice((1, 16, 16, 16), 5)
+    modes = module.patch_lattice_modes(corrupted - module.remove_patch_lattice(corrupted))
+    shifted = module.patch_lattice_modes(torch.roll(corrupted - module.remove_patch_lattice(corrupted), (1, 1), (-2, -1)))
+    assert torch.allclose(shifted, modes * torch.tensor([-1.0, -1.0, 1.0], dtype=modes.dtype), atol=1e-12)
+
+
+def test_patch_lattice_removal_preserves_dtype_and_does_not_mutate():
+    _, _, corrupted = _with_lattice((1, 16, 8, 8), 6)
+    for dtype in (torch.float32, torch.float16):
+        x = corrupted.to(dtype)
+        original = x.clone()
+        fixed = module.remove_patch_lattice(x)
+        assert fixed.dtype == dtype and torch.equal(x, original) and fixed is not x
+
+
+def test_patch_lattice_metrics_separate_locked_offsets_from_chance():
+    g = torch.Generator().manual_seed(7)
+    content = torch.randn(1, 16, 64, 96, generator=g)
+    clean = module.patch_lattice_metrics(content)
+    assert clean["chance"] == pytest.approx((32 * 48) ** -0.5)
+    assert clean["coherence"] < 2 * clean["chance"] and clean["max_coherence"] < 5 * clean["chance"]
+    offsets = torch.zeros(1, 16, 2, 2)
+    offsets[:, :, 0, 0], offsets[:, :, 1, 1] = 0.3, -0.3     # pure row + column modes
+    locked = module.patch_lattice_metrics(content + offsets.repeat(1, 1, 32, 48))
+    assert locked["coherence"] > 5 * clean["coherence"] and locked["max_coherence"] > 0.25
+    assert locked["amplitude"] == pytest.approx(0.3 / 2 ** 0.5, rel=0.1)
+    # A plane that consists only of the pattern is fully coherent.
+    pure = module.patch_lattice_metrics(offsets.repeat(1, 1, 32, 48))
+    assert pure["max_coherence"] == pytest.approx(1.0)
+    assert set(clean) == {"coherence", "max_coherence", "chance", "amplitude"}
+    assert all(type(v) is float for v in clean.values())
+
+
+@pytest.mark.parametrize("shape", [(1, 16, 7, 8), (1, 16, 8, 9), (1, 16, 0, 8)])
+def test_patch_lattice_rejects_grids_off_the_patch_geometry(shape):
+    for fn in (module.patch_lattice_modes, module.remove_patch_lattice, module.patch_lattice_metrics):
+        with pytest.raises(ValueError, match="even latent H/W"):
+            fn(torch.zeros(shape))
+    with pytest.raises(TypeError):
+        module.patch_lattice_modes(torch.zeros(1, 16, 8, 8, dtype=torch.long))
