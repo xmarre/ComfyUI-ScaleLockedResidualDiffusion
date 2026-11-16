@@ -21,10 +21,12 @@ ROOT = Path(__file__).resolve().parents[1]
 _SPECTRAL_SPEC = importlib.util.spec_from_file_location("slrd_controls_spectral", ROOT / "spectral_progressive.py")
 spectral = importlib.util.module_from_spec(_SPECTRAL_SPEC)
 _SPECTRAL_SPEC.loader.exec_module(spectral)
+REGENERATION_MODES = ("trajectory", "planner_final_img2img", "planner_final_upscale_only",
+                      "planner_final_native_refine", "spectral_progressive", "trajectory_auto", "trajectory_auto_native")
 SAMPLERS = ("euler", "dpmpp_2m", "res_multistep", "deis", "ipndm", "ipndm_v", "gradient_estimation", "er_sde", "sa_solver", "sa_solver_pece")
 
 
-def _node():
+def _node(native_first=None, planned=()):
     source = ast.parse((ROOT / "nodes.py").read_text())
     cls = next(n for n in source.body if isinstance(n, ast.ClassDef)
                and n.name == "Krea2TurboFlowAlignedRegenerate")
@@ -33,6 +35,8 @@ def _node():
         pass
 
     calls = []
+    planning = []
+    native_calls = []
     model = SimpleNamespace(
         model=Krea2(),
         get_model_object=lambda name: SimpleNamespace(shift=1.15),
@@ -61,13 +65,17 @@ def _node():
         "comfy": SimpleNamespace(model_base=SimpleNamespace(Krea2=Krea2)),
         "compat_scheduler_names": lambda: ["simple", "normal", "sgm_uniform"],
         "krea2_sampler_names": lambda: list(SAMPLERS),
+        "REGENERATION_MODES": REGENERATION_MODES,
         "fix_latent_channels": lambda model, latent: latent,
         "latent_target_hw_from_megapixels": target_hw,
         "parse_stage_megapixels": lambda text: (
             [float(x) for x in text.split(",") if x.strip()] if text else []
         ),
-        "plan_stage_megapixels": lambda *args: [],
+        "plan_stage_megapixels": lambda *args: (planning.append(args), list(planned))[1],
         "krea2_native_refine_hw": lambda planner, target: (256, 256),
+        "krea2_native_first_stage_hw": lambda planner, target, cap: (
+            native_calls.append((planner, target, cap)), native_first
+        )[1],
         "full_lock_prefix_length": prefix,
         "calculate_sigmas": calculate_sigmas,
         "effective_er_sde_sigmas": lambda sigmas, model: sigmas,
@@ -93,6 +101,8 @@ def _node():
     node = namespace[cls.name]()
     latent = {"samples": torch.zeros(1, 16, 200, 200)}
     base_args = (model, "positive", "negative", latent, 42, 1.0, 0.0, 0.0)
+    node.planning = planning
+    node.native_calls = native_calls
     return node, calls, base_args
 
 
@@ -150,13 +160,16 @@ def test_existing_widget_slots_and_explicit_defaults():
         "planner_fidelity_strength", "planner_detail_strength",
         "latent_upscale_method",
         "progressive_transition_sigmas", "spectral_tolerance", "spectral_calibration",
+        "stage_planning",
     ]
     assert schema["optional"]["latent_upscale_method"][0] == ["interpolate", "sesqui_wan21"]
     assert schema["optional"]["latent_upscale_method"][1]["default"] == "interpolate"
-    assert schema["optional"]["regeneration_mode"][0] == ["trajectory", "planner_final_img2img", "planner_final_upscale_only", "planner_final_native_refine", "spectral_progressive"]
+    assert schema["optional"]["regeneration_mode"][0] == list(REGENERATION_MODES)
     assert schema["optional"]["progressive_transition_sigmas"][1]["default"] == ""
     assert schema["optional"]["spectral_tolerance"][1]["default"] == 0.01
     assert schema["optional"]["spectral_calibration"][0] == "SLRD_SPECTRUM"
+    assert schema["optional"]["stage_planning"][0] == ["manual", "auto_two_passes"]
+    assert schema["optional"]["stage_planning"][1]["default"] == "manual"
     assert schema["optional"]["regeneration_mode"][1]["default"] == "trajectory"
     assert schema["optional"]["steps"][1]["default"] == 12
     assert schema["optional"]["composition_lock_sigma"][1]["default"] == 0.65
@@ -341,7 +354,7 @@ def test_trajectory_mode_ignores_img2img_sigma():
 
 
 @pytest.mark.parametrize("extra, message", [
-    ({"regeneration_mode": "img2img"}, "invalid regeneration_mode"),
+    ({"regeneration_mode": "img2img"}, "regeneration_mode must be one of"),
     ({"handoff_diagnostics": "verbose"}, "handoff_diagnostics must be"),
     ({"regeneration_mode": "planner_final_img2img", "img2img_start_sigma": 0.0}, "strictly between"),
     ({"regeneration_mode": "planner_final_img2img", "img2img_start_sigma": 1.0}, "strictly between"),
@@ -575,3 +588,89 @@ def test_invalid_progressive_transition_sigmas_rejected_before_sampling(text):
     with pytest.raises(ValueError, match="progressive_transition_sigmas"):
         node.sample(*args, regeneration_mode="spectral_progressive", progressive_transition_sigmas=text)
     assert not calls
+
+
+def test_trajectory_auto_uses_existing_widgets_without_manual_refinement_sigmas():
+    node, calls, args = _node()
+    node.sample(*args, regeneration_mode="trajectory_auto", stage_megapixels="2",
+                img2img_start_sigma=0.0, progressive_transition_sigmas="invalid inactive setting")
+    call = calls[-1]
+    assert call["regeneration_mode"] == "trajectory_auto"
+    assert call["stage_hw"]
+    assert call["img2img_start_sigma"] is None
+    assert call["progressive_transition_sigmas"] == []
+
+
+def test_trajectory_auto_native_plans_the_in_range_grid_as_first_stage():
+    # Planner 1 MP -> (124, 124) on the test grid; output (200, 200).
+    node, calls, args = _node(native_first=(150, 150), planned=(2.0,))
+    node.sample(*args, regeneration_mode="trajectory_auto_native")
+    call = calls[-1]
+    assert call["regeneration_mode"] == "trajectory_auto_native"
+    # The in-range grid leads; later stages are planned from it, not from the planner.
+    assert call["stage_hw"] == ((150, 150), (176, 176))
+    assert node.native_calls == [((124, 124), (200, 200), 4.0)]
+    assert node.planning[-1][0] == 150 * 150 * 64.0
+    assert call["img2img_start_sigma"] is None
+
+
+def test_auto_two_passes_uses_target_grid_instead_of_a_fixed_upscale_cap():
+    node, calls, args = _node(native_first=(150, 150))
+    node.sample(*args, regeneration_mode="trajectory_auto_native",
+                stage_planning="auto_two_passes", max_stage_upscale=2.0)
+    assert calls[-1]["stage_hw"] == ((150, 150),)
+    assert node.native_calls[-1] == ((124, 124), (200, 200), 0.0)
+    assert node.planning[-1][2] == pytest.approx(
+        1.02 * max((150 / 124) ** 2, (200 / 150) ** 2)
+    )
+
+    # Same planner and native stage; a larger connected target automatically
+    # increases the area cap without changing any widget values.
+    enlarged = list(args)
+    enlarged[3] = {"samples": torch.zeros(1, 16, 300, 300)}
+    node.sample(*enlarged, regeneration_mode="trajectory_auto_native",
+                stage_planning="auto_two_passes", max_stage_upscale=2.0)
+    assert node.native_calls[-1] == ((124, 124), (300, 300), 0.0)
+    assert node.planning[-1][2] == pytest.approx(
+        1.02 * max((150 / 124) ** 2, (300 / 150) ** 2)
+    )
+
+
+def test_auto_two_passes_respects_explicit_stages_and_other_modes():
+    node, calls, args = _node(native_first=(150, 150), planned=(2.0,))
+    node.sample(*args, regeneration_mode="trajectory_auto_native",
+                stage_planning="auto_two_passes", stage_megapixels="2")
+    assert calls[-1]["stage_hw"] == ((176, 176),)
+    assert not node.native_calls and not node.planning
+
+    node.sample(*args, regeneration_mode="trajectory",
+                stage_planning="auto_two_passes")
+    assert node.native_calls == []
+    assert node.planning[-1][2] == 4.0
+    with pytest.raises(ValueError, match="stage_planning"):
+        node.sample(*args, stage_planning="invalid")
+
+
+def test_auto_two_passes_falls_back_to_single_pass_without_native_stage():
+    node, calls, args = _node(native_first=None)
+    node.sample(*args, regeneration_mode="trajectory_auto_native",
+                stage_planning="auto_two_passes")
+    assert calls[-1]["stage_hw"] == ()
+    assert node.planning[-1][2] == pytest.approx(1.02 * (200 / 124) ** 2)
+
+
+def test_trajectory_auto_native_without_an_in_range_grid_keeps_the_planned_layout():
+    node, calls, args = _node(native_first=None, planned=(2.0,))
+    node.sample(*args, regeneration_mode="trajectory_auto_native")
+    assert calls[-1]["stage_hw"] == ((176, 176),)
+    assert node.planning[-1][0] == 124 * 124 * 64.0
+
+
+def test_native_first_stage_is_specific_to_its_mode_and_respects_explicit_stages():
+    node, calls, args = _node(native_first=(150, 150), planned=(2.0,))
+    node.sample(*args, regeneration_mode="trajectory_auto")
+    assert calls[-1]["stage_hw"] == ((176, 176),)
+    node.sample(*args, regeneration_mode="trajectory")
+    assert calls[-1]["stage_hw"] == ((176, 176),)
+    node.sample(*args, regeneration_mode="trajectory_auto_native", stage_megapixels="2")
+    assert calls[-1]["stage_hw"] == ((176, 176),)

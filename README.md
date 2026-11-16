@@ -147,6 +147,25 @@ runtime and does not load weights independently.
     while retaining independent fine-frequency noise. Later stages restart
     ER-SDE history at the release step; they do not inherit earlier-stage
     multistep derivatives.
+  - **The planner is one stock ComfyUI sampler call.** `LOWRES_PLANNER` is
+    the result of ComfyUI's own sampler on the planner canvas with the
+    connected MODEL, conditioning, CFG, scheduler, steps and seed. For
+    deterministic solvers (including `er_sde` with solver type `ODE`) it is
+    bit-identical to a native `KSampler` at that size. For stochastic ER-SDE
+    and SA-Solver the solver, scaler, sigma schedule and call order are
+    native as well; only the per-step Gaussian increments come from a
+    different seeded stream than ComfyUI's default generator. They are
+    independent standard-normal fields, one per native noise request, so the
+    planner is another sample of the same solver, not a different
+    integration. Later resolution passes read the finished planner and never
+    modify it. Consequently a planner that looks soft or malformed is
+    reproduced by a native sampler on the same MODEL input at the planner
+    size, and is decided by what feeds this node: the solver and its
+    settings, the step count, the checkpoint and LoRAs, and every patch
+    applied to MODEL upstream. To locate the source, hold the seed fixed and
+    compare `LOWRES_PLANNER` after changing one of those at a time, starting
+    with `er_sde_solver_type=ODE` (or `sampler_name=euler`) to separate
+    stochastic sampling from everything else.
   - **Native SA-Solver and SA-Solver PECE.** The optional `sa_eta`,
     `sa_sde_start_percent` (0.2), `sa_sde_end_percent` (0.35), `sa_s_noise`,
     `sa_predictor_order` (3), `sa_corrector_order` (4), and
@@ -277,6 +296,34 @@ runtime and does not load weights independently.
     `composition_lock_sigma` the first high-resolution stage follows the
     planner's denoising trajectory (its intermediate denoised predictions),
     then refines freely.
+  - `trajectory_auto` (experimental) uses the same planner and first
+    high-resolution pass. For each later pass it uses the completed source
+    and the selected enlargement method to choose a restart on the existing
+    schedule. There are no per-stage noise or step settings. With only one
+    high-resolution pass it produces the same result as `trajectory`.
+    See [Automatic trajectory refinement](docs/krea2-auto-refinement.md)
+    for the selection rule and a matched-seed comparison procedure.
+  - `trajectory_auto_native` (experimental) places the trajectory-driven
+    refinement inside the model's 2048-pixel-per-axis range. With empty
+    `stage_megapixels` the first stage becomes the largest in-range size of
+    the output aspect ratio that respects positive `max_stage_upscale` limits
+    from the planner. A value of 0 disables the area cap but still inserts an
+    in-range stage. Every pass above the range restarts from a completed
+    latent at an automatically selected sigma. With both band locks at zero,
+    a coarse schedule can retime the last two evaluations when their native
+    restart exceeds the measured structure limit. For outputs inside
+    the range it is identical to `trajectory_auto`. See
+    [Automatic trajectory refinement](docs/krea2-auto-refinement.md#native-range-first-refinement).
+    For opt-in automatic stage budgeting, set `stage_planning=auto_two_passes`
+    and clear `stage_megapixels`. The node computes the area-growth cap from
+    the connected final LATENT and the rounded planner grid instead of requiring
+    manual tuning of `max_stage_upscale` after every resolution change. It
+    selects two high-resolution passes when a native-range intermediate exists,
+    otherwise just one direct target pass (including when the planner already
+    exceeds 2048 pixels on an axis). The selector never promises a fixed
+    image-quality improvement, and manual mode remains the default. Existing
+    `ScaleLockedResolutionSelector` connections are sufficient; no additional
+    resolution node is needed.
   - `planner_final_img2img` runs the planner to completion and treats its
     finished latent as an image to refine. Each high-resolution stage resizes
     the finished latent of the stage below (the planner for the first stage),
@@ -487,7 +534,7 @@ runtime and does not load weights independently.
     Every random field is seeded, so identical settings reproduce the same
     trajectory (bitwise only where the device kernels are deterministic).
   - **In other modes** a connected `spectral_calibration` never changes
-    sampling. In `trajectory` mode it logs, for each handoff, the lowest
+    sampling. In both trajectory modes it logs, for each handoff, the lowest
     release sigma at which frequencies above the source grid are still noise
     dominated, and warns when `composition_lock_sigma` is below it (risk of
     defocus). Saved `progressive_transition_sigmas` values are ignored in
@@ -576,6 +623,22 @@ runtime and does not load weights independently.
   `output/scale_locked_diagnostics/`. Load them with LoadLatent and VAE Decode
   to see the actual tensors that the live preview approximates. Nothing is
   decoded inside the sampler.
+- **Planner check against the stock KSampler:** with
+  `handoff_diagnostics=log_and_save_latents` the node also runs the planner
+  canvas once more through ComfyUI's own `KSampler` code path (same MODEL,
+  conditioning, seed, steps, CFG, sampler and scheduler), logs a
+  `Krea 2 planner check:` line with the maximum and relative RMS difference
+  from `LOWRES_PLANNER`, and saves the reference as
+  `planner_stock_ksampler.latent` beside `planner_final.latent`. This costs
+  one extra planner pass and does not change any output. "Bit-identical" or a
+  difference at floating-point rounding level (GPU kernels are not always
+  bitwise repeatable) means the planner image is exactly what the stock
+  sampler produces for these inputs, so its quality is determined by the
+  checkpoint, LoRAs, MODEL patches, prompt, step count and planner size. A
+  larger difference means the planner deviates from stock sampling and
+  should be reported with the log line. The check is skipped for `er_sde`,
+  `sa_solver` and `sa_solver_pece`, whose node-configured options the stock
+  KSampler cannot receive; select another solver such as `euler` to run it.
 - **Five-stage handoff diagnostic viewer:** Import
   [`workflows/krea2-handoff-diagnostics.json`](workflows/krea2-handoff-diagnostics.json)
   after one generation with `handoff_diagnostics=log_and_save_latents`.
