@@ -156,3 +156,46 @@ def test_degenerate_input_and_invalid_configuration_keep_release():
     ]
     for decision, reason in cases:
         assert decision.reason == reason and decision.index == RELEASE
+
+
+@pytest.mark.parametrize("steps,fraction,expected", [
+    (14, .25, 4), (16, .25, 4), (20, .25, 5),
+    (20, .4, 8), (20, 0, 2),
+])
+def test_min_highres_step_budget_scales_with_requested_steps(steps, fraction, expected):
+    release = 2
+    decision = policy.RefinementRestart(steps - 2, "reduced")
+    adjusted = policy.apply_refinement_step_budget(decision, steps, release, fraction)
+    assert steps - adjusted.index == expected
+    assert adjusted.reason == ("reduced" if fraction == 0 else "min_highres_step_budget")
+    assert adjusted.retimed_sigmas is None
+
+
+def test_min_highres_budget_cannot_cross_composition_release():
+    decision = policy.RefinementRestart(18, "reduced")
+    adjusted = policy.apply_refinement_step_budget(decision, 20, 17, .50)
+    assert adjusted.index == 17
+    assert 20 - adjusted.index == 3
+    # A start earlier than release would destroy the completed source's
+    # composition, so a requested ten-step suffix is capped at three.
+
+
+def test_min_highres_budget_drops_retimestep_grid_only_when_longer_suffix_needed():
+    d = policy.RefinementRestart(12, "retimed_two_step_suffix", retimed_sigmas=(.30, .15, 0.))
+    assert policy.apply_refinement_step_budget(d, 14, 6, 0.0) is d
+    adjusted = policy.apply_refinement_step_budget(d, 14, 6, .25)
+    assert adjusted.index == 10
+    assert adjusted.retimed_sigmas is None
+    assert adjusted.reason == "min_highres_step_budget"
+    assert policy.apply_refinement_step_budget(d, 14, 6, .10) is d
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), -0.1, 1.01, True, "0.25"])
+def test_min_highres_step_budget_rejects_invalid_fractions(bad):
+    with pytest.raises(ValueError, match="highres_min_step_fraction"):
+        policy.apply_refinement_step_budget(policy.RefinementRestart(8, "reduced"), 10, 2, bad)
+
+
+def test_min_highres_step_budget_preserves_uncertain_full_suffix():
+    full = policy.RefinementRestart(5, "invalid_spectral_measurement")
+    assert policy.apply_refinement_step_budget(full, 20, 5, .25) is full
