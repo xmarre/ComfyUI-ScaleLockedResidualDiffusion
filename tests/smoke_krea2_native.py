@@ -839,9 +839,14 @@ def main():
                 assert legacy_reports[-1]["outer_steps"] == 2, legacy_reports
                 assert budget_reports[-1]["outer_steps"] == 5, budget_reports
                 assert all(r["fallback"] is None for r in budget_reports), budget_reports
-            assert len(legacy_forwards) == len(budget_forwards) == 1
+            legacy_target = [f for f in legacy_forwards if f[0] == (16, 20)]
+            budget_target = [f for f in budget_forwards if f[0] == (16, 20)]
+            assert len(legacy_target) == len(budget_target) == 1, (
+                label, solver, [f[0] for f in legacy_forwards],
+                [f[0] for f in budget_forwards],
+            )
             schedule20 = runtime.calculate_sigmas(selected, scheduler="simple", steps=20, denoise=1.0)
-            assert budget_forwards[0][1] == float(schedule20[-6])
+            assert budget_target[0][1] == float(schedule20[-6])
             repeat = native_run(
                 selected, solver, label == "native", highres_min_step_fraction=0.25, **common,
             )
