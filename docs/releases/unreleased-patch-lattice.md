@@ -47,10 +47,35 @@ high-resolution stage. Diagnostics still never change the sampled result.
 - Applying the correction to the encodings of four of those regions removed
   83% to 100% of the decoded pattern, with a mean pixel change of 0.6 to 1.0
   of 255 levels.
-- Not measured: the correction on latents sampled directly from a real
-  checkpoint, and which pipeline factor creates the offset. Grid-shaped
-  texture already drawn into image content is not a constant offset and
-  remains.
+- Diagnostics from one sampling run of a quantized, LoRA-patched Krea 2
+  Turbo finetune (ER-SDE, planner 2000 px, stages 2048 px and 4800 px):
+  the finished planner already carried the pattern (coherence 0.097, chance
+  0.008). Planner predictions resized onto the 2048 px grid did not (0.008
+  to 0.028), the first model prediction after the composition-lock release
+  did (0.155), the SesquiLSR-enlarged source did not (0.006, chance 0.003),
+  and the first 4800 px prediction did again (0.19). The pattern therefore
+  comes from the denoiser's prediction at every resolution, including the
+  native range, and not from enlargement, noise or the solver. The offset of
+  the first prediction divided by its sigma was 0.0177 at sigma 0.637 and
+  0.0178 at sigma 0.558 (internal latent units), as a sigma-independent
+  constant offset in the predicted velocity would give.
+- Wan 2.1 VAE encodings of ten real photographs show no such signature
+  (coherence 0.018, chance 0.011), so it is not a property of natural-image
+  latents.
+- The output-head bias of the stock Krea 2 Turbo checkpoint has a
+  patch-position component of 0.0023, an eighth of the measured velocity
+  offset, and does not point in the measured direction (cosine -0.06, measured
+  on a different image). The stock INT8 ConvRot checkpoint keeps its output
+  head unquantized. The bias parameter alone therefore does not explain the
+  pattern.
+- Not established: whether the base model, a finetune or merge, weight
+  quantization or a LoRA produces the offset. Comparing the `planner_final`
+  line between checkpoints, and with LoRAs disabled, at otherwise identical
+  settings isolates it.
+- With `final_latent`, the coherence of that run's 4800 px output went from
+  0.11 to 0. The visual result on directly sampled latents has not been
+  assessed. Grid-shaped texture already drawn into image content is not a
+  constant offset and remains.
 - The bundled SesquiLSR upscaler, run on synthetic latents, produced no
   period-2 pattern at a 1.55x enlargement and a strong one (coherence 0.17
   against 0.003) at exactly 2.0x. Real-latent behavior at 2.0x is not

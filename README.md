@@ -658,8 +658,10 @@ runtime and does not load weights independently.
   subtraction removed 83% to 100% of the decoded pattern and changed pixels
   by 0.6 to 1.0 of 255 levels on average. Grid-shaped texture that the
   denoiser already drew into image content is not a constant offset and is
-  not removed; the effect on sampled latents from a real checkpoint, where
-  no VAE or JPEG round trip is involved, has not been measured.
+  not removed. In one real-checkpoint run the pattern was already present in
+  the finished planner and in the first model prediction of every stage,
+  including the native 2048 px range, while enlarged sources were clean; see
+  [`docs/releases/unreleased-patch-lattice.md`](docs/releases/unreleased-patch-lattice.md).
 - **Planner check against the stock KSampler:** with
   `handoff_diagnostics=log_and_save_latents` the node also runs the planner
   canvas once more through ComfyUI's own `KSampler` code path (same MODEL,
