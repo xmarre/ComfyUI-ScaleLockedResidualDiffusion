@@ -160,7 +160,7 @@ def test_existing_widget_slots_and_explicit_defaults():
         "planner_fidelity_strength", "planner_detail_strength",
         "latent_upscale_method",
         "progressive_transition_sigmas", "spectral_tolerance", "spectral_calibration",
-        "stage_planning",
+        "stage_planning", "highres_min_step_fraction",
     ]
     assert schema["optional"]["latent_upscale_method"][0] == ["interpolate", "sesqui_wan21"]
     assert schema["optional"]["latent_upscale_method"][1]["default"] == "interpolate"
@@ -170,6 +170,7 @@ def test_existing_widget_slots_and_explicit_defaults():
     assert schema["optional"]["spectral_calibration"][0] == "SLRD_SPECTRUM"
     assert schema["optional"]["stage_planning"][0] == ["manual", "auto_two_passes"]
     assert schema["optional"]["stage_planning"][1]["default"] == "manual"
+    assert schema["optional"]["highres_min_step_fraction"][1]["default"] == 0.25
     assert schema["optional"]["regeneration_mode"][1]["default"] == "trajectory"
     assert schema["optional"]["steps"][1]["default"] == 12
     assert schema["optional"]["composition_lock_sigma"][1]["default"] == 0.65
@@ -674,3 +675,16 @@ def test_native_first_stage_is_specific_to_its_mode_and_respects_explicit_stages
     assert calls[-1]["stage_hw"] == ((176, 176),)
     node.sample(*args, regeneration_mode="trajectory_auto_native", stage_megapixels="2")
     assert calls[-1]["stage_hw"] == ((176, 176),)
+
+
+def test_highres_step_budget_reaches_runtime_and_rejects_invalid_values():
+    node, calls, args = _node()
+    node.sample(*args, steps=20, regeneration_mode="trajectory_auto_native")
+    assert calls[-1]["highres_min_step_fraction"] == 0.25
+    assert calls[-1]["steps"] == 20
+    node.sample(*args, steps=20, regeneration_mode="trajectory_auto_native",
+                highres_min_step_fraction=0.0)
+    assert calls[-1]["highres_min_step_fraction"] == 0.0
+    for bad in (-0.01, 1.01, float("nan"), float("inf"), True, "0.25"):
+        with pytest.raises(ValueError, match="highres_min_step_fraction"):
+            node.sample(*args, highres_min_step_fraction=bad)
