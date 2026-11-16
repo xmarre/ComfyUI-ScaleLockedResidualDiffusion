@@ -6,9 +6,189 @@ quality or GPU speed. Run with ComfyUI's Python dependencies installed.
 import argparse
 import importlib.util
 import json
+import math
 from pathlib import Path
 import sys
 from unittest.mock import patch
+
+
+def check_planner_is_stock_sampling(*, torch, comfy, runtime, node, base, cases, positive, negative,
+                                    reports_context):
+    """The low-resolution planner is one unmodified ComfyUI sampler invocation.
+
+    Reference: ``comfy.sample.sample_custom`` on the planner canvas with the
+    stock sampler object. Stochastic solvers draw a different, equally valid
+    Gaussian realization than ComfyUI's default generator, so the reference
+    receives the same increment sequence; everything else is stock. Equality
+    is bitwise, which also proves that later resolution passes never modify
+    the completed planner latent that the node returns.
+    """
+    import comfy.sample
+    import comfy.samplers
+
+    # 1. Stochastic increments requested by the planner (no resolution stage).
+    shape, steps = (1, 16, 1, 48, 32), 16
+    count = math.prod(shape)
+    schedule = torch.linspace(1.0, 0.0, steps + 1)
+    worst = {"mean": 0.0, "variance": 0.0, "spatial": 0.0, "channel": 0.0, "initial": 0.0, "steps": 0.0}
+    for seed in (0, 42, 504086510483906, 2 ** 64 - 1):
+        initial = comfy.sample.prepare_noise(torch.zeros(shape), seed, None).double()
+        source = runtime.Krea2PatchCoupledERSDENoise(shape, (), -1, seed, 0, schedule, "cpu", torch.float32)
+        fields = [source(schedule[i], schedule[i + 1]) for i in range(steps - 1)]
+        assert source.cursor == steps - 1
+        assert all(f.shape == shape and f.dtype == torch.float32 for f in fields)
+        fields = [f.double() for f in fields]
+        for field in fields:
+            worst["mean"] = max(worst["mean"], abs(float(field.mean())) * count ** 0.5)
+            worst["variance"] = max(worst["variance"], abs(float(field.var()) - 1.0) * (count / 2) ** 0.5)
+            worst["initial"] = max(worst["initial"], abs(float((field * initial).mean())) * count ** 0.5)
+            for dim in (-1, -2):
+                worst["spatial"] = max(worst["spatial"],
+                                       abs(float((field * field.roll(1, dim)).mean())) * count ** 0.5)
+            worst["channel"] = max(worst["channel"],
+                                   abs(float((field * field.roll(1, 1)).mean())) * count ** 0.5)
+        for a in range(len(fields)):
+            for b in range(a + 1, len(fields)):
+                worst["steps"] = max(worst["steps"],
+                                     abs(float((fields[a] * fields[b]).mean())) * count ** 0.5)
+        # Seeded replay, and no dependence on the order of earlier requests.
+        replay = runtime.Krea2PatchCoupledERSDENoise(shape, (), -1, seed, 0, schedule, "cpu", torch.float32)
+        assert torch.equal(replay(schedule[0], schedule[1]).double(), fields[0])
+        resumed = runtime.Krea2PatchCoupledERSDENoise(shape, (), -1, seed, 5, schedule[5:], "cpu", torch.float32)
+        assert torch.equal(resumed(schedule[5], schedule[6]).double(), fields[5])
+        other = runtime.Krea2PatchCoupledERSDENoise(shape, (), -1, seed ^ 1, 0, schedule, "cpu", torch.float32)
+        assert not torch.equal(other(schedule[0], schedule[1]).double(), fields[0])
+        # A request that is not the next native interval is an error, never a silent reuse.
+        for bad in ((schedule[1], schedule[2]), (schedule[0], schedule[2])):
+            strict = runtime.Krea2PatchCoupledERSDENoise(shape, (), -1, seed, 0, schedule, "cpu", torch.float32)
+            try:
+                strict(*bad)
+            except RuntimeError as exc:
+                assert "sigma order" in str(exc)
+            else:
+                raise AssertionError("out-of-order ER-SDE noise request must fail")
+        try:
+            source(schedule[-2], schedule[-1])
+            source(schedule[-1], schedule[-1])
+        except RuntimeError as exc:
+            assert "outside its sigma schedule" in str(exc)
+        else:
+            raise AssertionError("ER-SDE noise beyond the schedule must fail")
+    # Standard scores of iid N(0, 1) fields; several hundred fixed-seed draws.
+    assert all(value < 5.0 for value in worst.values()), worst
+    print(json.dumps({"case": "planner_er_sde_increment_statistics",
+                      "max_abs_standard_score": {k: round(v, 3) for k, v in worst.items()}}))
+
+    # 2. The node's planner output against the stock reference.
+    sa_defaults = dict(eta=1.0, sde_start_percent=0.2, sde_end_percent=0.35, s_noise=1.0,
+                       predictor_order=3, corrector_order=4, simple_order_2=False)
+
+    def stock_sampler(selected, name, er_type, seed, sigmas, noise):
+        if name not in runtime.SNR_SOLVER_NAMES:
+            return comfy.samplers.sampler_object(name), None
+        effective = comfy.k_diffusion.sampling.offset_first_sigma_for_snr(
+            sigmas, selected.get_model_object("model_sampling"))
+        if name == "er_sde":
+            # Scalers as ComfyUI's SamplerER_SDE node defines them at eta 1.
+            options = {"ER-SDE": {}, "Reverse-time SDE": {"noise_scaler": lambda x: x ** 2.0},
+                       "ODE": {"noise_scaler": lambda x: x, "s_noise": 0.0}}[er_type]
+            options = dict(options, max_stage=3)
+            cls = runtime.Krea2PatchCoupledERSDENoise
+        else:
+            options = runtime.krea2_sa_solver_options(selected, **sa_defaults)
+            cls = runtime.Krea2PatchCoupledSANoise
+        increments = None
+        if options.get("s_noise", 1.0) > 0.0:
+            increments = cls(tuple(noise.shape), (), -1, seed, 0, effective, "cpu", noise.dtype)
+            options["noise_sampler"] = increments
+        return comfy.samplers.ksampler(name, options), increments
+
+    def observed(v):
+        if torch.is_tensor(v):
+            return (tuple(v.shape), str(v.dtype), v.detach().flatten().tolist())
+        if isinstance(v, (list, tuple)):
+            return [observed(x) for x in v]
+        if isinstance(v, dict):
+            return {str(k): observed(x) for k, x in sorted(v.items(), key=lambda kv: str(kv[0]))}
+        return v if isinstance(v, (int, float, str, bool, type(None))) else type(v).__name__
+
+    calls = []
+
+    def record(module, args, kwargs):
+        options = dict(kwargs.get("transformer_options", {}))
+        options.pop("uuids", None)  # fresh identifiers per conditioning conversion
+        calls.append((observed(args), sorted(kwargs), observed(options)))
+
+    def brief(reports):
+        return [{k: r.get(k) for k in ("outer_steps", "actual", "forecast", "fallback")} for r in reports]
+
+    solvers = [(name, "ER-SDE") for name in runtime.krea2_sampler_names()]
+    solvers += [("er_sde", "Reverse-time SDE"), ("er_sde", "ODE")]
+    layouts = (("trajectory", {}), ("trajectory", {"stage_megapixels": "0.02"}),
+               ("trajectory_auto", {"stage_megapixels": "0.02"}),
+               ("trajectory_auto_native", {}), ("planner_final_img2img", {}))
+    checked = 0
+    for label, selected in cases:
+        for (name, er_type), (mode, layout), (seed, steps) in [
+                (a, b, c) for a in solvers for b in layouts for c in ((42, 12), (7, 16))]:
+            if (mode, steps) not in (("trajectory", 12), ("trajectory", 16)) and steps == 16:
+                continue  # one schedule length is enough for the other layouts
+            hook = (base.diffusion_model.register_forward_pre_hook(record, with_kwargs=True)
+                    if label == "native" else None)
+            reports = []
+            token = reports_context.set(reports) if reports_context is not None else None
+            try:
+                calls.clear()
+                with torch.inference_mode(), patch.object(runtime, "KREA2_NATIVE_MAX_AXIS_PX", 20 * 8):
+                    result = node.sample(selected, positive, negative, {"samples": torch.zeros(1, 4, 32, 40)},
+                                         seed, .01, 0.0, 0.0, steps=steps, sampler_name=name,
+                                         er_sde_solver_type=er_type, regeneration_mode=mode, **layout)
+                planner = result[1]["samples"]
+                planner_calls = [c for c in calls if c[0][0][0][-2:] == tuple(planner.shape[-2:])]
+                planner_reports = brief(reports[:1])
+                # Independent stock invocation on the planner canvas.
+                latent = comfy.sample.fix_empty_latent_channels(
+                    selected, torch.zeros((1, 4) + tuple(planner.shape[-2:])), None)
+                noise = comfy.sample.prepare_noise(latent, seed, None)
+                sigmas = comfy.samplers.calculate_sigmas(
+                    selected.get_model_object("model_sampling"), "simple", steps).cpu()
+                sampler, increments = stock_sampler(selected, name, er_type, seed, sigmas, noise)
+                del reports[:]
+                calls.clear()
+                with torch.inference_mode():
+                    reference = comfy.sample.sample_custom(
+                        selected, noise, 1.0, sampler, sigmas, positive, negative, latent,
+                        disable_pbar=True, seed=seed)
+            finally:
+                if hook is not None:
+                    hook.remove()
+                if reports_context is not None:
+                    reports_context.reset(token)
+            assert planner.shape == reference.shape and planner.dtype == reference.dtype
+            assert torch.equal(planner, reference), (
+                label, name, er_type, mode, layout, float((planner - reference).abs().max()))
+            if label == "native":
+                assert len(calls) == steps + (steps - 1 if name == "sa_solver_pece" else 0), len(calls)
+                assert planner_calls[:len(calls)] == calls, (name, er_type, mode)
+            else:
+                assert planner_reports == brief(reports[:1]) and planner_reports, (planner_reports, brief(reports))
+            if name == "er_sde" and er_type != "ODE":
+                # One increment for every interval that does not end at sigma 0.
+                assert increments.cursor == steps - 1, increments.cursor
+            if name == "er_sde" and er_type == "ODE":
+                assert increments is None
+            checked += 1
+        # Consecutive invocations share no sampler or noise state.
+        def planner_only(seed, name):
+            with torch.inference_mode():
+                return node.sample(selected, positive, negative, {"samples": torch.zeros(1, 4, 32, 40)},
+                                   seed, .01, 0.0, 0.0, steps=12, sampler_name=name)[1]["samples"]
+        for name in ("er_sde", "sa_solver"):
+            first = planner_only(42, name)
+            assert not torch.equal(first, planner_only(43, name))
+            assert torch.equal(first, planner_only(42, name))
+    print(json.dumps({"case": "planner_is_stock_sampling", "models": [label for label, _ in cases],
+                      "bitwise_equal_invocations": checked}))
 
 
 def main():
@@ -178,6 +358,10 @@ def main():
             assert not base.diffusion_model._forward_pre_hooks
             print(json.dumps({"case": label + "_ladder", "options": stage_options, "steps_per_pass": steps,
                               "stage_steps": free, "output_shapes": shapes, "reports": reports}))
+
+    check_planner_is_stock_sampling(
+        torch=torch, comfy=comfy, runtime=runtime, node=node, base=base, cases=cases,
+        positive=positive, negative=negative, reports_context=reports_context)
 
 
     # The compact Krea sampler's controls must reach genuine ComfyUI

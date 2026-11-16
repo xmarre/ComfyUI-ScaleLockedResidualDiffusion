@@ -147,6 +147,25 @@ runtime and does not load weights independently.
     while retaining independent fine-frequency noise. Later stages restart
     ER-SDE history at the release step; they do not inherit earlier-stage
     multistep derivatives.
+  - **The planner is one stock ComfyUI sampler call.** `LOWRES_PLANNER` is
+    the result of ComfyUI's own sampler on the planner canvas with the
+    connected MODEL, conditioning, CFG, scheduler, steps and seed. For
+    deterministic solvers (including `er_sde` with solver type `ODE`) it is
+    bit-identical to a native `KSampler` at that size. For stochastic ER-SDE
+    and SA-Solver the solver, scaler, sigma schedule and call order are
+    native as well; only the per-step Gaussian increments come from a
+    different seeded stream than ComfyUI's default generator. They are
+    independent standard-normal fields, one per native noise request, so the
+    planner is another sample of the same solver, not a different
+    integration. Later resolution passes read the finished planner and never
+    modify it. Consequently a planner that looks soft or malformed is
+    reproduced by a native sampler on the same MODEL input at the planner
+    size, and is decided by what feeds this node: the solver and its
+    settings, the step count, the checkpoint and LoRAs, and every patch
+    applied to MODEL upstream. To locate the source, hold the seed fixed and
+    compare `LOWRES_PLANNER` after changing one of those at a time, starting
+    with `er_sde_solver_type=ODE` (or `sampler_name=euler`) to separate
+    stochastic sampling from everything else.
   - **Native SA-Solver and SA-Solver PECE.** The optional `sa_eta`,
     `sa_sde_start_percent` (0.2), `sa_sde_end_percent` (0.35), `sa_s_noise`,
     `sa_predictor_order` (3), `sa_corrector_order` (4), and
