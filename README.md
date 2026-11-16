@@ -324,6 +324,15 @@ runtime and does not load weights independently.
     image-quality improvement, and manual mode remains the default. Existing
     `ScaleLockedResolutionSelector` connections are sufficient; no additional
     resolution node is needed.
+    **The number of resolution stages and the number of steps are independent.**
+    For completed-latent automatic refinements, `highres_min_step_fraction`
+    (default `0.25`) retains at least a quarter of the requested `steps`
+    as high-resolution solver updates, bounded by the native sigma suffix
+    available after `composition_lock_sigma`. Thus 20 planner steps request
+    at least five high-resolution steps when available. Use `0.00` for
+    v1.3.0's unconstrained adaptive two-step-minimum behavior. More
+    high-resolution denoising can change anatomy and identity. See
+    [high-resolution step budgeting](docs/krea2-auto-refinement.md#high-resolution-step-budget-separate-from-stage-count).
   - `planner_final_img2img` runs the planner to completion and treats its
     finished latent as an image to refine. Each high-resolution stage resizes
     the finished latent of the stage below (the planner for the first stage),
