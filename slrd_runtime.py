@@ -23,7 +23,7 @@ import latent_preview
 from .auto_refinement import (
     RefinementRestart, choose_refinement_restart, apply_refinement_step_budget,
 )
-from .krea2_flow import build_patch_coupled_noise, patch_lattice_metrics
+from .krea2_flow import build_patch_coupled_noise, patch_lattice_metrics, patch_lattice_modes
 from .spectral_progressive import (
     describe_calibration,
     expand_flow_state,
@@ -1622,7 +1622,10 @@ class Krea2HandoffDiagnostics:
       model's 2x2 patch grid in the prediction (see ``patch_lattice_metrics``).
       Separate ``Krea 2 patch lattice`` lines report the same for the finished
       planner, each enlarged stage source and each completed stage, so the
-      first latent that carries the pattern can be read from one log.
+      first latent that carries the pattern can be read from one log. Those
+      lines include the signed 48-value pattern (``modes``) for comparison
+      between runs; ``cosine_vs_planner`` compares each pattern with the
+      finished planner's.
 
     Optional ``.latent`` files (ComfyUI SaveLatent format, output space) hold
     the resized clean source for every high-resolution stage, each stage's
@@ -1643,15 +1646,33 @@ class Krea2HandoffDiagnostics:
         self.records: list[dict] = []
         self.saved: list[str] = []
         self.lattice_records: list[dict] = []
+        self.planner_lattice: Optional[torch.Tensor] = None
         self.planner_check: Optional[dict] = None
 
     @staticmethod
-    def _lattice(internal: torch.Tensor) -> Optional[dict]:
-        """Period-2 patch-lattice strength; ``None`` off the 2x2 patch grid."""
+    def _signature(internal: torch.Tensor) -> torch.Tensor:
+        """Signed batch-mean modes, flattened channel-major as [cols, rows, diag]."""
+        modes = patch_lattice_modes(internal.float())
+        return modes.reshape(internal.shape[0], -1).mean(dim=0)
+
+    def _lattice(self, internal: torch.Tensor) -> Optional[dict]:
+        """Period-2 patch-lattice strength; ``None`` off the 2x2 patch grid.
+
+        ``cosine_vs_planner`` compares the signed per-channel pattern with the
+        finished planner's: near 1 means the same offsets, whatever the grid size.
+        """
         h, w = map(int, internal.shape[-2:])
         if min(h, w) < 2 or h % 2 or w % 2:
             return None
-        return patch_lattice_metrics(internal)
+        metrics = patch_lattice_metrics(internal)
+        reference = self.planner_lattice
+        if reference is not None:
+            signature = self._signature(internal)
+            if signature.shape == reference.shape:
+                metrics["cosine_vs_planner"] = float(
+                    torch.nn.functional.cosine_similarity(signature, reference, dim=0, eps=1e-20)
+                )
+        return metrics
 
     def log_patch_lattice(self, label: str, internal: torch.Tensor) -> None:
         """Report where a patch-position offset first appears along the handoff.
@@ -1662,7 +1683,9 @@ class Krea2HandoffDiagnostics:
         if metrics is None:
             return
         record = {"regeneration_mode": self.regeneration_mode, "latent": label,
-                  "hw": [int(v) for v in internal.shape[-2:]], **metrics}
+                  "hw": [int(v) for v in internal.shape[-2:]], **metrics,
+                  # Signed pattern, comparable between runs and model configurations.
+                  "modes": [round(float(v), 6) for v in self._signature(internal).tolist()]}
         self.lattice_records.append(record)
         _LOGGER.info("Krea 2 patch lattice: %s", record)
 
@@ -1671,7 +1694,10 @@ class Krea2HandoffDiagnostics:
             self.reference = self.model.model.process_latent_in(
                 planner_out.detach().to(device="cpu", dtype=torch.float32)
             )
+            self.planner_lattice = None  # the planner is its own reference
             self.log_patch_lattice("planner_final", self.reference)
+            if self._lattice(self.reference) is not None:
+                self.planner_lattice = self._signature(self.reference)
         if self.save:
             self._save("planner_final", planner_out)
 

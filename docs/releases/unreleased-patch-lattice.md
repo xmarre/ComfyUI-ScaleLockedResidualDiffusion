@@ -29,9 +29,11 @@ With `handoff_diagnostics=log` or `log_and_save_latents`:
 
 - A `Krea 2 patch lattice:` line is logged for the finished planner, each
   enlarged stage source and each completed stage.
+  Each line carries the signed 48-value pattern (`modes`) so runs with
+  different checkpoints or LoRAs can be compared, and `cosine_vs_planner`.
 - Every step record gains `x0_patch_lattice_coherence`,
-  `x0_patch_lattice_max_coherence`, `x0_patch_lattice_chance` and
-  `x0_patch_lattice_amplitude`.
+  `x0_patch_lattice_max_coherence`, `x0_patch_lattice_chance`,
+  `x0_patch_lattice_amplitude` and `x0_patch_lattice_cosine_vs_planner`.
 
 Coherence near `chance` means no pattern. The first latent well above chance
 shows where it enters: the planner, the latent upscaler, or the denoiser at a

@@ -643,7 +643,11 @@ runtime and does not load weights independently.
   `max_coherence` are `|mean| / rms` of the per-patch pattern coefficients
   (RMS and maximum over channels and the three period-2 modes); content that
   ignores the patch grid gives about `chance` (`1/sqrt(patches)`), and
-  `amplitude` is the pattern's RMS size in model-internal latent units. The
+  `amplitude` is the pattern's RMS size in model-internal latent units.
+  `modes` on the `Krea 2 patch lattice:` lines is the signed pattern itself
+  (16 channels x column, row and checkerboard mode), for comparing runs with
+  different checkpoints or LoRAs; `cosine_vs_planner` compares a pattern with
+  the finished planner's (near 1: the same offsets at another grid size). The
   first latent whose coherence rises well above chance is where the pattern
   enters: the planner (checkpoint, quantization or LoRA, independent of
   resolution), an enlarged source (the latent upscaler), or the predictions

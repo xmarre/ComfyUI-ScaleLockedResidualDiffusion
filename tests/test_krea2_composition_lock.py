@@ -710,6 +710,20 @@ def test_handoff_diagnostics_report_the_patch_lattice_at_every_handoff_point():
     assert by["stage0_completed"]["max_coherence"] > 0.2
     assert diag.saved == []  # log mode writes no files
 
+    # Signed patterns: the planner is the reference and carries no self-comparison.
+    assert "cosine_vs_planner" not in by["planner_final"]
+    assert all(len(r["modes"]) == 48 for r in diag.lattice_records)
+    expected = runtime.patch_lattice_modes(completed * 2.0).reshape(-1)
+    assert torch.allclose(torch.tensor(by["stage0_completed"]["modes"]), expected, atol=1e-5)
+    assert -1.0 <= second["x0_patch_lattice_cosine_vs_planner"] <= 1.0
+    # A latent with the planner's own offsets, on another grid, matches it.
+    planner_like = runtime.Krea2HandoffDiagnostics(model, "log", "trajectory_auto_native", 7)
+    planner_like.set_planner(latent(16, 24, True))
+    planner_like.log_patch_lattice("other_grid", latent(40, 28, True) * 2.0)
+    assert planner_like.lattice_records[-1]["cosine_vs_planner"] > 0.8
+    planner_like.log_patch_lattice("opposite", -latent(40, 28, True) * 2.0)
+    assert planner_like.lattice_records[-1]["cosine_vs_planner"] < -0.8
+
     # A grid off the 2x2 patch geometry is skipped, never an error.
     before = len(diag.lattice_records)
     diag.log_patch_lattice("odd", torch.zeros(1, 16, 9, 12))
