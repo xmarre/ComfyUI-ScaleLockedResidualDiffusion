@@ -1,6 +1,6 @@
 """Automatic restart selection for completed Krea 2 trajectory handoffs."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from typing import Sequence
 
@@ -150,3 +150,45 @@ def choose_refinement_restart(
     else:
         reason = "reduced"
     return RefinementRestart(index, reason, p_edge, p_roundtrip, p_interior, detail_sigma, structure_sigma)
+
+
+def apply_refinement_step_budget(
+    decision: RefinementRestart, total_steps: int, release: int, fraction: float,
+) -> RefinementRestart:
+    """Retain at least a share of requested steps, without crossing the lock release.
+
+    Automatic SNR selection remains the quality-dependent starting point. A
+    positive fraction limits how aggressively it may shorten the *native*
+    suffix; it never constructs extra sigma knots or re-noises at sigma=1.
+    Zero preserves the v1.3.0 selection, including two-step retiming.
+    """
+    if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
+        raise ValueError("highres_min_step_fraction must be between 0 and 1")
+    if not math.isfinite(fraction) or not 0.0 <= fraction <= 1.0:
+        raise ValueError("highres_min_step_fraction must be between 0 and 1")
+    if not isinstance(total_steps, int) or not isinstance(release, int):
+        raise ValueError("total_steps and release must be integers")
+    if total_steps < 1 or release < 0 or release >= total_steps:
+        raise ValueError("invalid refinement release index")
+    if fraction == 0.0:
+        return decision
+
+    # Two native steps remain the minimum whenever the unlocked suffix permits
+    # them. The requested fraction scales with the user's *total* steps.
+    requested = max(2, math.ceil(total_steps * fraction))
+    available = total_steps - release
+    required = min(requested, available)
+    if not release <= decision.index < total_steps:
+        raise ValueError("invalid refinement decision index")
+    selected = 2 if decision.retimed_sigmas is not None else total_steps - decision.index
+    if selected >= required:
+        return decision
+
+    # Retimed sigmas are defined only for exactly two updates. Switching to
+    # a longer suffix must discard the retimed grid and use native sigma knots.
+    return replace(
+        decision,
+        index=total_steps - required,
+        reason="min_highres_step_budget",
+        retimed_sigmas=None,
+    )
