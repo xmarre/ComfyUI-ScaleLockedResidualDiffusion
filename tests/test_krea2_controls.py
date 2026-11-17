@@ -325,23 +325,98 @@ def test_sa_invalid_forecast_control_fails_before_sampling():
 
 
 
-@pytest.mark.parametrize("sampler_name", ["sa_solver", "sa_solver_pece"])
+@pytest.mark.parametrize("sampler_name", SAMPLERS)
 @pytest.mark.parametrize("planner_forecasts", [False, True])
-def test_sa_native_planner_control_does_not_change_target_policy(sampler_name, planner_forecasts):
+def test_planner_native_control_applies_to_every_sampler(sampler_name, planner_forecasts):
     node, calls, args = _node()
-    node.sample(*args, sampler_name=sampler_name, sa_spectrum_forecasts=True,
-                sa_planner_spectrum_forecasts=planner_forecasts)
+    node.sample(*args, sampler_name=sampler_name, sa_planner_spectrum_forecasts=planner_forecasts)
     assert calls[-1]["sa_planner_native_only"] is not planner_forecasts
-    assert "sa_planner_spectrum_forecasts" not in calls[-1]["sampler_options"]
-    assert "sa_planner_native_only" not in calls[-1]["sampler_options"]
-    # The outer native-only control still applies to every stage. Restoring
-    # the nested planner flag cannot spuriously re-enable target forecasting.
+    assert "sa_planner_spectrum_forecasts" not in (calls[-1]["sampler_options"] or {})
+    assert "sa_planner_native_only" not in (calls[-1]["sampler_options"] or {})
+    assert "All Spectrum-supported samplers" in (
+        node.INPUT_TYPES()["optional"]["sa_planner_spectrum_forecasts"][1]["tooltip"]
+    )
+    # A following invocation with the default enabled policy must not
+    # retain the previous planner's native-only selection.
+    node.sample(*args, sampler_name=sampler_name)
+    assert calls[-1]["sa_planner_native_only"] is False
+
+
+@pytest.mark.parametrize("sampler_name", ["sa_solver", "sa_solver_pece"])
+def test_sa_full_invocation_native_control_remains_independent_of_planner(sampler_name):
+    node, calls, args = _node()
     node.sample(*args, sampler_name=sampler_name, sa_spectrum_forecasts=False,
                 sa_planner_spectrum_forecasts=True)
     assert calls[-1]["sa_planner_native_only"] is False
-    # Non-SA sampler behavior must remain independent of the new UI setting.
-    node.sample(*args, sampler_name="er_sde", sa_planner_spectrum_forecasts=False)
-    assert calls[-1]["sa_planner_native_only"] is False
+
+
+
+
+def test_native_spectrum_scopes_preserve_sa_only_and_planner_all_sampler_separation(monkeypatch):
+    import contextvars
+    import sys
+    from contextlib import contextmanager
+
+    source = ast.parse((ROOT / "slrd_runtime.py").read_text())
+    functions = [
+        n for n in source.body
+        if isinstance(n, ast.FunctionDef)
+        and n.name in ("_spectrum_force_native_vars", "sa_native_only_scope")
+    ]
+    assert len(functions) == 2
+    env = {
+        "contextvars": contextvars, "sys": sys,
+        "contextmanager": contextmanager,
+        "_SPECTRUM_RUNTIME": "comfyui_spectrum_krea2.runtime",
+    }
+    exec(compile(ast.Module(body=functions, type_ignores=[]),
+                 str(ROOT / "slrd_runtime.py"), "exec"), env)
+    native_scope = env["sa_native_only_scope"]
+    sa_flag = contextvars.ContextVar("test_sa_native_only", default=False)
+    planner_flag = contextvars.ContextVar("test_all_sampler_native_only", default=False)
+    monkeypatch.setitem(
+        sys.modules, "test_loaded.comfyui_spectrum_krea2.runtime",
+        SimpleNamespace(FORCE_NATIVE=sa_flag, FORCE_NATIVE_ALL_SAMPLERS=planner_flag)
+    )
+
+    with native_scope(True, all_samplers=True):
+        assert planner_flag.get() is True and sa_flag.get() is False
+        with native_scope(True):
+            assert planner_flag.get() is True and sa_flag.get() is True
+        assert planner_flag.get() is True and sa_flag.get() is False
+    assert planner_flag.get() is False and sa_flag.get() is False
+
+    with pytest.raises(RuntimeError, match="interrupted"):
+        with native_scope(True, all_samplers=True):
+            assert planner_flag.get() is True
+            raise RuntimeError("interrupted")
+    assert planner_flag.get() is False and sa_flag.get() is False
+
+
+def test_planner_native_scope_rejects_stale_spectrum_runtime(monkeypatch):
+    import contextvars
+    import sys
+    from contextlib import contextmanager
+
+    source = ast.parse((ROOT / "slrd_runtime.py").read_text())
+    functions = [
+        n for n in source.body if isinstance(n, ast.FunctionDef)
+        and n.name in ("_spectrum_force_native_vars", "sa_native_only_scope")
+    ]
+    env = {
+        "contextvars": contextvars, "sys": sys,
+        "contextmanager": contextmanager,
+        "_SPECTRUM_RUNTIME": "comfyui_spectrum_krea2.runtime",
+    }
+    exec(compile(ast.Module(body=functions, type_ignores=[]),
+                 str(ROOT / "slrd_runtime.py"), "exec"), env)
+    monkeypatch.setitem(
+        sys.modules, "test_legacy.comfyui_spectrum_krea2.runtime",
+        SimpleNamespace(FORCE_NATIVE=contextvars.ContextVar("old_sa_only", default=False))
+    )
+    with pytest.raises(RuntimeError, match="FORCE_NATIVE_ALL_SAMPLERS"):
+        with env["sa_native_only_scope"](True, all_samplers=True):
+            raise AssertionError("stale Spectrum runtime must be rejected")
 
 
 def test_sa_invalid_planner_forecast_control_rejected_before_any_sampling():

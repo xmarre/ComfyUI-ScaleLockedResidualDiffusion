@@ -68,36 +68,43 @@ _LOGGER = logging.getLogger(__name__)
 _SPECTRUM_RUNTIME = "comfyui_spectrum_krea2.runtime"
 
 
-def _spectrum_force_native_vars() -> list:
-    """FORCE_NATIVE of every loaded Spectrum Krea 2 runtime module.
+def _spectrum_force_native_vars(*, all_samplers: bool = False) -> list:
+    """Locate the actual loaded Spectrum runtime's selected native-only flag.
 
-    ComfyUI loads a custom-node directory under a path-derived module name,
-    so the active runtime is ``<custom node path>.comfyui_spectrum_krea2.runtime``
-    rather than the bare package name. A bare import would miss it, or load a
-    second copy whose context variable the active sampler hook never reads.
+    ComfyUI loads custom nodes under path-derived module names. Importing the
+    bare package may create a second runtime whose flag the sampler never reads.
+    SA-only and planner-all-sampler overrides must remain independent.
     """
+    selected = "FORCE_NATIVE_ALL_SAMPLERS" if all_samplers else "FORCE_NATIVE"
     found = []
     for name, module in list(sys.modules.items()):
         if module is None or not (name == _SPECTRUM_RUNTIME or name.endswith("." + _SPECTRUM_RUNTIME)):
             continue
-        var = getattr(module, "FORCE_NATIVE", None)
+        var = getattr(module, selected, None)
+        if all_samplers and not isinstance(var, contextvars.ContextVar):
+            raise RuntimeError(
+                "Planner-native Spectrum control requires a Spectrum Krea 2 "
+                "runtime with FORCE_NATIVE_ALL_SAMPLERS support (PR #2)"
+            )
         if isinstance(var, contextvars.ContextVar) and all(var is not v for v in found):
             found.append(var)
     return found
 
 
 @contextmanager
-def sa_native_only_scope(enabled: bool):
-    """Suppress only Spectrum forecasts for the scoped SA execution.
+def sa_native_only_scope(enabled: bool, *, all_samplers: bool = False):
+    """Suppress Spectrum forecasts in the selected invocation-local scope.
 
-    No mutation of the patcher, sampler, or process-global wrappers. The
-    contextvar is reset on cancellation, errors, and nested sampling.
+    The default retains SA-only behavior. The planner uses all_samplers=True,
+    which resets before target stages; nested calls and exceptions are safe.
     Standalone Scale-Locked works when Spectrum is not installed.
     """
     if not enabled:
         yield
         return
-    tokens = [(var, var.set(True)) for var in _spectrum_force_native_vars()]
+    tokens = [(var, var.set(True)) for var in _spectrum_force_native_vars(
+        all_samplers=all_samplers
+    )]
     try:
         yield
     finally:
@@ -2598,10 +2605,7 @@ def run_scale_locked_ksampler(
     # A native-only planner is an invocation-scoped quality comparator.
     # Reset the context before either target stage: target Spectrum forecasts
     # remain enabled, and no sampler or MODEL wrapper is modified.
-    with sa_native_only_scope(
-        bool(sa_planner_native_only)
-        and sampler_name in ("sa_solver", "sa_solver_pece")
-    ):
+    with sa_native_only_scope(bool(sa_planner_native_only), all_samplers=True):
         lowres_out, anchors_x0, planner_sigmas, lowres_noise, pece_corrections = _run_lowres_planner(
             model=model,
             positive=positive,
