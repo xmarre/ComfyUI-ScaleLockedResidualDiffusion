@@ -88,8 +88,9 @@ def _spectrum_force_native_vars() -> list:
 
 @contextmanager
 def sa_native_only_scope(enabled: bool):
-    """Suppress only Spectrum forecasts for the scoped SA execution.
+    """Suppress Spectrum forecasts for any qualified sampler in this scope.
 
+    The historical SA-prefixed helper name is retained for compatibility.
     No mutation of the patcher, sampler, or process-global wrappers. The
     contextvar is reset on cancellation, errors, and nested sampling.
     Standalone Scale-Locked works when Spectrum is not installed.
@@ -2598,10 +2599,7 @@ def run_scale_locked_ksampler(
     # A native-only planner is an invocation-scoped quality comparator.
     # Reset the context before either target stage: target Spectrum forecasts
     # remain enabled, and no sampler or MODEL wrapper is modified.
-    with sa_native_only_scope(
-        bool(sa_planner_native_only)
-        and sampler_name in ("sa_solver", "sa_solver_pece")
-    ):
+    with sa_native_only_scope(bool(sa_planner_native_only)):
         lowres_out, anchors_x0, planner_sigmas, lowres_noise, pece_corrections = _run_lowres_planner(
             model=model,
             positive=positive,

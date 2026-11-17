@@ -325,22 +325,28 @@ def test_sa_invalid_forecast_control_fails_before_sampling():
 
 
 
-@pytest.mark.parametrize("sampler_name", ["sa_solver", "sa_solver_pece"])
+@pytest.mark.parametrize("sampler_name", SAMPLERS)
 @pytest.mark.parametrize("planner_forecasts", [False, True])
-def test_sa_native_planner_control_does_not_change_target_policy(sampler_name, planner_forecasts):
+def test_planner_native_control_applies_to_every_sampler(sampler_name, planner_forecasts):
     node, calls, args = _node()
-    node.sample(*args, sampler_name=sampler_name, sa_spectrum_forecasts=True,
-                sa_planner_spectrum_forecasts=planner_forecasts)
+    node.sample(*args, sampler_name=sampler_name, sa_planner_spectrum_forecasts=planner_forecasts)
     assert calls[-1]["sa_planner_native_only"] is not planner_forecasts
-    assert "sa_planner_spectrum_forecasts" not in calls[-1]["sampler_options"]
-    assert "sa_planner_native_only" not in calls[-1]["sampler_options"]
-    # The outer native-only control still applies to every stage. Restoring
-    # the nested planner flag cannot spuriously re-enable target forecasting.
+    assert "sa_planner_spectrum_forecasts" not in (calls[-1]["sampler_options"] or {})
+    assert "sa_planner_native_only" not in (calls[-1]["sampler_options"] or {})
+    assert "All Spectrum-supported samplers" in (
+        node.INPUT_TYPES()["optional"]["sa_planner_spectrum_forecasts"][1]["tooltip"]
+    )
+    # A following invocation with the default enabled policy must not
+    # retain the previous planner's native-only selection.
+    node.sample(*args, sampler_name=sampler_name)
+    assert calls[-1]["sa_planner_native_only"] is False
+
+
+@pytest.mark.parametrize("sampler_name", ["sa_solver", "sa_solver_pece"])
+def test_sa_full_invocation_native_control_remains_independent_of_planner(sampler_name):
+    node, calls, args = _node()
     node.sample(*args, sampler_name=sampler_name, sa_spectrum_forecasts=False,
                 sa_planner_spectrum_forecasts=True)
-    assert calls[-1]["sa_planner_native_only"] is False
-    # Non-SA sampler behavior must remain independent of the new UI setting.
-    node.sample(*args, sampler_name="er_sde", sa_planner_spectrum_forecasts=False)
     assert calls[-1]["sa_planner_native_only"] is False
 
 

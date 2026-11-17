@@ -184,11 +184,15 @@ runtime and does not load weights independently.
     a raw forecast on a stochastic step, because a forecast cannot see SA's
     fresh noise increment. Forecasts are therefore most effective on the
     deterministic stages. `sa_planner_spectrum_forecasts` (default **true**)
-    independently controls Spectrum only during the low-resolution planner
-    pass. Set it to **false** while keeping `sa_spectrum_forecasts=true` to
-    evaluate all planner denoisers natively, retain the same seeded noise,
-    sigma schedule and planner anchors, then restore Spectrum acceleration
-    for both high-resolution stages. This isolates cases where the planner
+    independently controls Spectrum during the low-resolution planner pass
+    for **every supported sampler**, including ER-SDE, Euler, and SA-Solver.
+    Its historical SA-prefixed workflow input name is preserved to avoid
+    breaking saved ComfyUI workflows. Set it to **false** to evaluate all
+    planner denoisers natively, retain the same seeded noise, sigma schedule
+    and planner anchors, then restore Spectrum acceleration for later
+    high-resolution stages. `sa_spectrum_forecasts=false` still disables
+    Spectrum throughout the entire SA-Solver invocation regardless of the
+    planner-only switch. This isolates cases where the planner
     preview appears over-smoothed despite a detailed final image. It is
     an optional quality diagnostic, not proof that forecast error causes the
     blur: the planner also operates at a lower native resolution. The
