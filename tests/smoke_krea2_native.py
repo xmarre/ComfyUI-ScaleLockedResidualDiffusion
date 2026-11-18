@@ -1121,22 +1121,23 @@ def main():
             extrapolation_guard_enabled=False,
         )[0]
         baseline, _, _ = controls(
-            model, "er_sde", "simple", 1.0, 12, False,
+            model, "er_sde", "simple", 1.0, 14, False,
             latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
         )
         bypass, reports, _ = controls(
-            stage_forecasting, "er_sde", "simple", 1.0, 12, False,
+            stage_forecasting, "er_sde", "simple", 1.0, 14, False,
             latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
             sa_planner_spectrum_forecasts=False,
         )
         assert len(reports) == 3 and all(r["fallback"] is None for r in reports), reports
         assert reports[0]["native_only"] is True and reports[0]["forecast"] == 0, reports
+        assert reports[0]["actual"] == 14, reports
         assert reports[0]["peak_history_bytes"] == 0, reports
         assert all(not r["native_only"] for r in reports[1:]), reports
         assert any(r["forecast"] > 0 for r in reports[1:]), reports
         torch.testing.assert_close(baseline[1]["samples"], bypass[1]["samples"], rtol=0, atol=0)
         _, restored, _ = controls(
-            stage_forecasting, "er_sde", "simple", 1.0, 12, False,
+            stage_forecasting, "er_sde", "simple", 1.0, 14, False,
             latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
             sa_planner_spectrum_forecasts=True,
         )
@@ -1144,6 +1145,25 @@ def main():
         print(json.dumps({"case": "er_sde_native_planner_only",
                           "reports": reports,
                           "restored_planner_forecasts": restored[0]["forecast"]}))
+
+        for scope, expected in (("planner_only", [True, False, False]),
+                                ("highres_only", [False, True, True])):
+            selected = SpectrumApplyKrea2().apply(model, extrapolation_guard_scope=scope)[0]
+            _, stage_reports, _ = controls(
+                selected, "er_sde", "simple", 1.0, 14, False,
+                latent=torch.zeros(1, 4, 24, 28), stage_megapixels="0.02",
+                sa_planner_spectrum_forecasts=scope != "planner_only",
+            )
+            assert [r["stage"] for r in stage_reports] == ["planner", "highres", "highres"], stage_reports
+            assert [r["effective_config"]["extrapolation_guard_enabled"]
+                    for r in stage_reports] == expected, stage_reports
+            assert all(r["fallback"] is None for r in stage_reports), stage_reports
+            assert [r["native_only"] for r in stage_reports] == [scope == "planner_only", False, False]
+            assert "spectrum_krea2_stage" not in selected.model_options
+            if scope == "planner_only":
+                assert [r["forecast"] for r in stage_reports] == [r["forecast"] for r in reports]
+            print(json.dumps({"case": "er_sde_extrapolation_guard_scope", "scope": scope,
+                              "guard_enabled": expected, "forecasts": [r["forecast"] for r in stage_reports]}))
 
     # ER-SDE's three modes must not contaminate later queued invocations,
     # even when ComfyUI reuses the same node, MODEL patcher, and Spectrum
@@ -2303,9 +2323,12 @@ def progressive_regressions(node, model, positive, negative, runtime, base, pack
     if spectrum_model is not None:
         for sampler_name in ("euler", "er_sde", "sa_solver"):
             k = expected_split(16, sampler_name=sampler_name)
-            _, _, reports = run(spectrum_model, sampler_name, 16)
+            _, _, reports = run(spectrum_model, sampler_name, 16, sa_planner_spectrum_forecasts=False)
             assert [r["outer_steps"] for r in reports] == [k, 16 - k], reports
             assert all(r["fallback"] is None for r in reports), reports
+            assert [r["stage"] for r in reports] == ["planner", "highres"], reports
+            assert [r["native_only"] for r in reports] == [True, False], reports
+            assert reports[0]["forecast"] == 0, reports
             print(json.dumps({"case": "progressive_spectrum", "sampler": sampler_name,
                               "reports": [{key: r[key] for key in ("outer_steps", "actual", "forecast", "fallback")}
                                           for r in reports]}))

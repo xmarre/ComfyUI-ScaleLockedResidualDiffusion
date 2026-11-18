@@ -66,6 +66,7 @@ _LOGGER = logging.getLogger(__name__)
 
 
 _SPECTRUM_RUNTIME = "comfyui_spectrum_krea2.runtime"
+_SPECTRUM_STAGE_OPTION = "spectrum_krea2_stage"
 
 
 def _spectrum_force_native_vars(*, all_samplers: bool = False) -> list:
@@ -84,7 +85,7 @@ def _spectrum_force_native_vars(*, all_samplers: bool = False) -> list:
         if all_samplers and not isinstance(var, contextvars.ContextVar):
             raise RuntimeError(
                 "Planner-native Spectrum control requires a Spectrum Krea 2 "
-                "runtime with FORCE_NATIVE_ALL_SAMPLERS support (PR #2)"
+                "runtime with FORCE_NATIVE_ALL_SAMPLERS support (v0.2.0 or later)"
             )
         if isinstance(var, contextvars.ContextVar) and all(var is not v for v in found):
             found.append(var)
@@ -659,8 +660,12 @@ def locked_planner_prediction(guider, x: torch.Tensor, timestep) -> Optional[tor
     return scale_lock_anchor_for(guider, idx, x).clone()
 
 
-def create_cfg_guider(model, positive, negative, cfg):
+def create_cfg_guider(model, positive, negative, cfg, *, spectrum_stage=None):
     guider = comfy.samplers.CFGGuider(model)
+    if spectrum_stage is not None:
+        # CFGGuider initially aliases the MODEL's options. Stage metadata
+        # belongs to this sampler call, including when the MODEL is reused.
+        guider.model_options = {**guider.model_options, _SPECTRUM_STAGE_OPTION: spectrum_stage}
     guider.set_conds(positive, negative)
     guider.set_cfg(cfg)
     return guider
@@ -877,9 +882,7 @@ def _run_lowres_planner(
 ) -> tuple[dict, list[torch.Tensor], list[float], torch.Tensor,
            Optional[list[Optional[torch.Tensor]]]]:
     sampler_obj = None
-    guider = comfy.samplers.CFGGuider(model)
-    guider.set_conds(positive, negative)
-    guider.set_cfg(cfg)
+    guider = create_cfg_guider(model, positive, negative, cfg, spectrum_stage="planner")
 
     lowres_latent = fix_latent_channels(model, lowres_latent)
     latent_samples = lowres_latent["samples"]
@@ -1500,7 +1503,7 @@ def _run_resolution_ladder(
             noise_seed=seed,
             pece_corrected_anchors=pece_corrected_anchors,
         )
-        guider = create_cfg_guider(model, positive, negative, cfg)
+        guider = create_cfg_guider(model, positive, negative, cfg, spectrum_stage="highres")
         if retimed is None:
             apply_scale_lock_to_guider(guider, stage_runtime, config, skip_locked_model_calls=True)
         stage_x0: dict = {}
@@ -1868,8 +1871,12 @@ def _compare_planner_with_stock_ksampler(
         noise = torch.zeros(latent_image.size(), dtype=latent_image.dtype, layout=latent_image.layout, device="cpu")
     else:
         noise = comfy.sample.prepare_noise(latent_image, seed, lowres_latent.get("batch_index", None))
+    # Keep the reference on the stock sampling entry point with the same
+    # Spectrum guard as the planner. Never tag the shared MODEL.
+    reference_model = model.clone()
+    reference_model.model_options[_SPECTRUM_STAGE_OPTION] = "planner"
     reference = comfy.sample.sample(
-        model, noise, steps, cfg, sampler_name, scheduler, positive, negative, latent_image,
+        reference_model, noise, steps, cfg, sampler_name, scheduler, positive, negative, latent_image,
         denoise=denoise, disable_noise=disable_noise, noise_mask=lowres_latent.get("noise_mask", None),
         disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED, seed=seed,
     )
@@ -2168,7 +2175,7 @@ def _run_planner_final_img2img(
             )
         else:
             sampler = comfy.samplers.sampler_object(sampler_name)
-        guider = create_cfg_guider(model, positive, negative, cfg)
+        guider = create_cfg_guider(model, positive, negative, cfg, spectrum_stage="highres")
         stage_x0: dict = {}
         callback = make_preview_callback(model, len(stage_sigmas) - 1, stage_x0)
         if diagnostics is not None:
@@ -2264,6 +2271,7 @@ def _run_spectral_progressive(
     *, model, positive, negative, cfg, sampler_name: str, sigmas: torch.Tensor,
     highres_latent: dict, lowres_latent: dict, stage_hw: tuple, seed: int,
     sampler_options: Optional[dict], steps_at: list[int], thresholds: list[float], source: str,
+    sa_planner_native_only: bool = False,
 ) -> ScaleLockedSampleResult:
     """One denoising trajectory that grows its grid at the planned steps.
 
@@ -2324,7 +2332,9 @@ def _run_spectral_progressive(
             stage_shapes=shapes, stage_index=index - 1, seed=int(seed), start_step=start,
             sigmas=segment, noise_like=segment_noise,
         )
-        guider = create_cfg_guider(model, positive, negative, cfg)
+        guider = create_cfg_guider(
+            model, positive, negative, cfg, spectrum_stage="planner" if index == 0 else "highres",
+        )
         counter = [0]
         predict_native = guider.predict_noise
 
@@ -2335,10 +2345,11 @@ def _run_spectral_progressive(
         guider.predict_noise = types.MethodType(_counted, guider)
         x0_holder: dict = {}
         callback = make_preview_callback(model, len(segment) - 1, x0_holder)
-        out = guider.sample(
-            segment_noise, segment_latent, sampler, segment, denoise_mask=None,
-            callback=callback, disable_pbar=disable_pbar, seed=int(seed),
-        )
+        with sa_native_only_scope(index == 0 and sa_planner_native_only, all_samplers=True):
+            out = guider.sample(
+                segment_noise, segment_latent, sampler, segment, denoise_mask=None,
+                callback=callback, disable_pbar=disable_pbar, seed=int(seed),
+            )
         calls.append((hw, end - start, counter[0]))
         del segment_noise, segment_latent
         if index == 0 and "x0" in x0_holder:
@@ -2570,6 +2581,7 @@ def run_scale_locked_ksampler(
             sigmas=sigmas, highres_latent=highres_latent, lowres_latent=lowres_latent,
             stage_hw=tuple(stage_hw), seed=int(seed), sampler_options=sampler_options,
             steps_at=steps_at, thresholds=thresholds, source=source,
+            sa_planner_native_only=sa_planner_native_only,
         )
     if spectral_calibration is not None:
         # Outside spectral_progressive the calibration is advisory only: an
@@ -2625,12 +2637,13 @@ def run_scale_locked_ksampler(
     diagnostics = (None if handoff_diagnostics == "off" else
                    Krea2HandoffDiagnostics(model, handoff_diagnostics, regeneration_mode, int(seed)))
     if diagnostics is not None and diagnostics.save:
-        _compare_planner_with_stock_ksampler(
-            model=model, positive=positive, negative=negative, cfg=cfg, sampler_name=sampler_name,
-            scheduler=scheduler, steps=steps, denoise=denoise, lowres_latent=lowres_latent,
-            planner_out=lowres_out["samples"], seed=planner_seed, disable_noise=disable_noise,
-            sampler_options=sampler_options, diagnostics=diagnostics,
-        )
+        with sa_native_only_scope(sa_planner_native_only, all_samplers=True):
+            _compare_planner_with_stock_ksampler(
+                model=model, positive=positive, negative=negative, cfg=cfg, sampler_name=sampler_name,
+                scheduler=scheduler, steps=steps, denoise=denoise, lowres_latent=lowres_latent,
+                planner_out=lowres_out["samples"], seed=planner_seed, disable_noise=disable_noise,
+                sampler_options=sampler_options, diagnostics=diagnostics,
+            )
     if upscale_only:
         return _run_planner_final_upscale_only(
             model=model, highres_latent=highres_latent, lowres_out=lowres_out,
@@ -2696,7 +2709,7 @@ def run_scale_locked_ksampler(
         noise_seed=detail_seed,
         pece_corrected_anchors=pece_corrections,
     )
-    guider = create_cfg_guider(model, positive, negative, cfg)
+    guider = create_cfg_guider(model, positive, negative, cfg, spectrum_stage="highres")
     sampler = _krea2_sampler_object(
         sampler_name, sampler_options, model=model, low_shape=tuple(lowres_noise.shape),
         stage_shapes=(tuple(runtime.highres_noise.shape),), stage_index=0,
