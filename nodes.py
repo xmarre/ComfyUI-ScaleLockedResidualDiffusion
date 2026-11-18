@@ -337,10 +337,11 @@ class Krea2TurboFlowAlignedRegenerate:
                                "Forecasts on stochastic steps never reuse the forecast's noise estimate; they are most "
                                "effective on the deterministic high-resolution stages set by sa_sde_end_percent."}),
                 "sa_planner_spectrum_forecasts": ("BOOLEAN", {"default": True,
-                    "tooltip": "SA-Solver only: enable Spectrum forecasts in the low-resolution planner. "
-                               "Off evaluates every planner step natively while preserving Spectrum acceleration "
-                               "in the intermediate and final high-resolution stages. This is a quality comparison "
-                               "for planner texture loss; the planner uses the same native noise and solver."}),
+                    "tooltip": "All Spectrum-supported samplers, including ER-SDE: enable planner forecasts. "
+                               "Off runs the low-resolution planner (or first spectral-progressive segment) "
+                               "with genuine native denoiser evaluations, "
+                               "then restores Spectrum forecasting for later resolution stages. "
+                               "The historic SA-prefixed name is retained for saved-workflow compatibility."}),
                 "regeneration_mode": (list(REGENERATION_MODES), {"default": "trajectory",
                     "tooltip": "trajectory (default, unchanged): the first high-resolution stage follows the planner's "
                                "denoising trajectory above composition_lock_sigma, then refines freely. "
@@ -784,10 +785,7 @@ class Krea2TurboFlowAlignedRegenerate:
                 noise_mode="patch_coupled",
                 stage_hw=tuple(stage_hw),
                 sampler_options=sampler_options,
-                sa_planner_native_only=(
-                    sampler_name in ("sa_solver", "sa_solver_pece")
-                    and not sa_planner_spectrum_forecasts
-                ),
+                sa_planner_native_only=not sa_planner_spectrum_forecasts,
                 regeneration_mode=regeneration_mode,
                 img2img_start_sigma=float(img2img_start_sigma) if img2img else None,
                 handoff_diagnostics=handoff_diagnostics,
