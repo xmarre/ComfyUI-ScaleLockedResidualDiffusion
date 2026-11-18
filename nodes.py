@@ -13,6 +13,7 @@ import comfy.model_base
 from .slrd_core import build_nested_noise, clone_latent, full_lock_prefix_length, init_scale_lock_state, latent_target_hw_from_megapixels, parse_stage_megapixels, plan_stage_megapixels, resize_4d_tensor, resize_mask
 from .resolution import DISPLAY_NAME as RESOLUTION_DISPLAY_NAME, MAX_MEGAPIXELS, NODE_ID as RESOLUTION_NODE_ID, ResolutionSelectorUncapped
 from .diagnostic_load import SLRDLoadKrea2HandoffDiagnostics
+from .krea2_flow import patch_lattice_metrics, remove_patch_lattice
 from .spectral_progressive import CALIBRATION_TYPE, build_calibration, describe_calibration, parse_transition_sigmas
 from .slrd_runtime import (
     LOCK_SCHEDULE_OPTIONS,
@@ -221,6 +222,26 @@ class ScaleLockedResidualKSampler:
         return (result.output, result.lowres_planner, result.denoised_output)
 
 
+PATCH_LATTICE_CORRECTIONS = ("off", "final_latent")
+
+
+def _without_patch_lattice(latent: dict, label: str) -> dict:
+    """Copy of a LATENT dictionary whose samples have no period-2 patch-lattice modes."""
+    samples = latent["samples"]
+    corrected = remove_patch_lattice(samples)
+    before, after = patch_lattice_metrics(samples), patch_lattice_metrics(corrected)
+    logger.info(
+        "Krea 2 patch lattice correction (%s %sx%s): coherence %.4f -> %.4f, max %.4f -> %.4f "
+        "(chance %.4f), removed pattern amplitude %.6f (latent units)",
+        label, samples.shape[-1] * 8, samples.shape[-2] * 8,
+        before["coherence"], after["coherence"], before["max_coherence"], after["max_coherence"],
+        before["chance"], before["amplitude"],
+    )
+    out = dict(latent)
+    out["samples"] = corrected
+    return out
+
+
 class Krea2TurboFlowAlignedRegenerate:
     """Experimental Krea 2 Turbo two-pass composition-lock sampler."""
 
@@ -421,6 +442,17 @@ class Krea2TurboFlowAlignedRegenerate:
                                "0.00 restores v1.3.0's unconstrained adaptive two-step selection. "
                                "Does not alter stage count or other regeneration modes.",
                 }),
+                "patch_lattice_correction": (list(PATCH_LATTICE_CORRECTIONS), {
+                    "default": "off",
+                    "tooltip": "Experimental. Krea 2 writes each 2x2 latent patch from one token. If the four "
+                               "positions inside a patch receive a constant per-channel offset, the decoded image "
+                               "carries a faint regular 16-pixel grid, most visible in hair and fabric. "
+                               "final_latent measures that constant offset in the finished latent and subtracts it "
+                               "(three Fourier coefficients per channel; all other content is untouched) on the "
+                               "output and DENOISED_OUTPUT latents. Sampling itself is unchanged. off (default) "
+                               "returns the sampled latent unmodified. Grid texture that the denoiser already drew "
+                               "into the image content is not removed.",
+                }),
             },
         }
 
@@ -465,9 +497,14 @@ class Krea2TurboFlowAlignedRegenerate:
         spectral_calibration=None,
         stage_planning="manual",
         highres_min_step_fraction=0.25,
+        patch_lattice_correction="off",
     ):
         if latent_upscale_method not in ("interpolate", "sesqui_wan21"):
             raise ValueError("latent_upscale_method must be interpolate or sesqui_wan21")
+        if patch_lattice_correction not in PATCH_LATTICE_CORRECTIONS:
+            raise ValueError(
+                f"patch_lattice_correction must be one of {', '.join(PATCH_LATTICE_CORRECTIONS)}"
+            )
         if regeneration_mode not in REGENERATION_MODES:
             raise ValueError(f"regeneration_mode must be one of {', '.join(REGENERATION_MODES)}")
         if stage_planning not in ("manual", "auto_two_passes"):
@@ -762,7 +799,12 @@ class Krea2TurboFlowAlignedRegenerate:
                 spectral_tolerance=float(spectral_tolerance),
                 highres_min_step_fraction=float(highres_min_step_fraction),
             )
-        return (result.output, result.lowres_planner, result.denoised_output)
+        output, denoised_output = result.output, result.denoised_output
+        if patch_lattice_correction == "final_latent":
+            shared = denoised_output is output
+            output = _without_patch_lattice(output, "output")
+            denoised_output = output if shared else _without_patch_lattice(denoised_output, "denoised output")
+        return (output, result.lowres_planner, denoised_output)
 
 
 class Krea2SpectralCalibration:

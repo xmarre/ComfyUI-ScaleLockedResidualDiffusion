@@ -85,3 +85,70 @@ def build_patch_coupled_noise(
             )
 
     return result.to(dtype=lowres_noise.dtype)
+
+
+def _patch_phases(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not isinstance(x, torch.Tensor) or x.ndim < 2 or not x.is_floating_point():
+        raise TypeError("patch lattice analysis requires a floating tensor with trailing HxW")
+    h, w = map(int, x.shape[-2:])
+    if min(h, w) < 2 or h % 2 or w % 2:
+        raise ValueError("Krea 2 patch geometry requires positive even latent H/W")
+    return x[..., 0::2, 0::2], x[..., 0::2, 1::2], x[..., 1::2, 0::2], x[..., 1::2, 1::2]
+
+
+def patch_lattice_modes(x: torch.Tensor) -> torch.Tensor:
+    """Amplitudes of the three period-2 spatial modes of each ``HxW`` plane.
+
+    Krea 2 emits one token per 2x2 latent patch. An offset that depends only
+    on the position inside the patch is therefore a pattern with a period of
+    two latent pixels (16 image pixels): exactly the column-alternating,
+    row-alternating and checkerboard Fourier modes. The returned ``[..., 3]``
+    tensor holds their signed amplitudes in that order, so that the pattern is
+    ``cols * (-1)**x + rows * (-1)**y + diag * (-1)**(x + y)``.
+    """
+    a, b, c, d = (p.mean(dim=(-2, -1)) for p in _patch_phases(x))
+    return torch.stack((a - b + c - d, a + b - c - d, a - b - c + d), dim=-1) / 4.0
+
+
+def remove_patch_lattice(x: torch.Tensor) -> torch.Tensor:
+    """Return ``x`` without its three period-2 patch-lattice modes.
+
+    Only those three Fourier coefficients of each plane change; the plane mean
+    and every other frequency are preserved. Each plane is corrected with its
+    own measurement, so batches, channels and a singleton temporal axis need
+    no special handling. Content that is not phase-locked to the patch grid
+    contributes only its chance-level residue, of order ``1/sqrt(patches)`` of
+    its fine-detail amplitude.
+    """
+    # Half-precision means over a large plane lose the small offset; measure in float32 or wider.
+    wide = x if x.dtype in (torch.float32, torch.float64) else x.float()
+    modes = patch_lattice_modes(wide).to(dtype=x.dtype)
+    cols, rows, diag = (modes[..., k, None, None] for k in range(3))
+    out = x.clone()
+    for py, sy in ((0, 1.0), (1, -1.0)):
+        for px, sx in ((0, 1.0), (1, -1.0)):
+            out[..., py::2, px::2] -= sx * cols + sy * rows + sx * sy * diag
+    return out
+
+
+def patch_lattice_metrics(x: torch.Tensor) -> dict:
+    """Strength of the period-2 patch lattice in a latent, as plain floats.
+
+    ``coherence`` and ``max_coherence`` are the RMS and the maximum, over all
+    planes and the three modes, of ``|mean| / rms`` of the per-patch mode
+    coefficients: 1 means every patch carries the identical pattern, and
+    content that ignores the patch grid gives about ``chance``
+    (``1/sqrt(patches)``). ``amplitude`` is the RMS pattern amplitude in the
+    units of ``x``.
+    """
+    a, b, c, d = (p.float() for p in _patch_phases(x))
+    coefficients = torch.stack((a - b + c - d, a + b - c - d, a - b - c + d), dim=-3) / 4.0
+    mean = coefficients.mean(dim=(-2, -1))
+    rms = coefficients.pow(2).mean(dim=(-2, -1)).sqrt()
+    coherence = mean.abs() / rms.clamp_min(torch.finfo(torch.float32).tiny)
+    return {
+        "coherence": float(coherence.pow(2).mean().sqrt()),
+        "max_coherence": float(coherence.max()),
+        "chance": float((a.shape[-2] * a.shape[-1]) ** -0.5),
+        "amplitude": float(mean.pow(2).sum(dim=-1).mean().sqrt()),
+    }

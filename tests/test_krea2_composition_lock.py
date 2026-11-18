@@ -654,3 +654,77 @@ def test_native_first_stage_respects_area_cap(planner, cap, expected):
         assert grid[0] * grid[1] <= planner[0] * planner[1] * cap
         assert runtime.krea2_within_native_range(grid)
         assert all(a > b for a, b in zip(grid, planner))
+
+
+def test_handoff_diagnostics_report_the_patch_lattice_at_every_handoff_point():
+    # Internal space is 2x output space here, so a missing or doubled
+    # process_latent_in would change the reported amplitude.
+    model = types.SimpleNamespace(model=types.SimpleNamespace(
+        process_latent_in=lambda x: x * 2.0, process_latent_out=lambda x: x / 2.0,
+        model_sampling=types.SimpleNamespace(noise_scale=1.0),
+    ))
+    model.get_model_object = lambda name: model.model.model_sampling
+    g = torch.Generator().manual_seed(11)
+    offsets = torch.zeros(1, 16, 2, 2)
+    offsets[:, :, 0, 0], offsets[:, :, 1, 1] = 0.3, -0.3
+
+    def latent(h, w, locked):
+        x = torch.randn(1, 16, h, w, generator=g)
+        return x + offsets.repeat(1, 1, h // 2, w // 2) if locked else x
+
+    diag = runtime.Krea2HandoffDiagnostics(model, "log", "trajectory_auto_native", 7)
+    assert diag.lattice_records == []
+    planner = latent(16, 24, False)
+    diag.set_planner(planner)
+    enlarged = latent(24, 36, False)
+    seen = []
+    observe = diag.wrap(
+        lambda *args: seen.append(args), stage=0, stage_hw=(24, 36),
+        sigmas=torch.tensor([0.5, 0.25, 0.0]), noise=torch.zeros(1, 16, 24, 36),
+        source=planner, lock_sigma=0.7, enlarged_source=enlarged, completed_source=planner,
+    )
+    clean_x0, locked_x0 = latent(24, 36, False), latent(24, 36, True)
+    observe(0, clean_x0, clean_x0, 2)
+    observe(1, locked_x0, locked_x0, 2)
+    completed = latent(24, 36, True)
+    diag.save_completed(0, completed, final=True)
+
+    # Step records keep their existing keys and stage/step identity.
+    assert [r["step"] for r in diag.records] == [0, 1] and len(seen) == 2
+    assert all(r["stage"] == 0 and "x0_vs_planner_lowband" in r for r in diag.records)
+    chance = (12 * 18) ** -0.5
+    first, second = diag.records
+    assert first["x0_patch_lattice_chance"] == pytest.approx(chance)
+    assert first["x0_patch_lattice_coherence"] < 2 * chance
+    assert second["x0_patch_lattice_max_coherence"] > 0.2
+    assert second["x0_patch_lattice_amplitude"] == pytest.approx(0.3 / 2 ** 0.5, rel=0.25)
+
+    labels = [r["latent"] for r in diag.lattice_records]
+    assert labels == ["planner_final", "stage0_source_enlarged", "stage0_completed"]
+    by = {r["latent"]: r for r in diag.lattice_records}
+    assert by["planner_final"]["hw"] == [16, 24] and by["stage0_completed"]["hw"] == [24, 36]
+    assert by["planner_final"]["coherence"] < 2 * (8 * 12) ** -0.5
+    assert by["stage0_source_enlarged"]["coherence"] < 2 * chance
+    # Completed latents arrive in output space and are measured in internal space.
+    assert by["stage0_completed"]["amplitude"] == pytest.approx(2 * 0.3 / 2 ** 0.5, rel=0.25)
+    assert by["stage0_completed"]["max_coherence"] > 0.2
+    assert diag.saved == []  # log mode writes no files
+
+    # Signed patterns: the planner is the reference and carries no self-comparison.
+    assert "cosine_vs_planner" not in by["planner_final"]
+    assert all(len(r["modes"]) == 48 for r in diag.lattice_records)
+    expected = runtime.patch_lattice_modes(completed * 2.0).reshape(-1)
+    assert torch.allclose(torch.tensor(by["stage0_completed"]["modes"]), expected, atol=1e-5)
+    assert -1.0 <= second["x0_patch_lattice_cosine_vs_planner"] <= 1.0
+    # A latent with the planner's own offsets, on another grid, matches it.
+    planner_like = runtime.Krea2HandoffDiagnostics(model, "log", "trajectory_auto_native", 7)
+    planner_like.set_planner(latent(16, 24, True))
+    planner_like.log_patch_lattice("other_grid", latent(40, 28, True) * 2.0)
+    assert planner_like.lattice_records[-1]["cosine_vs_planner"] > 0.8
+    planner_like.log_patch_lattice("opposite", -latent(40, 28, True) * 2.0)
+    assert planner_like.lattice_records[-1]["cosine_vs_planner"] < -0.8
+
+    # A grid off the 2x2 patch geometry is skipped, never an error.
+    before = len(diag.lattice_records)
+    diag.log_patch_lattice("odd", torch.zeros(1, 16, 9, 12))
+    assert len(diag.lattice_records) == before

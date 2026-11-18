@@ -21,6 +21,9 @@ ROOT = Path(__file__).resolve().parents[1]
 _SPECTRAL_SPEC = importlib.util.spec_from_file_location("slrd_controls_spectral", ROOT / "spectral_progressive.py")
 spectral = importlib.util.module_from_spec(_SPECTRAL_SPEC)
 _SPECTRAL_SPEC.loader.exec_module(spectral)
+_FLOW_SPEC = importlib.util.spec_from_file_location("slrd_controls_krea2_flow", ROOT / "krea2_flow.py")
+krea2_flow = importlib.util.module_from_spec(_FLOW_SPEC)
+_FLOW_SPEC.loader.exec_module(krea2_flow)
 REGENERATION_MODES = ("trajectory", "planner_final_img2img", "planner_final_upscale_only",
                       "planner_final_native_refine", "spectral_progressive", "trajectory_auto", "trajectory_auto_native")
 SAMPLERS = ("euler", "dpmpp_2m", "res_multistep", "deis", "ipndm", "ipndm_v", "gradient_estimation", "er_sde", "sa_solver", "sa_solver_pece")
@@ -30,11 +33,21 @@ def _node(native_first=None, planned=()):
     source = ast.parse((ROOT / "nodes.py").read_text())
     cls = next(n for n in source.body if isinstance(n, ast.ClassDef)
                and n.name == "Krea2TurboFlowAlignedRegenerate")
+    # Module-level definitions the production class reads at call time.
+    support = [
+        n for n in source.body
+        if (isinstance(n, ast.FunctionDef) and n.name == "_without_patch_lattice")
+        or (isinstance(n, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "PATCH_LATTICE_CORRECTIONS" for t in n.targets))
+    ]
+    assert len(support) == 2
 
     class Krea2:
         pass
 
     calls = []
+    results = []
+    log_lines = []
     planning = []
     native_calls = []
     model = SimpleNamespace(
@@ -57,6 +70,8 @@ def _node(native_first=None, planned=()):
 
     def run(**kwargs):
         calls.append(kwargs)
+        if results:
+            return results[-1]
         return SimpleNamespace(output="target", lowres_planner="planner",
                                denoised_output="denoised")
 
@@ -92,13 +107,17 @@ def _node(native_first=None, planned=()):
         "ScaleLockConfig": SimpleNamespace,
         "run_scale_locked_ksampler": run,
         "parse_transition_sigmas": spectral.parse_transition_sigmas,
-        "logger": SimpleNamespace(info=lambda *args: None, warning=lambda *args: None),
+        "logger": SimpleNamespace(info=lambda *args: log_lines.append(args), warning=lambda *args: None),
+        "patch_lattice_metrics": krea2_flow.patch_lattice_metrics,
+        "remove_patch_lattice": krea2_flow.remove_patch_lattice,
         # resolution.MAX_MEGAPIXELS on the native 16384-pixel canvas.
         "MAX_MEGAPIXELS": 256.0,
     }
-    exec(compile(ast.Module(body=[cls], type_ignores=[]), str(ROOT / "nodes.py"),
+    exec(compile(ast.Module(body=support + [cls], type_ignores=[]), str(ROOT / "nodes.py"),
                  "exec"), namespace)
     node = namespace[cls.name]()
+    node.results = results
+    node.log_lines = log_lines
     latent = {"samples": torch.zeros(1, 16, 200, 200)}
     base_args = (model, "positive", "negative", latent, 42, 1.0, 0.0, 0.0)
     node.planning = planning
@@ -161,7 +180,10 @@ def test_existing_widget_slots_and_explicit_defaults():
         "latent_upscale_method",
         "progressive_transition_sigmas", "spectral_tolerance", "spectral_calibration",
         "stage_planning", "highres_min_step_fraction",
+        "patch_lattice_correction",
     ]
+    assert schema["optional"]["patch_lattice_correction"][0] == ["off", "final_latent"]
+    assert schema["optional"]["patch_lattice_correction"][1]["default"] == "off"
     assert schema["optional"]["latent_upscale_method"][0] == ["interpolate", "sesqui_wan21"]
     assert schema["optional"]["latent_upscale_method"][1]["default"] == "interpolate"
     assert schema["optional"]["regeneration_mode"][0] == list(REGENERATION_MODES)
@@ -688,3 +710,60 @@ def test_highres_step_budget_reaches_runtime_and_rejects_invalid_values():
     for bad in (-0.01, 1.01, float("nan"), float("inf"), True, "0.25"):
         with pytest.raises(ValueError, match="highres_min_step_fraction"):
             node.sample(*args, highres_min_step_fraction=bad)
+
+
+def _lattice_latent(seed, shape=(1, 16, 24, 28)):
+    g = torch.Generator().manual_seed(seed)
+    content = torch.randn(shape, generator=g)
+    offsets = 0.2 * torch.randn(shape[:-2] + (2, 2), generator=g)
+    offsets = offsets - offsets.mean(dim=(-2, -1), keepdim=True)
+    lattice = offsets.repeat(*([1] * (len(shape) - 2)), shape[-2] // 2, shape[-1] // 2)
+    return content, content + lattice
+
+
+def test_patch_lattice_correction_is_off_by_default_and_returns_sampler_objects_untouched():
+    node, calls, args = _node()
+    _, corrupted = _lattice_latent(0)
+    output = {"samples": corrupted.clone(), "batch_index": [3]}
+    node.results.append(SimpleNamespace(output=output, lowres_planner="planner", denoised_output=output))
+    out, planner, denoised = node.sample(*args)
+    assert out is output and denoised is output and planner == "planner"
+    assert torch.equal(out["samples"], corrupted)
+    assert "patch_lattice_correction" not in calls[-1]  # sampling never sees the option
+    out, _, _ = node.sample(*args, patch_lattice_correction="off")
+    assert out is output and torch.equal(out["samples"], corrupted)
+
+
+def test_patch_lattice_correction_removes_the_offset_from_both_final_latents_only():
+    node, calls, args = _node()
+    clean, corrupted = _lattice_latent(1)
+    _, corrupted_denoised = _lattice_latent(2)
+    output = {"samples": corrupted.clone(), "batch_index": [3]}
+    denoised = {"samples": corrupted_denoised.clone()}
+    planner = {"samples": corrupted.clone()}
+    node.results.append(SimpleNamespace(output=output, lowres_planner=planner, denoised_output=denoised))
+    out, planner_out, denoised_out = node.sample(*args, patch_lattice_correction="final_latent")
+    # Inputs from the sampler are not mutated; metadata is carried over.
+    assert torch.equal(output["samples"], corrupted) and torch.equal(denoised["samples"], corrupted_denoised)
+    assert out is not output and out["batch_index"] == [3]
+    assert planner_out is planner and torch.equal(planner_out["samples"], corrupted)
+    for result in (out, denoised_out):
+        assert krea2_flow.patch_lattice_modes(result["samples"]).abs().max() < 1e-6
+    # The injected offset is recovered up to the content's own chance-level modes.
+    assert (out["samples"] - krea2_flow.remove_patch_lattice(clean)).abs().max() < 1e-5
+    assert sum("patch lattice correction" in line[0] for line in node.log_lines) == 2
+    assert "patch_lattice_correction" not in calls[-1]
+
+    # A shared output/denoised dictionary stays shared and is corrected once.
+    node.log_lines.clear()
+    node.results.append(SimpleNamespace(output=output, lowres_planner=planner, denoised_output=output))
+    out, _, denoised_out = node.sample(*args, patch_lattice_correction="final_latent")
+    assert denoised_out is out and len(node.log_lines) == 1
+
+
+def test_patch_lattice_correction_rejects_unknown_values_before_sampling():
+    node, calls, args = _node()
+    for bad in ("on", "", None, True):
+        with pytest.raises(ValueError, match="patch_lattice_correction must be one of off, final_latent"):
+            node.sample(*args, patch_lattice_correction=bad)
+    assert not calls
