@@ -1386,6 +1386,8 @@ def main():
 
         def capture_guider(*a, **kw):
             guider = original_guider(*a, **kw)
+            if kw.get("spectrum_stage") != "highres":
+                return guider
             native_sample = guider.sample
 
             def sample(noise, latent_image, sampler, sigmas, **kws):
@@ -1792,6 +1794,7 @@ def main():
                 latent_hw = (16, 20) if n_stages == 1 else (24, 28)
                 result, reports, _, _ = img2img(aligned, sampler_name, steps, latent_hw=latent_hw, **stage_options)
                 assert len(reports) == 1 + n_stages, (sampler_name, reports)
+                assert [r["stage"] for r in reports] == ["planner"] + ["highres"] * n_stages, reports
                 assert reports[0]["outer_steps"] == steps
                 assert [r["outer_steps"] for r in reports[1:]] == [free] * n_stages, reports
                 assert all(r["fallback"] is None for r in reports), reports
