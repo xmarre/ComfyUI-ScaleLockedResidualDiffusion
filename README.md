@@ -218,8 +218,8 @@ runtime and does not load weights independently.
     The Spectrum node's `extrapolation_guard_scope` can apply the
     distance guard to both passes (`all`), the planner only
     (`planner_only`), or all high-resolution passes (`highres_only`).
-    This selector is available in [Spectrum PR #5](https://github.com/xmarre/ComfyUI-Spectrum-Krea2/pull/5)
-    and requires the Spectrum node's master guard to be enabled.
+    This selector requires [Spectrum v0.2.2](https://github.com/xmarre/ComfyUI-Spectrum-Krea2/releases/tag/v0.2.2)
+    or later and the Spectrum node's master guard to be enabled.
     Keep `sa_s_noise` and `er_sde_s_noise` at 1.0 on stochastic steps. A
     stochastic step shrinks the existing noise and re-adds fresh noise of the
     size the next step expects. Below 1.0 it re-adds too little, so the model
@@ -663,15 +663,16 @@ runtime and does not load weights independently.
   (16 channels x column, row and checkerboard mode), for comparing runs with
   different checkpoints or LoRAs; `cosine_vs_planner` compares a pattern with
   the finished planner's (near 1: the same offsets at another grid size). The
-  first latent whose coherence rises well above chance is where the pattern
-  enters: the planner (checkpoint, quantization or LoRA, independent of
-  resolution), an enlarged source (the latent upscaler), or the predictions
-  of a high-resolution stage (denoising beyond the model's native range).
+  first recorded latent whose coherence rises well above chance helps
+  localize the pattern to the planner, an enlargement, or a refinement
+  prediction. A stage trace alone cannot determine the checkpoint or
+  adapter contribution.
   `patch_lattice_correction` (optional, default `off`) is experimental.
   `final_latent` measures that constant offset in the finished latent and
   subtracts it from the output and `DENOISED_OUTPUT` latents: three Fourier
-  coefficients per channel change, the channel mean and all other content are
-  preserved, and sampling is unchanged. `LOWRES_PLANNER` is never modified.
+  coefficients per channel change, the channel mean and remaining latent
+  Fourier modes are preserved within floating-point precision, and sampling
+  is unchanged. `LOWRES_PLANNER` is never modified.
   Measured on Wan 2.1 VAE encodings of four 768-pixel regions (hair, skin,
   fabric) of one 3920x5888 Krea 2 image that showed the grid, the same
   subtraction removed 83% to 100% of the decoded pattern and changed pixels
@@ -680,7 +681,7 @@ runtime and does not load weights independently.
   not removed. In one real-checkpoint run the pattern was already present in
   the finished planner and in the first model prediction of every stage,
   including the native 2048 px range, while enlarged sources were clean; see
-  [`docs/releases/unreleased-patch-lattice.md`](docs/releases/unreleased-patch-lattice.md).
+  [the patch-lattice diagnostics guide](docs/patch-lattice.md).
 - **Planner check against the stock KSampler:** with
   `handoff_diagnostics=log_and_save_latents` the node also runs the planner
   canvas once more through ComfyUI's own `KSampler` code path (same MODEL,

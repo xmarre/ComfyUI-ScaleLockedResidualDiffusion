@@ -1,4 +1,4 @@
-# Unreleased: Krea 2 patch-lattice report and opt-in correction
+# Krea 2 patch-lattice diagnostics and correction
 
 ## Background
 
@@ -19,7 +19,8 @@ Saved workflows keep their widget values and behavior.
   measured in the finished latent and subtracted from the output and
   `DENOISED_OUTPUT` latents. Exactly three Fourier coefficients per channel
   change (column-alternating, row-alternating and checkerboard); the channel
-  mean and all other frequencies are preserved. Sampling, model-call counts,
+  mean and other latent frequencies are preserved within floating-point precision.
+  Sampling, model-call counts,
   seeds and `LOWRES_PLANNER` are unchanged. One log line reports the measured
   strength before and after.
 
@@ -35,9 +36,10 @@ With `handoff_diagnostics=log` or `log_and_save_latents`:
   `x0_patch_lattice_max_coherence`, `x0_patch_lattice_chance`,
   `x0_patch_lattice_amplitude` and `x0_patch_lattice_cosine_vs_planner`.
 
-Coherence near `chance` means no pattern. The first latent well above chance
-shows where it enters: the planner, the latent upscaler, or the denoiser at a
-high-resolution stage. Diagnostics still never change the sampled result.
+Coherence near `chance` is consistent with ordinary variation across patches.
+The first recorded latent well above chance helps localize the pattern to
+the planner, latent upscaling, or a refinement prediction. Diagnostics leave
+the sampled result unchanged.
 
 ## Evidence and limits
 
@@ -55,15 +57,14 @@ high-resolution stage. Diagnostics still never change the sampled result.
   0.008). Planner predictions resized onto the 2048 px grid did not (0.008
   to 0.028), the first model prediction after the composition-lock release
   did (0.155), the SesquiLSR-enlarged source did not (0.006, chance 0.003),
-  and the first 4800 px prediction did again (0.19). The pattern therefore
-  comes from the denoiser's prediction at every resolution, including the
-  native range, and not from enlargement, noise or the solver. The offset of
+  and the first 4800 px prediction did again (0.19). Within this run, the
+  denoiser predictions carry the pattern at each resolution, including the
+  native range. The offset of
   the first prediction divided by its sigma was 0.0177 at sigma 0.637 and
   0.0178 at sigma 0.558 (internal latent units), as a sigma-independent
   constant offset in the predicted velocity would give.
-- Wan 2.1 VAE encodings of ten real photographs show no such signature
-  (coherence 0.018, chance 0.011), so it is not a property of natural-image
-  latents.
+- Wan 2.1 VAE encodings of ten real photographs were near the chance level
+  (coherence 0.018, chance 0.011).
 - The output-head bias of the stock Krea 2 Turbo checkpoint has a
   patch-position component of 0.0023, an eighth of the measured velocity
   offset, and does not point in the measured direction (cosine -0.06, measured
@@ -74,10 +75,10 @@ high-resolution stage. Diagnostics still never change the sampled result.
   quantization or a LoRA produces the offset. Comparing the `planner_final`
   line between checkpoints, and with LoRAs disabled, at otherwise identical
   settings isolates it.
-- With `final_latent`, the coherence of that run's 4800 px output went from
-  0.11 to 0. The visual result on directly sampled latents has not been
-  assessed. Grid-shaped texture already drawn into image content is not a
-  constant offset and remains.
+- With `final_latent`, the measured coherence of the 4800 px output latent
+  went from 0.11 to 0 at the reported precision. Decoded visual fidelity
+  remains unverified. Grid-shaped texture already drawn into image content
+  can remain after the subtraction.
 - The bundled SesquiLSR upscaler, run on synthetic latents, produced no
   period-2 pattern at a 1.55x enlargement and a strong one (coherence 0.17
   against 0.003) at exactly 2.0x. Real-latent behavior at 2.0x is not
