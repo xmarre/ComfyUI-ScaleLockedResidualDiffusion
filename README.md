@@ -187,9 +187,10 @@ runtime and does not load weights independently.
     independently controls Spectrum during the low-resolution planner pass
     for **every supported sampler**, including ER-SDE, Euler, and SA-Solver.
     Its historical SA-prefixed workflow input name is preserved to avoid
-    breaking saved ComfyUI workflows. It uses Spectrum PR #2's separate
+    breaking saved ComfyUI workflows. It uses the separate
     `FORCE_NATIVE_ALL_SAMPLERS` flag; the existing `sa_spectrum_forecasts`
-    still controls SA-only full-invocation suppression. An older loaded
+    still controls SA-only full-invocation suppression. The planner flag is
+    present in Spectrum v0.2.0 and later. An older loaded
     Spectrum runtime missing the all-sampler flag produces an explicit
     compatibility error instead of silently ignoring the planner switch.
     Set it to **false** to evaluate all
@@ -214,6 +215,11 @@ runtime and does not load weights independently.
     time from 70 s to 45 s. If upscale stages still invent small details
     (for example a partly visible object turning into something else), end
     the window earlier, for example `sa_sde_end_percent=0.30`.
+    The Spectrum node's `extrapolation_guard_scope` can apply the
+    distance guard to both passes (`all`), the planner only
+    (`planner_only`), or all high-resolution passes (`highres_only`).
+    This selector is available in [Spectrum PR #5](https://github.com/xmarre/ComfyUI-Spectrum-Krea2/pull/5)
+    and requires the Spectrum node's master guard to be enabled.
     Keep `sa_s_noise` and `er_sde_s_noise` at 1.0 on stochastic steps. A
     stochastic step shrinks the existing noise and re-adds fresh noise of the
     size the next step expects. Below 1.0 it re-adds too little, so the model
@@ -546,8 +552,8 @@ runtime and does not load weights independently.
     `handoff_diagnostics=log_and_save_latents` are rejected; all of this is
     checked before any model call. `log` diagnostics are accepted; the mode
     always logs its transitions, aligned sigmas and denoiser calls per
-    resolution. `sa_planner_spectrum_forecasts` has no effect (there is no
-    separate planner). The `lowres_planner` output holds the denoised
+    resolution. `sa_planner_spectrum_forecasts` controls the first
+    small-grid segment. The `lowres_planner` output holds the denoised
     prediction at the last small-grid step, not a finished planner image.
     Every random field is seeded, so identical settings reproduce the same
     trajectory (bitwise only where the device kernels are deterministic).

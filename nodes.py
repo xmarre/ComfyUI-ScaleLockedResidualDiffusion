@@ -338,7 +338,8 @@ class Krea2TurboFlowAlignedRegenerate:
                                "effective on the deterministic high-resolution stages set by sa_sde_end_percent."}),
                 "sa_planner_spectrum_forecasts": ("BOOLEAN", {"default": True,
                     "tooltip": "All Spectrum-supported samplers, including ER-SDE: enable planner forecasts. "
-                               "Off runs the low-resolution planner with genuine native denoiser evaluations, "
+                               "Off runs the low-resolution planner (or first spectral-progressive segment) "
+                               "with genuine native denoiser evaluations, "
                                "then restores Spectrum forecasting for later resolution stages. "
                                "The historic SA-prefixed name is retained for saved-workflow compatibility."}),
                 "regeneration_mode": (list(REGENERATION_MODES), {"default": "trajectory",
